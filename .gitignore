@@ -1,0 +1,36 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts.map
+.env
+.env.local
+*.log
+coverage/
+.idea/
+.vscode/
+*.swp
+*.swo
+extract_docs.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Electron
+out/
+release/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.eslintcache
+
+.vs/
+.claude/
+node_modules/
+dist/

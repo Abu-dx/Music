@@ -1,0 +1,2 @@
+# Stem Monitor Desktop — Python Worker 依赖
+# 当前为占位文件，实际依赖在联调阶段补充
