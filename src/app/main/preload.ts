@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('project:getResult', projectId),
   getStemsByProject: (projectId: string) =>
     ipcRenderer.invoke('project:getStems', projectId),
+  openExistingProject: () =>
+    ipcRenderer.invoke('project:openExisting'),
   openProjectDir: (projectId: string) =>
     ipcRenderer.invoke('project:openDir', projectId),
   getMasterWaveform: (projectId: string) =>

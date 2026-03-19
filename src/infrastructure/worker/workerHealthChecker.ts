@@ -116,10 +116,12 @@ export class WorkerHealthChecker implements IWorkerHealthChecker {
 
   async check(): Promise<void> {
     const startMs = Date.now();
+    console.log('[REAL_CHAIN] workerHealthChecker.check begin');
 
     // 1. 检查 Worker 状态
     const status = this.workerManager.getStatus();
     if (status.status !== WorkerStatus.Running && status.status !== WorkerStatus.Unresponsive) {
+      console.log(`[REAL_CHAIN] workerHealthChecker.check fail_not_running status=${status.status}`);
       throw new AppError({
         code: ErrorCode.WORKER_HEALTH_CHECK_FAILED,
         message: `Worker is not running (status: ${status.status})`,
@@ -136,6 +138,7 @@ export class WorkerHealthChecker implements IWorkerHealthChecker {
         {},
         this.config.timeoutMs,
       );
+      console.log(`[REAL_CHAIN] workerHealthChecker.check response success=${response.success} errorCode=${response.error?.code ?? 'N/A'} errorMessage="${response.error?.message ?? ''}"`);
 
       // 3. 检查响应
       if (!response.success) {
@@ -151,12 +154,14 @@ export class WorkerHealthChecker implements IWorkerHealthChecker {
 
       // 4. 成功 → 更新时间戳
       this.workerManager.updateHealthCheckTimestamp();
+      console.log(`[REAL_CHAIN] workerHealthChecker.check success elapsedMs=${Date.now() - startMs}`);
 
       this.logger.debug('Health check passed (protocol-level)', {
         elapsedMs: Date.now() - startMs,
         stage: 'workerHealthChecker.check',
       });
     } catch (err) {
+      console.log(`[REAL_CHAIN] workerHealthChecker.check caught error="${err instanceof Error ? err.message : String(err)}"`);
       if (err instanceof AppError && err.code === ErrorCode.WORKER_HEALTH_CHECK_FAILED) {
         throw err; // 已经是正确的错误，直接 rethrow
       }
@@ -193,6 +198,15 @@ export class WorkerHealthChecker implements IWorkerHealthChecker {
     this.stopPeriodicCheck();
 
     this.periodicTimer = setInterval(() => {
+      // [REAL_CHAIN] Long-running commands (e.g. start_separation) block the single-threaded
+      // Python worker loop. Sending health_check concurrently can timeout and produce false
+      // unresponsive state. Skip periodic ping while there are pending IPC requests.
+      const pendingCount = this.ipcBridge.getPendingCount();
+      if (pendingCount > 0) {
+        console.log(`[REAL_CHAIN] workerHealthChecker.periodicCheck skipped pendingCount=${pendingCount}`);
+        return;
+      }
+
       this.check().catch((err) => {
         this.logger.warn('Periodic health check failed', {
           error: err instanceof Error ? err.message : String(err),

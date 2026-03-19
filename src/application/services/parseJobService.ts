@@ -48,9 +48,11 @@ import {
   JobStatus,
   JobStage,
   ProjectStatus,
+  ProjectSourceType,
   WorkerCommand,
   WorkerEventName,
 } from '../../shared/enums';
+import { CURRENT_MANIFEST_SCHEMA_VERSION } from '../../domain/policies';
 import { SUPPORTED_INPUT_EXTENSIONS } from '../../shared/contracts';
 import { STAGE_PROGRESS_MAPPING } from '../../shared/stageMapping';
 import { AppError, ErrorCode } from '../../shared/errors';
@@ -174,6 +176,7 @@ export class ParseJobService implements IParseJobService {
   ) {}
 
   async startSeparation(params: StartSeparationParams): Promise<SeparationStartResult> {
+    console.log(`[REAL_CHAIN] parseJobService.startSeparation entry projectId="${params.projectId}" sourceFilePath="${params.sourceFilePath}" projectDir="${params.projectDir}"`);
     // 1. 串行约束
     if (this.currentJobId) {
       throw new AppError({
@@ -249,23 +252,45 @@ export class ParseJobService implements IParseJobService {
 
     // 7. 发送分离命令
     try {
+      const separationPayload = {
+        filePath: params.sourceFilePath,
+        outputDir: params.projectDir,
+      };
+      console.log(`[REAL_CHAIN] parseJobService.startSeparation send_before jobId="${jobId}" projectId="${params.projectId}" payload=${JSON.stringify(separationPayload)}`);
       const response = await this.ipcBridge.send(
         WorkerCommand.StartSeparation,
-        {
-          sourceFilePath: params.sourceFilePath,
-          outputDir: this.projectDirManager.getPath(params.projectDir, 'STEMS_DIR'),
-          projectId: params.projectId,
-        },
+        separationPayload,
         this.config.separationTimeoutMs,
       );
+      console.log(`[REAL_CHAIN] parseJobService.startSeparation send_after jobId="${jobId}" projectId="${params.projectId}" responseSuccess=${response.success} responseErrorCode=${response.error?.code ?? 'N/A'} responseErrorMessage="${response.error?.message ?? ''}"`);
 
       this.cleanupProgressListener();
 
-      // 8. 校验响应 schema
+      // 8a. 先检查 Worker 级错误（Demucs crash / timeout / 输入无效）
+      //     必须在 schema 校验之前：response.success=false 时 data 可能缺失，
+      //     直接进 schema 校验会丢失 Worker 原始错误信息。
+      if (!response.success) {
+        const errCode = response.error?.code as string ?? 'UNKNOWN_WORKER_ERROR';
+        const errMsg = response.error?.message as string ?? 'Worker returned error without details';
+        await this.failJob(jobId, params.projectId, startMs,
+          errCode, errMsg, this.classifyFailure(errCode),
+        );
+        const failedJob = await this.parseJobRepo.findById(jobId);
+        return {
+          job: failedJob ?? job,
+          projectStatusAfter: this.classifyFailure(errCode) === FailureKind.TransientError
+            ? ProjectStatus.ReadyToParse
+            : ProjectStatus.Failed,
+          warnings: [],
+        };
+      }
+
+      // 8b. 校验响应 schema（response.success=true 后才校验 data 结构）
       const validated = this.schemaValidator.validate<RawSeparationResult>(
         WorkerCommand.StartSeparation,
         response,
       );
+      console.log(`[REAL_CHAIN] parseJobService.startSeparation schema_validated jobId="${jobId}" projectId="${params.projectId}" valid=${validated.valid}`);
 
       if (!validated.valid) {
         await this.failJob(jobId, params.projectId, startMs,
@@ -283,6 +308,7 @@ export class ParseJobService implements IParseJobService {
 
       // 9. 通过 adapter 归一化 → 写盘
       const adapted = this.resultAdapter.adapt(validated.data!, params.projectId, params.projectDir);
+      console.log(`[REAL_CHAIN] parseJobService.startSeparation adapted jobId="${jobId}" projectId="${params.projectId}" stemFilesLength=${adapted.stemFiles.length}`);
       await this.handleSeparationSuccess(jobId, params, adapted, startMs);
 
       const finalJob = await this.parseJobRepo.findById(jobId);
@@ -471,7 +497,17 @@ export class ParseJobService implements IParseJobService {
     // 通过映射表归一化
     const mapping = STAGE_PROGRESS_MAPPING[rawStage];
     const stage = mapping?.stage ?? JobStage.Init;
-    const progress = Math.max(0, Math.min(100, payload.progress ?? 0));
+    const rawProgress = typeof payload.progress === 'number' ? payload.progress : null;
+    // Worker currently reports global progress in [0, 1]. Normalize to [0, 100].
+    // If a future worker reports [0, 100], keep backward compatibility.
+    let progress = 0;
+    if (rawProgress !== null) {
+      progress = rawProgress <= 1 ? rawProgress * 100 : rawProgress;
+    } else if (mapping) {
+      // No numeric progress in payload: fall back to stage floor to avoid 0% "stuck" display.
+      progress = mapping.minProgress;
+    }
+    progress = Math.max(0, Math.min(100, progress));
 
     await this.parseJobRepo.updateProgress(jobId, stage, progress);
 
@@ -500,17 +536,31 @@ export class ParseJobService implements IParseJobService {
     // 1. 写入 DB
     await this.stemFileRepo.createMany(adapted.stemFiles);
 
-    // 2. 更新 manifest
+    // 2. 写入 / 更新 manifest
+    //    首次分离时 manifest 不存在（read 返回 null），需从头创建
     const existingManifest = await this.manifestManager.read(params.projectDir);
-    if (existingManifest) {
-      const updatedManifest: ProjectManifest = {
-        ...existingManifest,
-        engineVersion: adapted.engineVersion,
-        updatedAt: Date.now(),
-        stems: adapted.manifestEntries,
-      };
-      await this.manifestManager.write(params.projectDir, updatedManifest);
-    }
+    const manifest: ProjectManifest = existingManifest
+      ? {
+          // 已有 manifest → 增量更新
+          ...existingManifest,
+          engineVersion: adapted.engineVersion,
+          updatedAt: Date.now(),
+          stems: adapted.manifestEntries,
+        }
+      : {
+          // 首次 → 创建最小初始 manifest
+          projectId: params.projectId,
+          fingerprint: '',  // Phase 2 不做指纹计算
+          sourceType: ProjectSourceType.Separation,
+          schemaVersion: CURRENT_MANIFEST_SCHEMA_VERSION,
+          engineVersion: adapted.engineVersion,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          stems: adapted.manifestEntries,
+          waveform: null,         // Phase 2 不做真实 waveform
+          chordAnalysis: null,    // Phase 2 不做真实 chord
+        };
+    await this.manifestManager.write(params.projectDir, manifest);
 
     // 3. 完成 Job
     assertJobTransition(jobId, JobStatus.Running, JobStatus.Success);
@@ -518,6 +568,7 @@ export class ParseJobService implements IParseJobService {
 
     // 4. 更新项目状态 → Ready
     await this.projectRepo.updateStatus(params.projectId, ProjectStatus.Ready);
+    console.log(`[REAL_CHAIN] parseJobService.handleSeparationSuccess done jobId="${jobId}" projectId="${params.projectId}" createManyCount=${adapted.stemFiles.length} projectStatus="${ProjectStatus.Ready}"`);
 
     // 5. 清理
     this.currentJobId = null;

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @module renderer/pages/PlayerPage
  * @description 播放器页面 — 主波形 + 和弦时间轴 + 播放控制 + 单轨控制
  *
@@ -34,7 +34,7 @@
  * - 最低 Electron 版本要求：28+（原生支持 ResizeObserver，无需 polyfill）
  */
 
-import React, { useSyncExternalStore, useCallback, useRef, useEffect } from 'react';
+import React, { useSyncExternalStore, useCallback, useRef, useEffect, useState } from 'react';
 import { PlaybackStatus } from '../../shared/enums';
 import { IProjectStore } from '../stores/projectStore';
 import { IPlaybackStore } from '../stores/playbackStore';
@@ -72,6 +72,12 @@ const STEM_TYPE_ICONS: Record<string, string> = {
 };
 
 const SPEED_PRESETS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+const MOJIBAKE_PATTERN = /[�]|(?:鍜|鍒|鎾|缁|妯|锛|銆|鈥|鈫)/;
+
+function sanitizePlayerText(text: string | null | undefined, fallback: string): string {
+  if (!text || text.trim().length === 0) return fallback;
+  return MOJIBAKE_PATTERN.test(text) ? fallback : text;
+}
 
 // ============================================================================
 // 3. 主组件
@@ -100,19 +106,49 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
     (cb) => analysisStore.subscribe(cb),
     () => analysisStore.getSnapshot(),
   );
+  const [openDirError, setOpenDirError] = useState<string | null>(null);
+  const [hasRequestedLoad, setHasRequestedLoad] = useState(false);
+  const [projectMissing, setProjectMissing] = useState(false);
 
-  const projectName = projectSnap.currentProject?.displayName ?? '\u672A\u547D\u540D\u9879\u76EE';
+  const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
   const isPlayable = pbSnap.status === PlaybackStatus.Playing
     || pbSnap.status === PlaybackStatus.Paused
     || pbSnap.status === PlaybackStatus.Ended;
 
   // ---- 生命周期：通过 controller 加载 ----
   useEffect(() => {
-    playerController.loadPlayer(projectId);
+    console.log(`[PlayerPage] loading projectId="${projectId}"`);
+    setHasRequestedLoad(true);
+    playerController.loadPlayer(projectId).catch((err) => {
+      console.error('[PlayerPage] loadPlayer failed', err);
+    });
     return () => {
       playerController.unloadPlayer();
     };
   }, [playerController, projectId]);
+
+  // 定时刷新，及时发现项目被删除/失效
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      projectStore.loadProjectResult(projectId).catch(() => undefined);
+    }, 6000);
+    return () => window.clearInterval(timer);
+  }, [projectStore, projectId]);
+
+  useEffect(() => {
+    if (hasRequestedLoad && !projectSnap.isLoading && projectSnap.projectResult === null) {
+      setProjectMissing(true);
+      playerController.unloadPlayer();
+    }
+  }, [hasRequestedLoad, projectSnap.isLoading, projectSnap.projectResult, playerController]);
+
+  useEffect(() => {
+    if (!projectMissing) return;
+    const timer = window.setTimeout(() => {
+      onNavigateToHome();
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [projectMissing, onNavigateToHome]);
 
   // ---- 播放控制（直接调用 playbackStore，这些是单 store 操作） ----
   const handleTogglePlay = useCallback(() => {
@@ -136,33 +172,73 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
 
   // ---- "打开文件"入口（GPT R10 Suggested #2：占位） ----
   const handleOpenFile = useCallback(() => {
-    playerController.openFile(projectId);
+    playerController.openFile(projectId).catch((err) => {
+      setOpenDirError(err instanceof Error ? err.message : '无法打开项目目录');
+    });
   }, [playerController, projectId]);
+
+  const hasRealGeneratedStems = projectSnap.stems.some(
+    (s) => s.presence === 'exists' && typeof s.filePath === 'string' && s.filePath.trim().length > 0,
+  );
+
+  if (projectMissing) {
+    return (
+      <div className="player-page" style={styles.container}>
+        <div style={styles.errorBanner}>
+          项目已被删除或失效，正在返回首页...
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="player-page" style={styles.container}>
       {/* Header */}
       <div style={styles.header}>
         <button style={styles.backButton} onClick={() => onNavigateToResult(projectId)}>
-          &larr; \u7ED3\u679C\u9875
+          &larr; 结果页
         </button>
         <h2 style={styles.title}>{projectName}</h2>
         <div style={styles.headerActions}>
-          <button style={styles.openFileButton} onClick={handleOpenFile} title="\u6253\u5F00\u9879\u76EE\u76EE\u5F55">
+          <button style={styles.openFileButton} onClick={handleOpenFile} title="打开项目目录">
             {'\u{1F4C2}'}
           </button>
           <button style={styles.homeButton} onClick={onNavigateToHome}>
-            \u9996\u9875
+            首页
           </button>
         </div>
       </div>
 
+      {/* mock 数据提示 */}
+      {analysisSnap.source === 'mock_stub' && (
+        <div style={styles.mockBanner}>
+          {hasRealGeneratedStems ? (
+            <>
+              <strong>真实分轨文件已生成。</strong>
+              波形(waveform)、和弦(chord)、BPM、调性(Key) 当前仍为示例占位数据，非真实分析结果。
+            </>
+          ) : (
+            <>
+              <strong>当前仅提供原始音频试听。</strong>
+              尚未生成真实分轨文件。波形(waveform)、和弦(chord)、BPM、调性(Key) 当前仍为示例占位数据，非真实分析结果。
+            </>
+          )}
+        </div>
+      )}
+
       {/* 状态提示 */}
       {pbSnap.status === PlaybackStatus.Loading && (
-        <div style={styles.statusBanner}>\u52A0\u8F7D\u8F68\u9053\u4E2D...</div>
+        <div style={styles.statusBanner}>加载轨道中...</div>
       )}
       {pbSnap.status === PlaybackStatus.Error && pbSnap.error && (
-        <div style={styles.errorBanner}>{pbSnap.error.userMessage}</div>
+        <div style={styles.errorBanner}>
+          {sanitizePlayerText(pbSnap.error.userMessage, '播放失败，请重试')}
+        </div>
+      )}
+      {openDirError && (
+        <div style={styles.errorBanner}>
+          {sanitizePlayerText(openDirError, '无法打开项目目录')}
+        </div>
       )}
 
       {/* 主波形区域 */}
@@ -197,17 +273,24 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
               {analysisSnap.estimatedKey && (
                 <span style={styles.chordMetaTag}>
                   调性: {analysisSnap.estimatedKey}
-                  <span style={styles.estimatedBadge}>估计值</span>
+                  <span style={styles.estimatedBadge}>
+                    {analysisSnap.source === 'mock_stub' ? '示例' : '估计值'}
+                  </span>
                 </span>
               )}
               {analysisSnap.estimatedBpm != null && (
                 <span style={styles.chordMetaTag}>
                   BPM: {Math.round(analysisSnap.estimatedBpm)}
-                  <span style={styles.estimatedBadge}>估计值</span>
+                  <span style={styles.estimatedBadge}>
+                    {analysisSnap.source === 'mock_stub' ? '示例' : '估计值'}
+                  </span>
                 </span>
               )}
               <span style={styles.chordMetaTag}>
                 {analysisSnap.segmentCount} 个和弦片段
+                {analysisSnap.source === 'mock_stub' && (
+                  <span style={styles.estimatedBadge}>示例</span>
+                )}
               </span>
             </div>
           </div>
@@ -215,21 +298,21 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
           {analysisSnap.warnings.length > 0 && (
             <div style={styles.warningsBar}>
               {analysisSnap.warnings.map((w, i) => (
-                <div key={i} style={styles.warningItem}>⚠ {w}</div>
+                <div key={i} style={styles.warningItem}>⚠ {sanitizePlayerText(w, '分析结果仅供参考')}</div>
               ))}
             </div>
           )}
         </>
       )}
       {analysisSnap.loadingState === 'loading' && (
-        <div style={styles.chordLoadingBar}>\u548C\u5F26\u5206\u6790\u52A0\u8F7D\u4E2D...</div>
+        <div style={styles.chordLoadingBar}>和弦分析加载中...</div>
       )}
       {analysisSnap.loadingState === 'empty' && (
-        <div style={styles.chordEmptyBar}>\u672A\u68C0\u6D4B\u5230\u548C\u5F26\u5206\u6790\u7ED3\u679C</div>
+        <div style={styles.chordEmptyBar}>未检测到和弦分析结果</div>
       )}
       {analysisSnap.loadingState === 'error' && (
         <div style={styles.chordErrorBar}>
-          {analysisSnap.error?.userMessage ?? '和弦分析加载失败'}
+          {sanitizePlayerText(analysisSnap.error?.userMessage, '和弦分析加载失败')}
         </div>
       )}
 
@@ -293,7 +376,7 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
 
       {/* 单轨控制卡片列表 */}
       <div style={styles.trackSection}>
-        <h3 style={styles.trackSectionTitle}>\u8F68\u9053\u63A7\u5236</h3>
+        <h3 style={styles.trackSectionTitle}>轨道控制</h3>
         {pbSnap.stemControls.map(ctrl => (
           <TrackControlCard
             key={ctrl.stemId}
@@ -305,7 +388,7 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
           />
         ))}
         {pbSnap.stemControls.length === 0 && (
-          <div style={styles.emptyTracks}>\u672A\u52A0\u8F7D\u8F68\u9053</div>
+          <div style={styles.emptyTracks}>未加载轨道</div>
         )}
       </div>
     </div>
@@ -470,7 +553,7 @@ const ChordTimeline: React.FC<{
       ctx.font = '12px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText(
-        loadingState === 'loading' ? '\u52A0\u8F7D\u4E2D...' : '\u65E0\u548C\u5F26\u6570\u636E',
+        loadingState === 'loading' ? '加载中...' : '无和弦数据',
         width / 2,
         height / 2 + 4,
       );
@@ -943,5 +1026,14 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '20px',
     color: '#999',
     fontSize: '14px',
+  },
+  mockBanner: {
+    padding: '10px 16px',
+    backgroundColor: '#fff3e0',
+    color: '#e65100',
+    borderRadius: '6px',
+    fontSize: '13px',
+    marginBottom: '12px',
+    border: '1px solid #ffe0b2',
   },
 };

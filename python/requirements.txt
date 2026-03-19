@@ -1,2 +1,5 @@
-# Stem Monitor Desktop — Python Worker 依赖
-# 当前为占位文件，实际依赖在联调阶段补充
+﻿# Stem Monitor Desktop - Python worker dependencies
+demucs>=4.0.0
+torchcodec>=0.1.0
+numpy>=1.24.0
+librosa>=0.10.0

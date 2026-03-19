@@ -1,26 +1,16 @@
-/**
+﻿/**
  * @module renderer/pages/ProgressPage
- * @description 进度页 — 实时分离进度展示 + 阶段可视化 + 取消
+ * @description 杩涘害椤?鈥?瀹炴椂鍒嗙杩涘害灞曠ず + 闃舵鍙鍖?+ 鍙栨秷
  *
- * GPT R7 Must Fix #5：缓存命中分支 — cacheHit 时跳过进度展示
- * GPT R7 Must Fix #6：所有运行态从 jobStore 只读消费，页面不自行推导
- * GPT R7 Suggested #3：已耗时展示
+ * GPT R7 Must Fix #5锛氱紦瀛樺懡涓垎鏀?鈥?cacheHit 鏃惰烦杩囪繘搴﹀睍绀? * GPT R7 Must Fix #6锛氭墍鏈夎繍琛屾€佷粠 jobStore 鍙娑堣垂锛岄〉闈笉鑷鎺ㄥ
+ * GPT R7 Suggested #3锛氬凡鑰楁椂灞曠ず
  *
- * 职责：
- * - 展示当前分离任务的实时进度条
- * - 展示当前阶段名称和阶段列表（只读派生自 jobStore）
- * - 缓存命中时展示快速完成提示
- * - 提供取消按钮
- * - 分离完成后展示结果摘要
- * - 分离失败后展示错误信息
+ * 鑱岃矗锛? * - 灞曠ず褰撳墠鍒嗙浠诲姟鐨勫疄鏃惰繘搴︽潯
+ * - 灞曠ず褰撳墠闃舵鍚嶇О鍜岄樁娈靛垪琛紙鍙娲剧敓鑷?jobStore锛? * - 缂撳瓨鍛戒腑鏃跺睍绀哄揩閫熷畬鎴愭彁绀? * - 鎻愪緵鍙栨秷鎸夐挳
+ * - 鍒嗙瀹屾垚鍚庡睍绀虹粨鏋滄憳瑕? * - 鍒嗙澶辫触鍚庡睍绀洪敊璇俊鎭? *
+ * 鏁版嵁鏉ユ簮锛? * - IJobStore.getSnapshot() 鈥?杩涘害銆侀樁娈点€侀敊璇€佺紦瀛樺懡涓? * - IProjectStore.getSnapshot() 鈥?椤圭洰鍚嶇О锛堜粎灞曠ず鐢級
  *
- * 数据来源：
- * - IJobStore.getSnapshot() — 进度、阶段、错误、缓存命中
- * - IProjectStore.getSnapshot() — 项目名称（仅展示用）
- *
- * 导航：
- * - 完成后 → 进入结果页
- * - 失败后 → 可重试（跳回上传页）
+ * 瀵艰埅锛? * - 瀹屾垚鍚?鈫?杩涘叆缁撴灉椤? * - 澶辫触鍚?鈫?鍙噸璇曪紙璺冲洖涓婁紶椤碉級
  */
 
 import React, { useSyncExternalStore } from 'react';
@@ -42,7 +32,7 @@ export interface ProgressPageProps {
 }
 
 // ============================================================================
-// 2. 组件
+// 2. 缁勪欢
 // ============================================================================
 
 export const ProgressPage: React.FC<ProgressPageProps> = ({
@@ -66,7 +56,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
 
   const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
 
-  // GPT R7 Must Fix #6：所有运行态直接从 jobStore snapshot 读取，不推导
+  // GPT R7 Must Fix #6锛氭墍鏈夎繍琛屾€佺洿鎺ヤ粠 jobStore snapshot 璇诲彇锛屼笉鎺ㄥ
   const { isRunning, isComplete, isFailed, cacheHit, progress, stageDisplayName,
     errorMessage, warnings, currentStageIndex, orderedStages, elapsedMs } = jobSnap;
 
@@ -86,7 +76,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
         </span>
       </div>
 
-      {/* GPT R7 Must Fix #5：缓存命中提示 */}
+      {/* GPT R7 Must Fix #5锛氱紦瀛樺懡涓彁绀?*/}
       {cacheHit && isRunning && (
         <div style={styles.cacheHitBanner}>
           已检测到缓存，正在快速恢复结果...
@@ -109,7 +99,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
         </div>
       </div>
 
-      {/* Current Stage + Elapsed Time（GPT R7 Suggested #3） */}
+      {/* Current Stage + Elapsed Time锛圙PT R7 Suggested #3锛?*/}
       {isRunning && (
         <div style={styles.stageRow}>
           {stageDisplayName && (
@@ -119,7 +109,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
         </div>
       )}
 
-      {/* Stage Timeline — GPT R7 Must Fix #6：从 jobSnap.orderedStages 读取 */}
+      {/* Stage Timeline 鈥?GPT R7 Must Fix #6锛氫粠 jobSnap.orderedStages 璇诲彇 */}
       {!cacheHit && (
         <div style={styles.timeline}>
           {orderedStages.map((stageItem, index) => {
@@ -189,8 +179,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
           </div>
           {projectSnap.currentProject && (
             <div style={styles.successMeta}>
-              共 {projectSnap.currentProject.stemCount} 轨
-              {cacheHit && ' · 来自缓存'}
+              共 {projectSnap.currentProject.stemCount} 轨{cacheHit && ' · 来自缓存'}
             </div>
           )}
           <div style={styles.successActions}>
@@ -223,11 +212,11 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
 };
 
 // ============================================================================
-// 3. 辅助函数
+// 3. 杈呭姪鍑芥暟
 // ============================================================================
 
 /**
- * GPT R7 Suggested #3：将 ms 格式化为人类可读已耗时
+ * GPT R7 Suggested #3锛氬皢 ms 鏍煎紡鍖栦负浜虹被鍙宸茶€楁椂
  */
 function formatElapsed(ms: number): string {
   if (ms < 1000) return '< 1 秒';
@@ -239,7 +228,7 @@ function formatElapsed(ms: number): string {
 }
 
 // ============================================================================
-// 4. 样式
+// 4. 鏍峰紡
 // ============================================================================
 
 const styles: Record<string, React.CSSProperties> = {
@@ -437,3 +426,4 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
   },
 };
+

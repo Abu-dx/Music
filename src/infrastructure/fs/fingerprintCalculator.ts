@@ -252,7 +252,7 @@ export class FingerprintCalculator implements IFingerprintCalculator {
       const hash = crypto.createHash(HASH_ALGORITHM);
       const stream = fs.createReadStream(filePath);
 
-      stream.on('data', (chunk: Buffer) => {
+      stream.on('data', (chunk) => {
         hash.update(chunk);
       });
       stream.on('end', () => {

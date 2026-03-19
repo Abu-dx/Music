@@ -129,6 +129,8 @@ export class JobStore implements IJobStore {
   private unsubProgress: (() => void) | null = null;
   private unsubComplete: (() => void) | null = null;
   private disposed = false;
+  /** 缓存的 snapshot — useSyncExternalStore 要求引用稳定 */
+  private _cachedSnapshot: JobStoreSnapshot | null = null;
 
   constructor(api: IJobElectronAPI) {
     this.unsubProgress = api.onSeparationProgress((data) => {
@@ -161,26 +163,29 @@ export class JobStore implements IJobStore {
   }
 
   getSnapshot(): JobStoreSnapshot {
-    const stageIndex = this.stage
-      ? ORDERED_STAGES.findIndex((s) => s.key === this.stage)
-      : -1;
+    if (!this._cachedSnapshot) {
+      const stageIndex = this.stage
+        ? ORDERED_STAGES.findIndex((s) => s.key === this.stage)
+        : -1;
 
-    return {
-      currentJobId: this.currentJobId,
-      stage: this.stage,
-      stageDisplayName: this.stage ? (STAGE_DISPLAY_NAMES[this.stage] ?? this.stage) : null,
-      progress: this.progress,
-      isRunning: this.currentJobId !== null && !this.isComplete,
-      elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
-      cacheHit: this.cacheHit,
-      errorCode: this.errorCode,
-      errorMessage: this.errorMessage,
-      isComplete: this.isComplete && this.errorCode === null,
-      isFailed: this.isComplete && this.errorCode !== null,
-      warnings: this.warnings,
-      currentStageIndex: stageIndex,
-      orderedStages: ORDERED_STAGES,
-    };
+      this._cachedSnapshot = {
+        currentJobId: this.currentJobId,
+        stage: this.stage,
+        stageDisplayName: this.stage ? (STAGE_DISPLAY_NAMES[this.stage] ?? this.stage) : null,
+        progress: this.progress,
+        isRunning: this.currentJobId !== null && !this.isComplete,
+        elapsedMs: this.startedAt ? Date.now() - this.startedAt : 0,
+        cacheHit: this.cacheHit,
+        errorCode: this.errorCode,
+        errorMessage: this.errorMessage,
+        isComplete: this.isComplete && this.errorCode === null,
+        isFailed: this.isComplete && this.errorCode !== null,
+        warnings: this.warnings,
+        currentStageIndex: stageIndex,
+        orderedStages: ORDERED_STAGES,
+      };
+    }
+    return this._cachedSnapshot;
   }
 
   startJob(jobId: string, cacheHit: boolean): void {
@@ -225,6 +230,7 @@ export class JobStore implements IJobStore {
   }
 
   private notify(): void {
+    this._cachedSnapshot = null;
     for (const listener of this.listeners) {
       try { listener(); } catch { /* View 层错误不影响 Store */ }
     }

@@ -344,6 +344,7 @@ export class WorkerIpcBridge implements IWorkerIpcBridge {
       command,
       payload,
     };
+    console.log(`[REAL_CHAIN] workerIpcBridge.send request requestId="${requestId}" command="${command}" timeoutMs=${timeout}`);
 
     return new Promise<WorkerResponse>((resolve, reject) => {
       // 设置超时
@@ -521,7 +522,7 @@ export class WorkerIpcBridge implements IWorkerIpcBridge {
         break;
       default:
         this.logger.warn('Unknown message type from worker', {
-          type: (message as Record<string, unknown>).type,
+          type: (message as unknown as Record<string, unknown>).type,
           stage: 'workerIpcBridge.routeMessage',
         });
     }
@@ -541,6 +542,7 @@ export class WorkerIpcBridge implements IWorkerIpcBridge {
     this.pendingRequests.delete(response.id);
 
     // resolve（即使 success=false 也 resolve，由上层检查）
+    console.log(`[REAL_CHAIN] workerIpcBridge.send response requestId="${response.id}" success=${response.success} errorCode=${response.error?.code ?? 'N/A'} errorMessage="${response.error?.message ?? ''}"`);
     pending.resolve(response);
 
     this.logger.debug('Response received', {

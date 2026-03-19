@@ -60,6 +60,7 @@ export interface IProjectElectronAPI {
    * 包含 filePath / presence / mergedFrom 等完整信息
    */
   getStemsByProject(projectId: string): Promise<StemTrackDTO[]>;
+  openExistingProject(): Promise<{ projectId: string; displayName: string; stemCount: number } | null>;
 
   /**
    * 在系统文件管理器中打开项目目录（GPT R8 Must Fix #2）
@@ -113,6 +114,7 @@ export interface IProjectStore {
   loadCacheStats(): Promise<void>;
   /** 加载结果摘要 + 分轨列表（GPT R8 Must Fix #1） */
   loadProjectResult(projectId: string): Promise<void>;
+  openExistingProject(): Promise<{ projectId: string; displayName: string; stemCount: number } | null>;
   /** 打开项目目录（GPT R8 Must Fix #2） */
   openProjectDir(projectId: string): Promise<void>;
   subscribe(listener: () => void): () => void;
@@ -133,18 +135,23 @@ export class ProjectStore implements IProjectStore {
 
   private listeners = new Set<() => void>();
   private disposed = false;
+  /** 缓存的 snapshot — useSyncExternalStore 要求引用稳定 */
+  private _cachedSnapshot: ProjectStoreSnapshot | null = null;
 
   constructor(private readonly api: IProjectElectronAPI) {}
 
   getSnapshot(): ProjectStoreSnapshot {
-    return {
-      currentProject: this.currentProject,
-      recentProjects: this.recentProjects,
-      isLoading: this.isLoading,
-      cacheStats: this.cacheStats,
-      projectResult: this.projectResult,
-      stems: this.stems,
-    };
+    if (!this._cachedSnapshot) {
+      this._cachedSnapshot = {
+        currentProject: this.currentProject,
+        recentProjects: this.recentProjects,
+        isLoading: this.isLoading,
+        cacheStats: this.cacheStats,
+        projectResult: this.projectResult,
+        stems: this.stems,
+      };
+    }
+    return this._cachedSnapshot;
   }
 
   async loadRecentProjects(limit = 20): Promise<void> {
@@ -165,6 +172,7 @@ export class ProjectStore implements IProjectStore {
 
     try {
       const result = await this.api.startSeparation(filePath);
+      console.log(`[ProjectStore] startSeparation returned projectId="${result.projectId}", jobId="${result.jobId}"`);
       await this.loadProject(result.projectId);
       return result;
     } finally {
@@ -193,6 +201,7 @@ export class ProjectStore implements IProjectStore {
   }
 
   async loadProjectResult(projectId: string): Promise<void> {
+    console.log(`[ProjectStore] loadProjectResult projectId="${projectId}"`);
     this.isLoading = true;
     this.notify();
 
@@ -203,10 +212,19 @@ export class ProjectStore implements IProjectStore {
       ]);
       this.projectResult = result;
       this.stems = stems;
+      console.log(`[ProjectStore] loadProjectResult done: displayName="${result?.displayName}", stems=${stems.length}`);
     } finally {
       this.isLoading = false;
       this.notify();
     }
+  }
+
+  async openExistingProject(): Promise<{ projectId: string; displayName: string; stemCount: number } | null> {
+    const result = await this.api.openExistingProject();
+    if (result) {
+      await this.loadProject(result.projectId);
+    }
+    return result;
   }
 
   async openProjectDir(projectId: string): Promise<void> {
@@ -225,6 +243,7 @@ export class ProjectStore implements IProjectStore {
   }
 
   private notify(): void {
+    this._cachedSnapshot = null; // 使 getSnapshot 下次返回新对象
     for (const listener of this.listeners) {
       try { listener(); } catch { /* View 层错误不影响 Store */ }
     }

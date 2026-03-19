@@ -258,6 +258,8 @@ export class PlaybackStore implements IPlaybackStore {
 
   /** drift 节流：trackPair → lastAlertTimestamp */
   private driftThrottleMap = new Map<string, number>();
+  /** 缓存的 snapshot — useSyncExternalStore 要求引用稳定 */
+  private _cachedSnapshot: PlaybackStoreSnapshot | null = null;
 
   constructor(private readonly engine: IAudioEngine) {}
 
@@ -267,21 +269,24 @@ export class PlaybackStore implements IPlaybackStore {
   }
 
   getSnapshot(): PlaybackStoreSnapshot {
-    const hasSoloedTrack = this.stemControls.some(s => s.soloed);
-    return {
-      status: this.status,
-      currentTimeMs: this.currentTimeMs,
-      durationMs: this.durationMs,
-      masterVolume: this.masterVolume,
-      playbackRate: this.playbackRate,
-      error: this.error,
-      currentProjectId: this.currentProjectId,
-      loadedTrackCount: this.loadedTrackCount,
-      stemControls: this.stemControls,
-      masterWaveform: this.masterWaveform,
-      hasSoloedTrack,
-      lastDriftAlert: this.lastDriftAlert,
-    };
+    if (!this._cachedSnapshot) {
+      const hasSoloedTrack = this.stemControls.some(s => s.soloed);
+      this._cachedSnapshot = {
+        status: this.status,
+        currentTimeMs: this.currentTimeMs,
+        durationMs: this.durationMs,
+        masterVolume: this.masterVolume,
+        playbackRate: this.playbackRate,
+        error: this.error,
+        currentProjectId: this.currentProjectId,
+        loadedTrackCount: this.loadedTrackCount,
+        stemControls: this.stemControls,
+        masterWaveform: this.masterWaveform,
+        hasSoloedTrack,
+        lastDriftAlert: this.lastDriftAlert,
+      };
+    }
+    return this._cachedSnapshot;
   }
 
   async loadProject(
@@ -328,6 +333,7 @@ export class PlaybackStore implements IPlaybackStore {
       tracks = validTracks;
     }
 
+    console.log(`[PlaybackStore] loadProject projectId="${projectId}", tracks=${tracks.length}, filePaths:`, tracks.map(t => t.filePath));
     this.transition(PlaybackStatus.Loading, 'loadProject: start');
     this.error = null;
     this.currentProjectId = projectId;
@@ -602,6 +608,11 @@ export class PlaybackStore implements IPlaybackStore {
     this.unsubError = null;
     this.unsubDrift = null;
 
+    // 释放引擎持有的 HTMLAudioElement / Web Audio 节点，
+    // 防止离开 PlayerPage 后音频资源残留。
+    // loadTracks([]) 内部同步调用 cleanup()，立即释放资源。
+    void this.engine.loadTracks([]);
+
     // Idle 是通用降级路径，transition() 内部始终允许
     this.transition(PlaybackStatus.Idle, 'unload');
     this.currentTimeMs = 0;
@@ -616,6 +627,7 @@ export class PlaybackStore implements IPlaybackStore {
   }
 
   private notify(): void {
+    this._cachedSnapshot = null;
     for (const listener of this.listeners) {
       try { listener(); } catch { /* View 层错误不影响 Store */ }
     }

@@ -84,7 +84,9 @@ export const App: React.FC = () => {
       return (
         <UploadPage
           store={deps.projectStore}
+          jobStore={deps.jobStore}
           onNavigateToProgress={goProgress}
+          onNavigateToResult={goResult}
           onNavigateBack={goHome}
         />
       );

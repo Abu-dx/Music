@@ -259,3 +259,49 @@ export APPLE_TEAM_ID="YOUR_TEAM_ID"
 
 > ⚠️ 签名证书需要用户自行购买/申请。当前项目未包含任何证书文件。
 > 开发阶段可不签名运行（Windows 手动允许，macOS 右键打开）。
+
+---
+
+## BS-RoFormer-SW Experimental Engine (Phase 2.5)
+
+This project keeps **Demucs as default**. BS-RoFormer-SW is optional and experimental.
+
+### 1) Install experimental dependencies
+
+```bash
+pip install -r python/requirements.bs.txt
+pip install git+https://github.com/openmirlab/bs-roformer-infer.git
+```
+
+### 2) Enable BS experimental engine
+
+Set environment variable before starting the app:
+
+```bash
+# PowerShell
+$env:SEPARATION_ENGINE = "bs_roformer_sw"
+
+# Optional: override command template
+# Use {input} and {output} placeholders.
+$env:BS_ROFORMER_CMD = "python -m bs_roformer.inference --input \"{input}\" --output-dir \"{output}\" --model bs_roformer_sw"
+```
+
+### 3) Fallback behavior
+
+- If `SEPARATION_ENGINE` is missing or invalid, worker uses `demucs`.
+- If BS execution fails, worker logs warning and **automatically falls back to Demucs**.
+- Existing renderer/IPC contract is unchanged.
+
+### 4) Back to stable default
+
+```bash
+# PowerShell
+Remove-Item Env:SEPARATION_ENGINE -ErrorAction SilentlyContinue
+Remove-Item Env:BS_ROFORMER_CMD -ErrorAction SilentlyContinue
+```
+
+### 5) Known limitations
+
+- BS-RoFormer-SW is experimental in this app and not default.
+- Windows setup may require extra dependency troubleshooting.
+- Runtime/VRAM usage can be significantly higher than Demucs.

@@ -166,24 +166,29 @@ export class AnalysisStore implements IAnalysisStore {
 
   private listeners = new Set<() => void>();
   private disposed = false;
+  /** 缓存的 snapshot — useSyncExternalStore 要求引用稳定 */
+  private _cachedSnapshot: AnalysisStoreSnapshot | null = null;
 
   getSnapshot(): AnalysisStoreSnapshot {
-    return {
-      loadingState: this.loadingState,
-      chordResult: this.chordResult,
-      currentChordLabel: this.currentChordLabel,
-      currentSegment: this.currentSegment,
-      segmentCount: this.chordResult?.segments.length ?? 0,
-      source: this.chordResult?.source ?? null,
-      estimatedKey: this.chordResult?.estimatedKey ?? null,
-      estimatedBpm: this.chordResult?.estimatedBpm ?? null,
-      projectId: this.projectId,
-      error: this.error,
-      warnings: this.warnings,
-      elapsedMs: this.chordResult?.elapsedMs ?? null,
-      analysisVersion: this.chordResult?.analysisVersion ?? null,
-      vocabularyVersion: this.chordResult?.vocabularyVersion ?? null,
-    };
+    if (!this._cachedSnapshot) {
+      this._cachedSnapshot = {
+        loadingState: this.loadingState,
+        chordResult: this.chordResult,
+        currentChordLabel: this.currentChordLabel,
+        currentSegment: this.currentSegment,
+        segmentCount: this.chordResult?.segments.length ?? 0,
+        source: this.chordResult?.source ?? null,
+        estimatedKey: this.chordResult?.estimatedKey ?? null,
+        estimatedBpm: this.chordResult?.estimatedBpm ?? null,
+        projectId: this.projectId,
+        error: this.error,
+        warnings: this.warnings,
+        elapsedMs: this.chordResult?.elapsedMs ?? null,
+        analysisVersion: this.chordResult?.analysisVersion ?? null,
+        vocabularyVersion: this.chordResult?.vocabularyVersion ?? null,
+      };
+    }
+    return this._cachedSnapshot;
   }
 
   setChordResult(result: ChordAnalysisResultDTO | null, projectId: string): void {
@@ -269,6 +274,7 @@ export class AnalysisStore implements IAnalysisStore {
   }
 
   private notify(): void {
+    this._cachedSnapshot = null;
     for (const listener of this.listeners) {
       try { listener(); } catch { /* View 层错误不影响 Store */ }
     }

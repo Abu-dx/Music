@@ -1,40 +1,33 @@
-/**
+﻿/**
  * @module shared/stageMapping
- * @description 跨层共享的阶段映射、阶段显示名、IPC 事件 DTO
+ * @description 璺ㄥ眰鍏变韩鐨勯樁娈垫槧灏勩€侀樁娈垫樉绀哄悕銆両PC 浜嬩欢 DTO
  *
- * GPT R7 Must Fix #2：从 application 层迁移到 shared 层，
- * 禁止 renderer import application 层常量。
- *
- * GPT R7 Suggested #4：IPC 事件 payload 统一成共享 DTO。
- *
- * 位置选择：独立文件而非 contracts.ts，因为阶段映射自成体系，
- * 放入 contracts.ts 会使其过长。规格文档 26.2 允许 shared 层
- * 包含多个文件，只要属于跨层最小公共集合。
- */
+ * GPT R7 Must Fix #2锛氫粠 application 灞傝縼绉诲埌 shared 灞傦紝
+ * 绂佹 renderer import application 灞傚父閲忋€? *
+ * GPT R7 Suggested #4锛欼PC 浜嬩欢 payload 缁熶竴鎴愬叡浜?DTO銆? *
+ * 浣嶇疆閫夋嫨锛氱嫭绔嬫枃浠惰€岄潪 contracts.ts锛屽洜涓洪樁娈垫槧灏勮嚜鎴愪綋绯伙紝
+ * 鏀惧叆 contracts.ts 浼氫娇鍏惰繃闀裤€傝鏍兼枃妗?26.2 鍏佽 shared 灞? * 鍖呭惈澶氫釜鏂囦欢锛屽彧瑕佸睘浜庤法灞傛渶灏忓叕鍏遍泦鍚堛€? */
 
 import { JobStage } from './enums';
 
 // ============================================================================
-// 1. 阶段映射表
-// ============================================================================
+// 1. 闃舵鏄犲皠琛?// ============================================================================
 
 /**
- * 阶段映射条目
+ * 闃舵鏄犲皠鏉＄洰
  */
 export interface StageMapping {
-  /** 归一化的 JobStage 枚举值 */
+  /** 褰掍竴鍖栫殑 JobStage 鏋氫妇鍊?*/
   stage: JobStage;
-  /** 建议最小进度百分比（规格文档 §16） */
+  /** 寤鸿鏈€灏忚繘搴︾櫨鍒嗘瘮锛堣鏍兼枃妗?搂16锛?*/
   minProgress: number;
-  /** 建议最大进度百分比 */
+  /** 寤鸿鏈€澶ц繘搴︾櫨鍒嗘瘮 */
   maxProgress: number;
 }
 
 /**
- * Worker 上报的 stage 字符串 → 规格文档推荐的 JobStage + 百分比区间
- *
- * 规格文档 §16 进度系统：
- * - INIT: 0-5%
+ * Worker 涓婃姤鐨?stage 瀛楃涓?鈫?瑙勬牸鏂囨。鎺ㄨ崘鐨?JobStage + 鐧惧垎姣斿尯闂? *
+ * 瑙勬牸鏂囨。 搂16 杩涘害绯荤粺锛? * - INIT: 0-5%
  * - READ_SOURCE: 5-10%
  * - PREPROCESS: 10-20%
  * - INFER: 20-80%
@@ -57,12 +50,10 @@ export const STAGE_PROGRESS_MAPPING: Record<string, StageMapping> = {
 };
 
 // ============================================================================
-// 2. 阶段显示名
-// ============================================================================
+// 2. 闃舵鏄剧ず鍚?// ============================================================================
 
 /**
- * JobStage → 用户友好显示名
- */
+ * JobStage 鈫?鐢ㄦ埛鍙嬪ソ鏄剧ず鍚? */
 export const STAGE_DISPLAY_NAMES: Record<string, string> = {
   [JobStage.Init]: '初始化',
   [JobStage.ReadSource]: '读取源文件',
@@ -77,7 +68,7 @@ export const STAGE_DISPLAY_NAMES: Record<string, string> = {
 };
 
 /**
- * 有序阶段列表（用于进度页时间线展示）
+ * 鏈夊簭闃舵鍒楄〃锛堢敤浜庤繘搴﹂〉鏃堕棿绾垮睍绀猴級
  */
 export const ORDERED_STAGES: readonly { key: string; label: string }[] = [
   { key: JobStage.Init, label: STAGE_DISPLAY_NAMES[JobStage.Init] },
@@ -92,8 +83,6 @@ export const ORDERED_STAGES: readonly { key: string; label: string }[] = [
 ];
 
 // ============================================================================
-// 3. IPC DTO 已迁移到 shared/contracts.ts（GPT R8 Decision #1）
-// ============================================================================
+// 3. IPC DTO 宸茶縼绉诲埌 shared/contracts.ts锛圙PT R8 Decision #1锛?// ============================================================================
 // SeparationProgressDTO, SeparationCompleteDTO, SeparationStartResultDTO,
-// SelectedFileDTO 现在从 shared/contracts.ts 导出。
-// 保留此注释以说明迁移历史。
+// SelectedFileDTO 鐜板湪浠?shared/contracts.ts 瀵煎嚭銆?// 淇濈暀姝ゆ敞閲婁互璇存槑杩佺Щ鍘嗗彶銆?

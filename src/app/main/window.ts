@@ -22,6 +22,7 @@ export function createMainWindow(): BrowserWindow {
 
   // 加载 renderer 打包输出
   const rendererHtml = path.join(__dirname, '..', '..', '..', 'renderer', 'index.html');
+
   win.loadFile(rendererHtml);
 
   return win;

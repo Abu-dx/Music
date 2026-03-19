@@ -322,6 +322,7 @@ export class WorkerManager implements IWorkerManager {
 
     // GPT R6 Must Fix #2：启动前异步硬校验配置
     await this.validateConfig();
+    console.log(`[REAL_CHAIN] workerManager.start spawn_prepare pythonPath="${this.config.pythonPath}" workerScriptPath="${this.config.workerScriptPath}"`);
 
     this.currentStatus = WorkerStatus.Starting;
 
@@ -363,12 +364,14 @@ export class WorkerManager implements IWorkerManager {
         pid: this.pid,
         stage: 'workerManager.start',
       });
+      console.log(`[REAL_CHAIN] workerManager.start spawn_success pid=${this.pid}`);
     } catch (err) {
       this.currentStatus = WorkerStatus.Idle;
       this.process = null;
       this.pid = null;
 
       const error = err instanceof Error ? err : new Error(String(err));
+      console.log(`[REAL_CHAIN] workerManager.start spawn_failed error="${error.message}" pythonPath="${this.config.pythonPath}" workerScriptPath="${this.config.workerScriptPath}"`);
       throw new AppError({
         code: ErrorCode.WORKER_SPAWN_FAILED,
         message: `Failed to start worker process: ${error.message}`,

@@ -244,9 +244,11 @@ export class WebAudioEngineAdapter implements IAudioEngine {
 
   setMasterVolume(volume: number): void {
     const clamped = Math.max(0, Math.min(1, volume));
+    // 指数曲线：人耳听觉为对数响应，线性滑块需要平方映射才自然
+    const gain = clamped * clamped;
     if (this.masterGainNode) {
       this.masterGainNode.gain.setValueAtTime(
-        clamped,
+        gain,
         this.audioContext?.currentTime ?? 0,
       );
     }
@@ -398,7 +400,8 @@ export class WebAudioEngineAdapter implements IAudioEngine {
    * 应用单轨增益（mute 时 gain=0）
    */
   private applyTrackGain(track: InternalTrack): void {
-    const gain = track.muted ? 0 : track.volume;
+    // 指数曲线：与 setMasterVolume 保持一致
+    const gain = track.muted ? 0 : track.volume * track.volume;
     track.gainNode.gain.setValueAtTime(
       gain,
       this.audioContext?.currentTime ?? 0,
