@@ -18,7 +18,17 @@ import time
 import wave
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Protocol
+from stem_routing import build_stem_routing_plan
+from runtime_profiles import (
+    ExecutionRequest,
+    ProcessLauncher,
+    RuntimeHealthChecker,
+    RuntimeProfile,
+    RuntimeProfileRegistry,
+    RuntimeResolution,
+    RuntimeResolver,
+)
 
 # Phase 2 defaults to stable 4-stem htdemucs.
 # Phase 2.5 can switch by env DEMUCS_MODEL=htdemucs_6s without protocol changes.
@@ -35,6 +45,18 @@ MODEL_SUPPORTED_STEM_TYPES = {
 
 DEFAULT_SEPARATION_ENGINE = "demucs"
 ALLOWED_SEPARATION_ENGINES = {"demucs", "bs_roformer_sw"}
+ENV_WORKER_PYTHON_EXE = "WORKER_PYTHON_EXE"
+ENV_DEMUCS_PYTHON_EXE = "DEMUCS_PYTHON_EXE"
+ENV_DEMUCS_RUNTIME_PROFILE = "DEMUCS_RUNTIME_PROFILE"
+ENV_ANALYSIS_RUNTIME_PROFILE = "ANALYSIS_RUNTIME_PROFILE"
+ENV_STEM_ROUTING_CONFIG_JSON = "STEM_ROUTING_CONFIG_JSON"
+ENV_CHORD_ANALYZER = "CHORD_ANALYZER"
+ENV_TEMPO_ANALYZER = "TEMPO_ANALYZER"
+
+DEFAULT_CHORD_ANALYZER_ID = "chord_rule_chroma_v1"
+DEFAULT_TEMPO_ANALYZER_ID = "tempo_rule_onset_v1"
+DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID = "analysis_default"
+DEFAULT_DEMUCS_RUNTIME_PROFILE_ID = "demucs_env_override"
 
 BS_OUTPUT_CANONICAL_FILENAMES = {
     "vocals": "vocals.wav",
@@ -450,6 +472,518 @@ def extract_chord_segments_from_chroma(
     return compact, warnings
 
 
+def compute_chroma_fallback(
+    samples: List[float],
+    sr: int,
+    hop_length: int,
+) -> "List[List[float]]":
+    """
+    librosa unavailable fallback:
+    - numpy STFT magnitude
+    - map frequency bins to 12 pitch classes
+    """
+    try:
+        import numpy as np  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("numpy is required for fallback chroma extraction") from exc
+
+    if sr <= 0:
+        return [[0.0] for _ in range(12)]
+
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size == 0:
+        return [[0.0] for _ in range(12)]
+
+    n_fft = 4096
+    if arr.size < n_fft:
+        arr = np.pad(arr, (0, n_fft - arr.size), mode="constant")
+
+    frame_count = max(1, int((arr.size - n_fft) / max(hop_length, 1)) + 1)
+    window = np.hanning(n_fft).astype(np.float32)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(sr))
+    valid_mask = (freqs >= 55.0) & (freqs <= 5000.0)
+    if not np.any(valid_mask):
+        return [[0.0] * frame_count for _ in range(12)]
+
+    valid_freqs = freqs[valid_mask]
+    midi = 69.0 + 12.0 * np.log2(np.maximum(valid_freqs, 1e-6) / 440.0)
+    pitch_classes = np.mod(np.round(midi).astype(np.int32), 12)
+
+    chroma = np.zeros((12, frame_count), dtype=np.float32)
+    for frame_idx in range(frame_count):
+        start = frame_idx * hop_length
+        frame = arr[start:start + n_fft]
+        if frame.size < n_fft:
+            frame = np.pad(frame, (0, n_fft - frame.size), mode="constant")
+        spectrum = np.abs(np.fft.rfft(frame * window))
+        weights = np.sqrt(np.maximum(spectrum[valid_mask], 0.0))
+        bins = np.bincount(pitch_classes, weights=weights, minlength=12).astype(np.float32)
+        total = float(np.sum(bins))
+        if total > 1e-8:
+            bins = bins / total
+        chroma[:, frame_idx] = bins
+
+    return chroma.tolist()
+
+
+def estimate_bpm_fallback(
+    samples: List[float],
+    sr: int,
+    hop_length: int,
+) -> Tuple[Optional[float], bool, List[str]]:
+    """
+    librosa unavailable fallback:
+    - spectral-flux onset envelope
+    - autocorrelation tempo pick
+    """
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        return None, False, ["BPM 估计依赖缺失，已隐藏该字段"]
+
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size < max(2048, hop_length * 8) or sr <= 0:
+        return None, False, ["音频过短，BPM 估计不可用"]
+
+    n_fft = 2048
+    if arr.size < n_fft:
+        arr = np.pad(arr, (0, n_fft - arr.size), mode="constant")
+    frame_count = max(1, int((arr.size - n_fft) / max(hop_length, 1)) + 1)
+    window = np.hanning(n_fft).astype(np.float32)
+
+    onset_vals: List[float] = []
+    prev = None
+    for frame_idx in range(frame_count):
+        start = frame_idx * hop_length
+        frame = arr[start:start + n_fft]
+        if frame.size < n_fft:
+            frame = np.pad(frame, (0, n_fft - frame.size), mode="constant")
+        mag = np.log1p(np.abs(np.fft.rfft(frame * window)))
+        if prev is None:
+            onset_vals.append(0.0)
+        else:
+            flux = np.maximum(0.0, mag - prev)
+            onset_vals.append(float(np.sum(flux) / max(flux.size, 1)))
+        prev = mag
+
+    onset_env = np.asarray(onset_vals, dtype=np.float32)
+    if onset_env.size < 8:
+        return None, False, ["音频节拍特征不足，BPM 估计不可用"]
+
+    onset_env = onset_env - float(np.mean(onset_env))
+    onset_env = np.maximum(onset_env, 0.0)
+    if float(np.max(onset_env)) <= 1e-8:
+        return None, False, ["节拍能量不足，BPM 估计不可用"]
+
+    min_bpm = 55.0
+    max_bpm = 200.0
+    min_lag = int(round((60.0 * sr) / (max_bpm * hop_length)))
+    max_lag = int(round((60.0 * sr) / (min_bpm * hop_length)))
+    min_lag = max(1, min_lag)
+    max_lag = min(max_lag, onset_env.size - 1)
+    if max_lag <= min_lag:
+        return None, False, ["BPM 搜索窗口不足，已隐藏该字段"]
+
+    ac = np.correlate(onset_env, onset_env, mode="full")[onset_env.size - 1:]
+    search = ac[min_lag:max_lag + 1]
+    if search.size == 0:
+        return None, False, ["BPM 自相关失败，已隐藏该字段"]
+
+    best_offset = int(np.argmax(search))
+    best_lag = min_lag + best_offset
+    bpm = float((60.0 * sr) / max(best_lag * hop_length, 1))
+    peak = float(search[best_offset])
+    baseline = float(np.median(search)) + 1e-8
+    confidence_ratio = peak / baseline
+    stable = confidence_ratio >= 1.35
+    warnings: List[str] = []
+    if not stable:
+        warnings.append("BPM 估计置信度较低，请结合听感复核")
+
+    if bpm < 40.0 or bpm > 240.0:
+        return None, False, ["BPM 超出有效范围，已隐藏该字段"]
+
+    return bpm, stable, warnings
+
+
+def infer_chord_metadata_from_label(label: str) -> Dict[str, Any]:
+    normalized = (label or "").strip()
+    if not normalized or normalized == "N":
+        return {
+            "symbol": normalized or "N",
+            "chordType": "no_chord",
+            "bassNote": None,
+            "extensions": [],
+            "alterations": [],
+            "omissions": [],
+            "vocabularyTag": "triad",
+        }
+
+    parts = normalized.split("/", 1)
+    symbol = parts[0]
+    bass = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+    lowered = symbol.lower()
+
+    chord_type = "major"
+    if lowered.endswith("m") and "maj" not in lowered:
+        chord_type = "minor"
+    if "sus" in lowered:
+        chord_type = "suspended"
+    if "dim" in lowered:
+        chord_type = "diminished"
+    if "aug" in lowered:
+        chord_type = "augmented"
+    if "7" in lowered and chord_type == "major":
+        chord_type = "dominant7"
+    if "maj7" in lowered:
+        chord_type = "major7"
+    if "m7" in lowered:
+        chord_type = "minor7"
+
+    extensions: List[str] = []
+    for token in ("7", "9", "11", "13"):
+        if token in lowered:
+            extensions.append(token)
+
+    return {
+        "symbol": normalized,
+        "chordType": chord_type,
+        "bassNote": bass,
+        "extensions": extensions,
+        "alterations": [],
+        "omissions": [],
+        "vocabularyTag": "triad",
+    }
+
+
+class ChordAnalyzer(Protocol):
+    analyzer_id: str
+    analyzer_type: str
+    runtime_profile_id: str
+
+    def analyze(
+        self,
+        *,
+        chroma: List[List[float]],
+        sr: int,
+        hop_length: int,
+    ) -> Dict[str, Any]:
+        ...
+
+
+class TempoAnalyzer(Protocol):
+    analyzer_id: str
+    analyzer_type: str
+    runtime_profile_id: str
+
+    def analyze(
+        self,
+        *,
+        bpm_candidate: Optional[float],
+        bpm_stable: bool,
+        backend_method: str,
+    ) -> Dict[str, Any]:
+        ...
+
+
+class DefaultChordAnalyzer:
+    analyzer_id = DEFAULT_CHORD_ANALYZER_ID
+    analyzer_type = "rule_based"
+    runtime_profile_id = DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID
+    analysis_version = "chord-v1"
+    vocabulary_version = "triad-v1"
+    selected_vocabulary = "triad"
+    supports_extended_chords = True
+    supported_descriptors = [
+        "major",
+        "minor",
+        "dominant7",
+        "major7",
+        "minor7",
+        "suspended",
+        "slash",
+    ]
+
+    def analyze(
+        self,
+        *,
+        chroma: List[List[float]],
+        sr: int,
+        hop_length: int,
+    ) -> Dict[str, Any]:
+        segments, warnings = extract_chord_segments_from_chroma(chroma, sr, hop_length)
+        enriched_segments: List[Dict[str, Any]] = []
+        for segment in segments:
+            label = str(segment.get("label", "N"))
+            confidence_raw = segment.get("confidence")
+            confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else None
+            metadata = infer_chord_metadata_from_label(label)
+            enriched: Dict[str, Any] = {
+                **segment,
+                "symbol": metadata["symbol"],
+                "chordType": metadata["chordType"],
+                "bassNote": metadata["bassNote"],
+                "extensions": metadata["extensions"],
+                "alterations": metadata["alterations"],
+                "omissions": metadata["omissions"],
+                "method": self.analyzer_id,
+                "vocabularyTag": metadata["vocabularyTag"],
+                "candidates": [
+                    {
+                        "label": label,
+                        "confidence": confidence if confidence is not None else 0.0,
+                        "method": self.analyzer_id,
+                    }
+                ],
+            }
+            enriched_segments.append(enriched)
+
+        return {
+            "segments": enriched_segments,
+            "warnings": warnings,
+            "analysisVersion": self.analysis_version,
+            "vocabularyVersion": self.vocabulary_version,
+            "chordVocabulary": {
+                "selected": self.selected_vocabulary,
+                "supportsExtendedChords": self.supports_extended_chords,
+                "supportedDescriptors": self.supported_descriptors,
+            },
+        }
+
+
+class DefaultTempoAnalyzer:
+    analyzer_id = DEFAULT_TEMPO_ANALYZER_ID
+    analyzer_type = "rule_based"
+    runtime_profile_id = DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID
+
+    def analyze(
+        self,
+        *,
+        bpm_candidate: Optional[float],
+        bpm_stable: bool,
+        backend_method: str,
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+        candidates: List[Dict[str, Any]] = []
+        ambiguity = {
+            "isAmbiguous": False,
+            "halfTimeBpm": None,
+            "doubleTimeBpm": None,
+            "reason": "",
+        }
+
+        primary: Optional[float] = None
+        confidence: Optional[float] = None
+        if bpm_candidate is not None and 40.0 <= bpm_candidate <= 240.0:
+            primary = float(bpm_candidate)
+            confidence = 0.82 if bpm_stable else 0.46
+            candidates.append({
+                "bpm": primary,
+                "confidence": confidence,
+                "relation": "primary",
+                "method": self.analyzer_id,
+            })
+
+            half_bpm = primary / 2.0
+            if 40.0 <= half_bpm <= 240.0:
+                half_conf = max(0.05, (confidence or 0.3) * 0.72)
+                candidates.append({
+                    "bpm": half_bpm,
+                    "confidence": half_conf,
+                    "relation": "half_time",
+                    "method": self.analyzer_id,
+                })
+                ambiguity["halfTimeBpm"] = half_bpm
+
+            double_bpm = primary * 2.0
+            if 40.0 <= double_bpm <= 240.0:
+                double_conf = max(0.05, (confidence or 0.3) * 0.68)
+                candidates.append({
+                    "bpm": double_bpm,
+                    "confidence": double_conf,
+                    "relation": "double_time",
+                    "method": self.analyzer_id,
+                })
+                ambiguity["doubleTimeBpm"] = double_bpm
+
+            if not bpm_stable and (ambiguity["halfTimeBpm"] is not None or ambiguity["doubleTimeBpm"] is not None):
+                ambiguity["isAmbiguous"] = True
+                ambiguity["reason"] = "tempo_instability_detected"
+                warnings.append("BPM 存在 half-time / double-time 模糊性，请结合听感复核")
+        elif bpm_candidate is not None:
+            warnings.append("BPM 超出有效范围，已隐藏该字段")
+        else:
+            warnings.append("未检测到稳定 BPM，已隐藏该字段")
+
+        tempo_payload = {
+            "primaryBpm": primary,
+            "confidence": confidence,
+            "method": f"{self.analyzer_id}:{backend_method}",
+            "candidates": candidates,
+            "ambiguity": ambiguity,
+        }
+        return {
+            "tempo": tempo_payload,
+            "estimatedBpm": primary,
+            "warnings": warnings,
+        }
+
+
+CHORD_ANALYZER_REGISTRY: Dict[str, ChordAnalyzer] = {
+    DEFAULT_CHORD_ANALYZER_ID: DefaultChordAnalyzer(),
+}
+
+TEMPO_ANALYZER_REGISTRY: Dict[str, TempoAnalyzer] = {
+    DEFAULT_TEMPO_ANALYZER_ID: DefaultTempoAnalyzer(),
+}
+
+
+def select_chord_analyzer(request_id: str) -> ChordAnalyzer:
+    requested = os.environ.get(ENV_CHORD_ANALYZER, DEFAULT_CHORD_ANALYZER_ID).strip().lower()
+    analyzer = CHORD_ANALYZER_REGISTRY.get(requested)
+    if analyzer is None:
+        log(
+            "WARN",
+            f"[REAL_CHAIN] execute_chord_analysis invalid_chord_analyzer request_id={request_id} "
+            f"requested={requested} fallback={DEFAULT_CHORD_ANALYZER_ID}",
+        )
+        return CHORD_ANALYZER_REGISTRY[DEFAULT_CHORD_ANALYZER_ID]
+    return analyzer
+
+
+def select_tempo_analyzer(request_id: str) -> TempoAnalyzer:
+    requested = os.environ.get(ENV_TEMPO_ANALYZER, DEFAULT_TEMPO_ANALYZER_ID).strip().lower()
+    analyzer = TEMPO_ANALYZER_REGISTRY.get(requested)
+    if analyzer is None:
+        log(
+            "WARN",
+            f"[REAL_CHAIN] execute_chord_analysis invalid_tempo_analyzer request_id={request_id} "
+            f"requested={requested} fallback={DEFAULT_TEMPO_ANALYZER_ID}",
+        )
+        return TEMPO_ANALYZER_REGISTRY[DEFAULT_TEMPO_ANALYZER_ID]
+    return analyzer
+
+
+PROCESS_LAUNCHER = ProcessLauncher()
+
+
+def _resolve_executable_candidate(candidate: str) -> str:
+    value = (candidate or "").strip()
+    if not value:
+        return ""
+    if os.path.isfile(value):
+        return value
+    found = shutil.which(value)
+    return found or value
+
+
+def _build_runtime_profile_registry() -> RuntimeProfileRegistry:
+    exe_name = "python.exe" if os.name == "nt" else "python3"
+    scripts_dir = "Scripts" if os.name == "nt" else "bin"
+    repo_root = str(Path(__file__).resolve().parents[2])
+    env_override = (
+        os.environ.get(ENV_DEMUCS_PYTHON_EXE, "").strip()
+        or os.environ.get(ENV_WORKER_PYTHON_EXE, "").strip()
+    )
+    demucs_device = os.environ.get("DEMUCS_DEVICE", "auto").strip() or "auto"
+    demucs_model_dir = os.environ.get("DEMUCS_MODEL_DIR", "").strip()
+
+    profiles = [
+        RuntimeProfile(
+            id=DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID,
+            executable=sys.executable,
+            required_modules=[],
+            isolation_mode="inprocess",
+            default_timeout_sec=120,
+            allow_fallback=False,
+        ),
+        RuntimeProfile(
+            id="demucs_env_override",
+            executable=_resolve_executable_candidate(env_override),
+            env={"DEMUCS_DEVICE": demucs_device},
+            required_modules=["demucs"],
+            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
+            device_preference=demucs_device,
+            isolation_mode="subprocess",
+            default_timeout_sec=1800,
+            allow_fallback=True,
+            fallback_profile_id="demucs_sys",
+        ),
+        RuntimeProfile(
+            id="demucs_sys",
+            executable=sys.executable,
+            env={"DEMUCS_DEVICE": demucs_device},
+            required_modules=["demucs"],
+            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
+            device_preference=demucs_device,
+            isolation_mode="subprocess",
+            default_timeout_sec=1800,
+            allow_fallback=True,
+            fallback_profile_id="demucs_cwd_venv",
+        ),
+        RuntimeProfile(
+            id="demucs_cwd_venv",
+            executable=os.path.join(os.getcwd(), ".venv", scripts_dir, exe_name),
+            env={"DEMUCS_DEVICE": demucs_device},
+            required_modules=["demucs"],
+            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
+            device_preference=demucs_device,
+            isolation_mode="subprocess",
+            default_timeout_sec=1800,
+            allow_fallback=True,
+            fallback_profile_id="demucs_repo_venv",
+        ),
+        RuntimeProfile(
+            id="demucs_repo_venv",
+            executable=os.path.join(repo_root, ".venv", scripts_dir, exe_name),
+            env={"DEMUCS_DEVICE": demucs_device},
+            required_modules=["demucs"],
+            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
+            device_preference=demucs_device,
+            isolation_mode="subprocess",
+            default_timeout_sec=1800,
+            allow_fallback=False,
+        ),
+    ]
+    return RuntimeProfileRegistry(profiles)
+
+
+def _resolve_runtime_profile(
+    *,
+    request_id: str,
+    requested_profile_id: str,
+    default_profile_id: str,
+    context: str,
+) -> RuntimeResolution:
+    registry = _build_runtime_profile_registry()
+    resolver = RuntimeResolver(registry=registry, health_checker=RuntimeHealthChecker())
+    resolution = resolver.resolve(
+        requested_profile_id=requested_profile_id,
+        default_profile_id=default_profile_id,
+    )
+    fallback = resolution.fallback_reason or "none"
+    health = "|".join(resolution.health.checks) if resolution.health.checks else "none"
+    outcome = (
+        "rejected"
+        if not resolution.health.healthy
+        else ("fallback" if resolution.requested_profile_id != resolution.actual_profile_id else "hit")
+    )
+    level = "WARN" if outcome != "hit" else "INFO"
+    log(
+        level,
+        f"[REAL_CHAIN] runtime_resolution context={context} request_id={request_id} "
+        f"requested={resolution.requested_profile_id} actual={resolution.actual_profile_id} "
+        f"fallback_reason={fallback} checks={health} "
+        f"allow_fallback={str(resolution.profile.allow_fallback).lower()} outcome={outcome}",
+    )
+    if not resolution.health.healthy:
+        raise RuntimeError(
+            f"Runtime profile unavailable: requested={resolution.requested_profile_id}, "
+            f"actual={resolution.actual_profile_id}, reason={fallback}, checks={health}"
+        )
+    return resolution
+
+
 def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
     file_path = payload.get("filePath", "")
     project_id = payload.get("projectId", "")
@@ -465,16 +999,121 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
 
     try:
         import numpy as np  # type: ignore
-        import librosa  # type: ignore
     except Exception as exc:
         send_response(request_id, False, error={
             "code": "ANALYSIS_DEPENDENCY_MISSING",
-            "message": f"Chord analysis dependencies missing: {exc}",
+            "message": f"Chord analysis dependencies missing (numpy): {exc}",
         })
         return
 
+    librosa = None
     try:
-        y, sr = librosa.load(file_path, sr=22050, mono=True)
+        import librosa as librosa_module  # type: ignore
+        librosa = librosa_module
+    except Exception as exc:
+        log(
+            "WARN",
+            f"[REAL_CHAIN] execute_chord_analysis librosa_unavailable request_id={request_id} error={exc}",
+        )
+
+    try:
+        warnings: List[str] = []
+        hop_length = 512
+        chord_analyzer = select_chord_analyzer(request_id)
+        tempo_analyzer = select_tempo_analyzer(request_id)
+        tempo_backend_method = "unknown"
+        analysis_runtime_override = os.environ.get(ENV_ANALYSIS_RUNTIME_PROFILE, "").strip()
+        chord_runtime_requested = analysis_runtime_override or chord_analyzer.runtime_profile_id
+        tempo_runtime_requested = analysis_runtime_override or tempo_analyzer.runtime_profile_id
+        chord_runtime = _resolve_runtime_profile(
+            request_id=request_id,
+            requested_profile_id=chord_runtime_requested,
+            default_profile_id=DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID,
+            context="execute_chord_analysis.chord",
+        )
+        tempo_runtime = _resolve_runtime_profile(
+            request_id=request_id,
+            requested_profile_id=tempo_runtime_requested,
+            default_profile_id=DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID,
+            context="execute_chord_analysis.tempo",
+        )
+        if chord_runtime.profile.isolation_mode != "inprocess" or tempo_runtime.profile.isolation_mode != "inprocess":
+            rejected_runtime = chord_runtime if chord_runtime.profile.isolation_mode != "inprocess" else tempo_runtime
+            rejected_checks = "|".join(rejected_runtime.health.checks) if rejected_runtime.health.checks else "none"
+            send_response(request_id, False, error={
+                "code": "ANALYSIS_RUNTIME_UNSUPPORTED",
+                "message": "Chord/tempo analysis currently supports inprocess runtime only",
+            })
+            log(
+                "WARN",
+                f"[REAL_CHAIN] runtime_resolution context=execute_chord_analysis.reject request_id={request_id} "
+                f"requested={rejected_runtime.requested_profile_id} actual={rejected_runtime.actual_profile_id} "
+                f"fallback_reason={rejected_runtime.fallback_reason or 'none'} checks={rejected_checks} "
+                f"allow_fallback={str(rejected_runtime.profile.allow_fallback).lower()} outcome=rejected_non_inprocess",
+            )
+            return
+
+        if librosa is not None:
+            y, sr = librosa.load(file_path, sr=22050, mono=True)
+            if y.size == 0:
+                send_response(request_id, False, error={
+                    "code": "ANALYSIS_AUDIO_INVALID",
+                    "message": "Audio is empty or unreadable",
+                })
+                return
+
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+            tempo_raw, beats = librosa.beat.beat_track(
+                onset_envelope=onset_env,
+                sr=sr,
+                hop_length=hop_length,
+            )
+            tempo_backend_method = "librosa.beat_track"
+            tempo = float(tempo_raw[0]) if isinstance(tempo_raw, np.ndarray) else float(tempo_raw)
+            bpm_candidate = tempo if tempo > 0 else None
+            bpm_stable = True
+            beat_count = int(len(beats)) if beats is not None else 0
+            if beat_count < 8:
+                bpm_stable = False
+            else:
+                beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=hop_length)
+                ibis = np.diff(beat_times)
+                if ibis.size < 6:
+                    bpm_stable = False
+                else:
+                    mean_ibi = float(np.mean(ibis))
+                    std_ibi = float(np.std(ibis))
+                    cv = std_ibi / max(mean_ibi, 1e-6)
+                    if cv > 0.23:
+                        bpm_stable = False
+
+            if bpm_candidate is not None and bpm_candidate >= 110.0:
+                lag = int(round((60.0 * sr) / max(bpm_candidate, 1e-6) / hop_length))
+                if lag > 0:
+                    max_size = max(2, min(len(onset_env), lag * 3))
+                    ac = librosa.autocorrelate(onset_env, max_size=max_size)
+                    base_score = float(ac[lag]) if lag < len(ac) else 0.0
+                    half_tempo_lag = lag * 2
+                    half_score = float(ac[half_tempo_lag]) if half_tempo_lag < len(ac) else 0.0
+                    half_bpm = bpm_candidate / 2.0
+                    if 58.0 <= half_bpm <= 120.0 and half_score >= base_score * 0.95:
+                        bpm_candidate = half_bpm
+                        warnings.append("检测到节拍倍频，BPM 已按半速校正")
+        else:
+            samples, sr = load_audio_mono(file_path, target_sr=22050)
+            y = np.asarray(samples, dtype=np.float32)
+            if y.size == 0:
+                send_response(request_id, False, error={
+                    "code": "ANALYSIS_AUDIO_INVALID",
+                    "message": "Audio is empty or unreadable",
+                })
+                return
+            chroma = np.asarray(compute_chroma_fallback(samples, sr, hop_length), dtype=np.float32)
+            bpm_candidate, bpm_stable, bpm_warnings = estimate_bpm_fallback(samples, sr, hop_length)
+            tempo_backend_method = "numpy.autocorrelation_fallback"
+            warnings.extend(bpm_warnings)
+
         if y.size == 0:
             send_response(request_id, False, error={
                 "code": "ANALYSIS_AUDIO_INVALID",
@@ -482,63 +1121,23 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
             })
             return
 
-        hop_length = 512
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
-        tempo_raw, beats = librosa.beat.beat_track(
-            onset_envelope=onset_env,
+        chroma_mean = np.mean(chroma, axis=1).tolist() if chroma.size > 0 else [0.0] * 12
+        estimated_key, key_margin = estimate_key_from_chroma(chroma_mean)
+        chord_result = chord_analyzer.analyze(
+            chroma=chroma.tolist(),
             sr=sr,
             hop_length=hop_length,
         )
-        tempo = float(tempo_raw[0]) if isinstance(tempo_raw, np.ndarray) else float(tempo_raw)
+        segments = chord_result.get("segments", [])
+        warnings.extend(chord_result.get("warnings", []))
 
-        chroma_mean = np.mean(chroma, axis=1).tolist() if chroma.size > 0 else [0.0] * 12
-        estimated_key, key_margin = estimate_key_from_chroma(chroma_mean)
-
-        segments, warnings = extract_chord_segments_from_chroma(chroma.tolist(), sr, hop_length)
-
-        # Conservative BPM stabilization:
-        # 1) handle common double-tempo errors (e.g. 130 shown for ~65 songs),
-        # 2) hide BPM when beat stability is poor.
-        normalized_bpm: Optional[float] = None
-        bpm_candidate = tempo if tempo > 0 else None
-
-        if bpm_candidate is not None and bpm_candidate >= 110.0:
-            lag = int(round((60.0 * sr) / max(bpm_candidate, 1e-6) / hop_length))
-            if lag > 0:
-                max_size = max(2, min(len(onset_env), lag * 3))
-                ac = librosa.autocorrelate(onset_env, max_size=max_size)
-                base_score = float(ac[lag]) if lag < len(ac) else 0.0
-                half_tempo_lag = lag * 2
-                half_score = float(ac[half_tempo_lag]) if half_tempo_lag < len(ac) else 0.0
-                half_bpm = bpm_candidate / 2.0
-                if 58.0 <= half_bpm <= 120.0 and half_score >= base_score * 0.95:
-                    bpm_candidate = half_bpm
-                    warnings.append("检测到节拍倍频，BPM 已按半速校正")
-
-        bpm_stable = True
-        beat_count = int(len(beats)) if beats is not None else 0
-        if beat_count < 8:
-            bpm_stable = False
-        else:
-            beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=hop_length)
-            ibis = np.diff(beat_times)
-            if ibis.size < 6:
-                bpm_stable = False
-            else:
-                mean_ibi = float(np.mean(ibis))
-                std_ibi = float(np.std(ibis))
-                cv = std_ibi / max(mean_ibi, 1e-6)
-                if cv > 0.23:
-                    bpm_stable = False
-
-        if bpm_candidate is None or bpm_candidate < 55.0 or bpm_candidate > 200.0:
-            bpm_stable = False
-
-        if bpm_stable and bpm_candidate is not None:
-            normalized_bpm = bpm_candidate
-        elif tempo > 0:
-            warnings.append("BPM 估计值不稳定，已隐藏该字段")
+        tempo_result = tempo_analyzer.analyze(
+            bpm_candidate=bpm_candidate,
+            bpm_stable=bpm_stable,
+            backend_method=tempo_backend_method,
+        )
+        normalized_bpm = tempo_result.get("estimatedBpm")
+        warnings.extend(tempo_result.get("warnings", []))
 
         normalized_key: Optional[str] = None
         if estimated_key != "Unknown" and key_margin >= KEY_CONFIDENCE_MARGIN:
@@ -552,19 +1151,31 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
 
         duration_ms = int((len(y) / sr) * 1000) if sr > 0 else 0
         elapsed_ms = int((time.time() - started_at) * 1000)
+        log(
+            "INFO",
+            f"[REAL_CHAIN] execute_chord_analysis analyzers request_id={request_id} "
+            f"chord={chord_analyzer.analyzer_id}@{chord_runtime.actual_profile_id} "
+            f"tempo={tempo_analyzer.analyzer_id}@{tempo_runtime.actual_profile_id}",
+        )
 
         send_response(request_id, True, data={
             "projectId": project_id,
             "source": "mixed",
-            "analyzerType": "rule_based",
+            "analyzerType": chord_analyzer.analyzer_type,
+            "analysisMethods": {
+                "chordAnalyzer": chord_analyzer.analyzer_id,
+                "tempoAnalyzer": tempo_analyzer.analyzer_id,
+            },
             "segments": segments,
             "elapsedMs": elapsed_ms,
             "analyzedAt": int(time.time() * 1000),
             "audioDurationMs": duration_ms,
             "estimatedKey": normalized_key,
             "estimatedBpm": normalized_bpm,
-            "analysisVersion": "chord-v1",
-            "vocabularyVersion": "triad-v1",
+            "tempo": tempo_result.get("tempo"),
+            "analysisVersion": chord_result.get("analysisVersion", "chord-v1"),
+            "vocabularyVersion": chord_result.get("vocabularyVersion", "triad-v1"),
+            "chordVocabulary": chord_result.get("chordVocabulary"),
             "warnings": warnings,
             "generatedAt": int(time.time() * 1000),
         })
@@ -622,25 +1233,48 @@ def _run_demucs_engine(
     supported_stem_types = MODEL_SUPPORTED_STEM_TYPES.get(model_name, MODEL_SUPPORTED_STEM_TYPES[DEFAULT_DEMUCS_MODEL])
 
     source_basename = Path(file_path).stem
+    requested_runtime_profile = (
+        os.environ.get(ENV_DEMUCS_RUNTIME_PROFILE, "").strip()
+        or DEFAULT_DEMUCS_RUNTIME_PROFILE_ID
+    )
+    demucs_runtime = _resolve_runtime_profile(
+        request_id=request_id,
+        requested_profile_id=requested_runtime_profile,
+        default_profile_id=DEFAULT_DEMUCS_RUNTIME_PROFILE_ID,
+        context="start_separation.demucs",
+    )
+
     cmd = [
-        sys.executable, "-m", "demucs",
+        "-m", "demucs",
         "-n", model_name,
         "-o", output_dir,
         file_path,
     ]
-    log("INFO", f"[REAL_CHAIN] start_separation demucs_cmd request_id={request_id} cmd={' '.join(cmd)}")
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=1800,
+    execution = PROCESS_LAUNCHER.launch(
+        demucs_runtime.profile,
+        ExecutionRequest(
+            args=cmd,
+            timeout_sec=1800,
+            prepend_executable=True,
+        ),
     )
-    log("INFO", f"[REAL_CHAIN] start_separation demucs_return request_id={request_id} returncode={result.returncode}")
+    log(
+        "INFO",
+        f"[REAL_CHAIN] start_separation demucs_cmd request_id={request_id} "
+        f"profile={demucs_runtime.actual_profile_id} cmd={execution.command_display}",
+    )
+    log(
+        "INFO",
+        f"[REAL_CHAIN] start_separation demucs_return request_id={request_id} "
+        f"profile={demucs_runtime.actual_profile_id} returncode={execution.returncode} elapsed_ms={execution.elapsed_ms}",
+    )
 
-    if result.returncode != 0:
-        stderr_tail = (result.stderr or "")[-1200:]
-        raise RuntimeError(f"Demucs exited with code {result.returncode}; stderr={stderr_tail}")
+    if execution.returncode != 0:
+        stderr_tail = execution.stderr[-1200:]
+        raise RuntimeError(
+            f"Demucs exited with code {execution.returncode}; "
+            f"runtime={demucs_runtime.actual_profile_id}; stderr={stderr_tail}"
+        )
 
     demucs_output_dir = os.path.join(output_dir, model_name, source_basename)
     if not os.path.isdir(demucs_output_dir):
@@ -928,6 +1562,32 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
         if not engine_result or len(engine_result.get("stems", [])) == 0:
             raise RuntimeError("No stems produced by selected separation engine")
 
+        # Build stem-level route metadata (base-only execution this round).
+        engine_version = str(engine_result.get("engineVersion", ""))
+        effective_base_runner = "demucs" if engine_version.startswith("demucs-") else selected_engine
+        routing_plan = build_stem_routing_plan(
+            request_id=request_id,
+            base_runner=effective_base_runner,
+            base_model=str(engine_result.get("modelName", DEFAULT_DEMUCS_MODEL)),
+            base_supported_stems=engine_result.get("supportedStemTypes", []),
+            requested_config_json=os.environ.get(ENV_STEM_ROUTING_CONFIG_JSON, ""),
+        )
+        for warning in routing_plan.get("warnings", []):
+            log("WARN", f"[REAL_CHAIN] start_separation routing_warning request_id={request_id} detail={warning}")
+        deferred_count = 0
+        for assignment in routing_plan.get("assignments", []):
+            if (
+                assignment.get("requestedRunner") != assignment.get("effectiveRunner")
+                or assignment.get("requestedModel") != assignment.get("effectiveModel")
+            ):
+                deferred_count += 1
+        log(
+            "INFO",
+            f"[REAL_CHAIN] start_separation routing_plan request_id={request_id} "
+            f"mode={routing_plan.get('routingMode', 'base_only')} "
+            f"assignments={len(routing_plan.get('assignments', []))} deferred={deferred_count}",
+        )
+
         # 鍙戦€?progress: postprocessing
         send_event("stage_progress", {
             "stage": "POSTPROCESS",
@@ -947,6 +1607,9 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
             "supportedStemTypes": engine_result.get("supportedStemTypes", MODEL_SUPPORTED_STEM_TYPES[DEFAULT_DEMUCS_MODEL]),
             "sourceDurationMs": get_audio_duration_ms(file_path),
             "stems": engine_result.get("stems", []),
+            "stemRoutingVersion": routing_plan.get("version", "stem-routing-v1"),
+            "routingMode": routing_plan.get("routingMode", "base_only"),
+            "stemRoutingAssignments": routing_plan.get("assignments", []),
         }
         if used_fallback:
             response_data["fallbackFromEngine"] = "bs_roformer_sw"

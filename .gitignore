@@ -34,3 +34,18 @@ Thumbs.db
 .claude/
 node_modules/
 dist/
+
+# 虚拟环境 - 千万不要提交！
+python/venvs/
+python/venv/
+
+# 临时文件
+.tmp_*
+*.tmp
+
+# 输出文件
+python/mdx_smoke_out/
+python/models/mdx_piano/
+
+# 第三方代码（如果用标准包管理）  
+python/third_party/uvr-mdx-infer/

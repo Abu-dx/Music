@@ -19,6 +19,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
+import { spawnSync } from 'child_process';
 import { app } from 'electron';
 import {
   WorkerManager,
@@ -176,20 +177,61 @@ interface RawChordSegmentResult {
   simplifiedLabel?: string;
   confidence?: number;
   sourceFlags?: string[];
+  symbol?: string;
+  chordType?: string;
+  bassNote?: string;
+  extensions?: string[];
+  alterations?: string[];
+  omissions?: string[];
+  candidates?: Array<{
+    label: string;
+    confidence?: number;
+    method?: string;
+  }>;
+  method?: string;
+  vocabularyTag?: string;
+}
+
+interface RawTempoAnalysisResult {
+  primaryBpm?: number;
+  confidence?: number;
+  method: string;
+  candidates: Array<{
+    bpm: number;
+    confidence?: number;
+    relation?: string;
+    method?: string;
+  }>;
+  ambiguity?: {
+    isAmbiguous: boolean;
+    halfTimeBpm?: number;
+    doubleTimeBpm?: number;
+    reason?: string;
+  };
 }
 
 interface RawChordAnalysisResult {
   projectId: string;
   source: string;
   analyzerType: string;
+  analysisMethods?: {
+    chordAnalyzer: string;
+    tempoAnalyzer: string;
+  };
   segments: RawChordSegmentResult[];
   elapsedMs: number;
   analyzedAt: number;
   audioDurationMs: number;
   estimatedKey?: string;
   estimatedBpm?: number;
+  tempo?: RawTempoAnalysisResult;
   analysisVersion?: string;
   vocabularyVersion?: string;
+  chordVocabulary?: {
+    selected: string;
+    supportsExtendedChords: boolean;
+    supportedDescriptors: string[];
+  };
   warnings?: string[];
   generatedAt?: number;
 }
@@ -330,6 +372,55 @@ function resolveWorkerScriptPath(): string {
   return candidates[0];
 }
 
+function isUsablePythonExecutable(candidatePath: string): boolean {
+  try {
+    return fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function hasDemucsModule(pythonPath: string): boolean {
+  try {
+    const probe = spawnSync(
+      pythonPath,
+      ['-c', 'import demucs'],
+      {
+        stdio: 'ignore',
+        timeout: 10_000,
+        windowsHide: true,
+      },
+    );
+    return probe.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function resolveDemucsPythonPath(workerScriptPath: string): string | null {
+  const explicit = process.env.DEMUCS_PYTHON_EXE?.trim();
+  if (explicit && isUsablePythonExecutable(explicit)) {
+    return explicit;
+  }
+
+  const exeName = process.platform === 'win32' ? 'python.exe' : 'python3';
+  const scriptsDir = process.platform === 'win32' ? 'Scripts' : 'bin';
+  const candidates = [
+    path.join(process.cwd(), '.venv', scriptsDir, exeName),
+    path.join(app.getAppPath(), '.venv', scriptsDir, exeName),
+    path.resolve(workerScriptPath, '..', '..', '..', '.venv', scriptsDir, exeName),
+  ];
+
+  for (const candidate of candidates) {
+    if (!isUsablePythonExecutable(candidate)) continue;
+    if (hasDemucsModule(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 export interface WorkerInfra {
   workerManager: WorkerManager;
   ipcBridge: WorkerIpcBridge;
@@ -361,9 +452,18 @@ export function initWorkerInfra(): WorkerInfra {
 
   // 确定 Python Worker 脚本路径
   const workerScriptPath = resolveWorkerScriptPath();
+  const demucsPythonPath = resolveDemucsPythonPath(workerScriptPath);
+  if (demucsPythonPath && !process.env.DEMUCS_PYTHON_EXE) {
+    process.env.DEMUCS_PYTHON_EXE = demucsPythonPath;
+    console.log(`[REAL_CHAIN] workerSetup.initWorkerInfra demucs_python_override=\"${demucsPythonPath}\"`);
+    logger.info('Resolved DEMUCS_PYTHON_EXE automatically', { demucsPythonPath });
+  }
+  if (demucsPythonPath && !process.env.WORKER_PYTHON_EXE) {
+    process.env.WORKER_PYTHON_EXE = demucsPythonPath;
+    logger.info('Resolved WORKER_PYTHON_EXE automatically', { workerPythonPath: demucsPythonPath });
+  }
 
-  // 确定 Python 可执行文件路径
-  const pythonPath = process.platform === 'win32' ? 'python' : 'python3';
+  const pythonPath = demucsPythonPath ?? (process.platform === 'win32' ? 'python' : 'python3');
 
   const config: WorkerManagerConfig = {
     pythonPath,

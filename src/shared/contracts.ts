@@ -458,6 +458,34 @@ export interface StemPlaybackControlDTO {
  * - 相邻段 segments[i].endMs <= segments[i+1].startMs（允许间隙，不允许重叠）
  * - startMs >= 0, endMs <= 音频总时长
  */
+export interface ChordCandidateDTO {
+  label: string;
+  confidence?: number;
+  method?: string;
+}
+
+export interface TempoCandidateDTO {
+  bpm: number;
+  confidence?: number;
+  relation?: string;
+  method?: string;
+}
+
+export interface TempoAmbiguityDTO {
+  isAmbiguous: boolean;
+  halfTimeBpm?: number;
+  doubleTimeBpm?: number;
+  reason?: string;
+}
+
+export interface TempoAnalysisDTO {
+  primaryBpm?: number;
+  confidence?: number;
+  method: string;
+  candidates: TempoCandidateDTO[];
+  ambiguity?: TempoAmbiguityDTO;
+}
+
 export interface ChordSegmentDTO {
   /** 起始时间（ms） */
   startMs: number;
@@ -491,6 +519,15 @@ export interface ChordSegmentDTO {
    * 可选，用于调试和诊断。
    */
   sourceFlags?: string[];
+  symbol?: string;
+  chordType?: string;
+  bassNote?: string;
+  extensions?: string[];
+  alterations?: string[];
+  omissions?: string[];
+  candidates?: ChordCandidateDTO[];
+  method?: string;
+  vocabularyTag?: string;
 }
 
 /**
@@ -515,6 +552,10 @@ export interface ChordAnalysisResultDTO {
    * 'rule_based' | 'ml'
    */
   analyzerType: string;
+  analysisMethods?: {
+    chordAnalyzer: string;
+    tempoAnalyzer: string;
+  };
   /** 和弦片段列表（按时间排序） */
   segments: ChordSegmentDTO[];
   /** 分析耗时（ms） */
@@ -532,6 +573,7 @@ export interface ChordAnalysisResultDTO {
   estimatedKey?: string;
   /** 估计 BPM（可选） */
   estimatedBpm?: number;
+  tempo?: TempoAnalysisDTO;
   /**
    * 分析引擎版本（GPT R11 Must Fix #4）
    * 用于缓存兼容性校验 — 版本不匹配时应重新分析。
@@ -542,6 +584,11 @@ export interface ChordAnalysisResultDTO {
    * 不同版本可能输出不同标签格式。
    */
   vocabularyVersion?: string;
+  chordVocabulary?: {
+    selected: string;
+    supportsExtendedChords: boolean;
+    supportedDescriptors: string[];
+  };
   /**
    * 诊断警告（GPT R11 Must Fix #4, #5）
    *

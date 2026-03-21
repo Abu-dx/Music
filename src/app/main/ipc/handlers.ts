@@ -6,7 +6,7 @@
  * - startSeparation: 閫氳繃 ParseJobService 璋冪敤鐪熷疄 Demucs Worker
  * - getStemsByProject: 浠?stemFileRepo 杩斿洖鐪熷疄 stem 鏂囦欢璺緞
  * - getProjectResult: 鐪熷疄鍒嗙鍚?sourceTypeLabel 涓嶅惈"妯℃嫙"
- * - getWaveform / getChordAnalysis: 浠嶈繑鍥?mock 鏁版嵁锛堟槑纭爣璁?mock_stub锛? *
+ * - getWaveform / getChordAnalysis: 浼樺厛璧扮湡瀹?Worker 鍒嗘瀽锛屽け璐ユ椂涓嶅啀鍥為€€鍋囨暟鎹?
  * Mock 鍥為€€锛? * - Worker 鏈惎鍔?/ HealthCheck 澶辫触 / Demucs 鏈畨瑁?鈫?mock 瀹氭椂鍣ㄦā鎷? * - 鐪熷疄鍒嗙璋冪敤澶辫触 鈫?閿欒閫氱煡 renderer锛屼笉 crash
  */
 
@@ -61,20 +61,61 @@ type CachedChordSegmentDTO = {
   simplifiedLabel?: string;
   confidence?: number;
   sourceFlags?: string[];
+  symbol?: string;
+  chordType?: string;
+  bassNote?: string;
+  extensions?: string[];
+  alterations?: string[];
+  omissions?: string[];
+  candidates?: Array<{
+    label: string;
+    confidence?: number;
+    method?: string;
+  }>;
+  method?: string;
+  vocabularyTag?: string;
+};
+
+type CachedTempoAnalysisDTO = {
+  primaryBpm?: number;
+  confidence?: number;
+  method: string;
+  candidates: Array<{
+    bpm: number;
+    confidence?: number;
+    relation?: string;
+    method?: string;
+  }>;
+  ambiguity?: {
+    isAmbiguous: boolean;
+    halfTimeBpm?: number;
+    doubleTimeBpm?: number;
+    reason?: string;
+  };
 };
 
 type CachedChordAnalysisDTO = {
   projectId: string;
   source: string;
   analyzerType: string;
+  analysisMethods?: {
+    chordAnalyzer: string;
+    tempoAnalyzer: string;
+  };
   segments: CachedChordSegmentDTO[];
   elapsedMs: number;
   analyzedAt: number;
   audioDurationMs: number;
   estimatedKey?: string;
   estimatedBpm?: number;
+  tempo?: CachedTempoAnalysisDTO;
   analysisVersion?: string;
   vocabularyVersion?: string;
+  chordVocabulary?: {
+    selected: string;
+    supportsExtendedChords: boolean;
+    supportedDescriptors: string[];
+  };
   warnings?: string[];
   generatedAt?: number;
 };
@@ -232,13 +273,13 @@ function toSeparationFailureMessage(err: unknown): string {
 function toAnalysisFailureMessage(err: unknown, fallback: string): string {
   const raw = normalizeErrorMessage(err, fallback);
   if (raw.includes('INPUT_FILE_NOT_FOUND') || raw.includes('Source file not found')) {
-    return '分析输入文件不存在，已回退到示例数据';
+    return '分析输入文件不存在，未返回分析结果';
   }
   if (raw.includes('ANALYSIS_DEPENDENCY_MISSING')) {
-    return '分析依赖缺失（librosa/torchaudio），已回退到示例数据';
+    return '分析依赖缺失（librosa/torchaudio），未返回分析结果';
   }
   if (raw.includes('WORKER_IPC') || raw.includes('Worker')) {
-    return '分析 Worker 不可用，已回退到示例数据';
+    return '分析 Worker 不可用，未返回分析结果';
   }
   return raw;
 }
@@ -331,7 +372,7 @@ function getMockWaveform(projectId: string, durationMs: number) {
   };
 }
 
-/** Mock 鍜屽鸡鍒嗘瀽锛圥hase 2 涓嶅仛鐪熷疄 chord/BPM/key锛?*/
+/** Legacy mock chord 鏁版嵁鐢熸垚鍣紙淇濈暀浠呬緵娓呯悊鏈熷弬鑰冿紝涓婚摼璺笉鍐嶈繑鍥烇級 */
 function getMockChordAnalysis(projectId: string, durationMs: number, createdAt: number) {
   const chords = [
     { label: 'C', simplifiedLabel: 'C', startMs: 0, endMs: 4000, confidence: 0.92 },
@@ -1184,7 +1225,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
     const sourceFilePath = await resolveAnalysisSourceFilePath(project, workerInfra);
     if (!sourceFilePath) {
-      return getMockChordAnalysis(projectId, project.durationMs ?? 0, project.createdAt);
+      console.log(
+        `[REAL_CHAIN] handlers.project:getChordAnalysis miss projectId="${projectId}" ` +
+        'reason="no_source_file"',
+      );
+      return null;
     }
     const sourceKind = project.originalFilePath
       && fs.existsSync(project.originalFilePath)
@@ -1226,7 +1271,17 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     }
 
     if (!ensureWorkerAcceptingRequests(workerInfra)) {
-      return getMockChordAnalysis(projectId, project.durationMs ?? 0, project.createdAt);
+      console.log(
+        `[REAL_CHAIN] handlers.project:getChordAnalysis miss projectId="${projectId}" ` +
+        'reason="worker_not_ready"',
+      );
+      if (cached) {
+        console.log(
+          `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache projectId="${projectId}"`,
+        );
+        return cached.result;
+      }
+      return null;
     }
 
     try {
@@ -1266,13 +1321,88 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           simplifiedLabel: typeof seg.simplifiedLabel === 'string' ? seg.simplifiedLabel : undefined,
           confidence: typeof seg.confidence === 'number' ? seg.confidence : undefined,
           sourceFlags: Array.isArray(seg.sourceFlags) ? seg.sourceFlags.filter((f) => typeof f === 'string') : undefined,
+          symbol: typeof (seg as { symbol?: unknown }).symbol === 'string'
+            ? (seg as { symbol: string }).symbol
+            : undefined,
+          chordType: typeof (seg as { chordType?: unknown }).chordType === 'string'
+            ? (seg as { chordType: string }).chordType
+            : undefined,
+          bassNote: typeof (seg as { bassNote?: unknown }).bassNote === 'string'
+            ? (seg as { bassNote: string }).bassNote
+            : undefined,
+          extensions: Array.isArray((seg as { extensions?: unknown }).extensions)
+            ? ((seg as { extensions: unknown[] }).extensions.filter((v) => typeof v === 'string') as string[])
+            : undefined,
+          alterations: Array.isArray((seg as { alterations?: unknown }).alterations)
+            ? ((seg as { alterations: unknown[] }).alterations.filter((v) => typeof v === 'string') as string[])
+            : undefined,
+          omissions: Array.isArray((seg as { omissions?: unknown }).omissions)
+            ? ((seg as { omissions: unknown[] }).omissions.filter((v) => typeof v === 'string') as string[])
+            : undefined,
+          candidates: Array.isArray((seg as { candidates?: unknown }).candidates)
+            ? ((seg as { candidates: unknown[] }).candidates
+              .flatMap((item) => {
+                if (!isObjectLike(item) || typeof item.label !== 'string') {
+                  return [];
+                }
+                const candidate = item as Record<string, unknown>;
+                return [{
+                  label: candidate.label as string,
+                  confidence: typeof candidate.confidence === 'number' ? candidate.confidence : undefined,
+                  method: typeof candidate.method === 'string' ? candidate.method : undefined,
+                }];
+              }))
+            : undefined,
+          method: typeof (seg as { method?: unknown }).method === 'string'
+            ? (seg as { method: string }).method
+            : undefined,
+          vocabularyTag: typeof (seg as { vocabularyTag?: unknown }).vocabularyTag === 'string'
+            ? (seg as { vocabularyTag: string }).vocabularyTag
+            : undefined,
         }));
 
+      const rawTempo = isObjectLike((raw as { tempo?: unknown }).tempo)
+        ? ((raw as { tempo: Record<string, unknown> }).tempo)
+        : null;
+      const tempoPrimary = rawTempo && typeof rawTempo.primaryBpm === 'number' && Number.isFinite(rawTempo.primaryBpm)
+        ? rawTempo.primaryBpm
+        : undefined;
       const rawEstimatedBpm = typeof raw.estimatedBpm === 'number' && Number.isFinite(raw.estimatedBpm)
         ? raw.estimatedBpm
-        : undefined;
+        : tempoPrimary;
       const normalizedEstimatedBpm = rawEstimatedBpm != null && rawEstimatedBpm >= 40 && rawEstimatedBpm <= 240
         ? rawEstimatedBpm
+        : undefined;
+      const tempo: CachedTempoAnalysisDTO | undefined = rawTempo
+        ? {
+          primaryBpm: tempoPrimary,
+          confidence: typeof rawTempo.confidence === 'number' ? rawTempo.confidence : undefined,
+          method: typeof rawTempo.method === 'string' ? rawTempo.method : 'tempo_default',
+          candidates: Array.isArray(rawTempo.candidates)
+            ? rawTempo.candidates
+              .filter((item) => isObjectLike(item) && typeof item.bpm === 'number' && Number.isFinite(item.bpm))
+              .map((item) => ({
+                bpm: item.bpm as number,
+                confidence: typeof item.confidence === 'number' ? item.confidence : undefined,
+                relation: typeof item.relation === 'string' ? item.relation : undefined,
+                method: typeof item.method === 'string' ? item.method : undefined,
+              }))
+            : [],
+          ambiguity: isObjectLike(rawTempo.ambiguity)
+            ? {
+              isAmbiguous: Boolean(rawTempo.ambiguity.isAmbiguous),
+              halfTimeBpm: typeof rawTempo.ambiguity.halfTimeBpm === 'number'
+                ? rawTempo.ambiguity.halfTimeBpm
+                : undefined,
+              doubleTimeBpm: typeof rawTempo.ambiguity.doubleTimeBpm === 'number'
+                ? rawTempo.ambiguity.doubleTimeBpm
+                : undefined,
+              reason: typeof rawTempo.ambiguity.reason === 'string'
+                ? rawTempo.ambiguity.reason
+                : undefined,
+            }
+            : undefined,
+        }
         : undefined;
       const warnings = Array.isArray(raw.warnings) ? raw.warnings.filter((w) => typeof w === 'string') : [];
       if (rawEstimatedBpm != null && normalizedEstimatedBpm == null) {
@@ -1286,14 +1416,37 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         projectId,
         source: typeof raw.source === 'string' ? raw.source : 'mixed',
         analyzerType: typeof raw.analyzerType === 'string' ? raw.analyzerType : 'rule_based',
+        analysisMethods: isObjectLike((raw as { analysisMethods?: unknown }).analysisMethods)
+          ? {
+            chordAnalyzer: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzer) === 'string'
+              ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzer as string)
+              : 'chord_default',
+            tempoAnalyzer: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzer) === 'string'
+              ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzer as string)
+              : 'tempo_default',
+          }
+          : undefined,
         segments,
         elapsedMs: typeof raw.elapsedMs === 'number' ? Math.max(0, Math.floor(raw.elapsedMs)) : 0,
         analyzedAt: typeof raw.analyzedAt === 'number' ? raw.analyzedAt : Date.now(),
         audioDurationMs: typeof raw.audioDurationMs === 'number' ? Math.max(0, Math.floor(raw.audioDurationMs)) : (project.durationMs ?? 0),
         estimatedKey: typeof raw.estimatedKey === 'string' ? raw.estimatedKey : undefined,
         estimatedBpm: normalizedEstimatedBpm,
+        tempo,
         analysisVersion: typeof raw.analysisVersion === 'string' ? raw.analysisVersion : expectedAnalysisVersion,
         vocabularyVersion: typeof raw.vocabularyVersion === 'string' ? raw.vocabularyVersion : 'triad-v1',
+        chordVocabulary: isObjectLike((raw as { chordVocabulary?: unknown }).chordVocabulary)
+          ? {
+            selected: typeof ((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.selected) === 'string'
+              ? ((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.selected as string)
+              : 'triad',
+            supportsExtendedChords: Boolean((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.supportsExtendedChords),
+            supportedDescriptors: Array.isArray((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.supportedDescriptors)
+              ? (((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.supportedDescriptors as unknown[])
+                .filter((item) => typeof item === 'string') as string[])
+              : [],
+          }
+          : undefined,
         warnings,
         generatedAt: typeof raw.generatedAt === 'number' ? raw.generatedAt : Date.now(),
       };
@@ -1326,15 +1479,22 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       );
       return chordResult;
     } catch (err) {
-      const fallback = getMockChordAnalysis(projectId, project.durationMs ?? 0, project.createdAt);
-      const warning = toAnalysisFailureMessage(err, '真实和弦分析失败，已回退到示例数据');
-      fallback.warnings = Array.from(new Set([...(fallback.warnings ?? []), warning]));
-      console.log(
-        `[REAL_CHAIN] handlers.project:getChordAnalysis fallback_summary projectId="${projectId}" ` +
-        `source_kind="${sourceKind}" analysisVersion="${expectedAnalysisVersion}" ` +
-        `segments=${fallback.segments.length} has_warning=true`,
+      const warning = toAnalysisFailureMessage(err, '真实和弦分析失败，未返回示例数据');
+      console.warn(
+        `[Analysis] getChordAnalysis unavailable. projectId=${projectId}, reason=${warning}`,
       );
-      return fallback;
+      if (cached) {
+        console.log(
+          `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache_on_error projectId="${projectId}"`,
+        );
+        return cached.result;
+      }
+      console.log(
+        `[REAL_CHAIN] handlers.project:getChordAnalysis fail_summary projectId="${projectId}" ` +
+        `source_kind="${sourceKind}" analysisVersion="${expectedAnalysisVersion}" ` +
+        'segments=0 has_warning=true',
+      );
+      return null;
     }
   });
 
