@@ -17,11 +17,16 @@
  * - 鎾斁鎺у埗 鈫?playbackStore
  * - 瀹為檯瀵煎嚭 鈫?exportService锛堝悗缁?Round锛? * - 鍜屽鸡鍒嗘瀽閫昏緫 鈫?analysisStore锛堝悗缁?Round锛? */
 
-import React, { useEffect, useSyncExternalStore, useCallback, useState } from 'react';
+import React, { useEffect, useSyncExternalStore, useCallback, useRef, useState } from 'react';
 import { IProjectStore } from '../stores/projectStore';
 import { IAnalysisStore } from '../stores/analysisStore';
 import { IExportService } from '../services/exportService';
-import type { StemTrackDTO, StemPresence, ExportRequestDTO } from '../../shared/contracts';
+import type {
+  StemTrackDTO,
+  StemPresence,
+  ExportRequestDTO,
+  AnalysisErrorDTO,
+} from '../../shared/contracts';
 
 // ============================================================================
 // 1. Props
@@ -122,6 +127,12 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const [exportInfo, setExportInfo] = useState<string | null>(null);
   const [hasRequestedLoad, setHasRequestedLoad] = useState(false);
   const [projectMissing, setProjectMissing] = useState(false);
+  const [renameModalOpen, setRenameModalOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState('');
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renameBusy, setRenameBusy] = useState(false);
+  const accessMarkedRef = useRef(false);
+  const analysisLoadedForProjectRef = useRef<string | null>(null);
 
   const getExportWarnings = (result: unknown): string[] => {
     if (!result || typeof result !== 'object') return [];
@@ -136,6 +147,11 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     setHasRequestedLoad(true);
     projectStore.loadProjectResult(projectId);
   }, [projectStore, projectId]);
+
+  useEffect(() => {
+    accessMarkedRef.current = false;
+    analysisLoadedForProjectRef.current = null;
+  }, [projectId]);
 
   // 定时刷新一次，避免“当前页项目已被删除”时继续展示旧状态
   useEffect(() => {
@@ -161,6 +177,62 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     return () => window.clearTimeout(timer);
   }, [projectMissing, onNavigateToHome]);
 
+  useEffect(() => {
+    if (accessMarkedRef.current) return;
+    if (!hasRequestedLoad || isLoading || !projectResult) return;
+    if (projectResult.id !== projectId) return;
+
+    accessMarkedRef.current = true;
+    projectStore.markProjectAccessed(projectId).catch(() => {
+      // Retry once on next stable render if IPC fails transiently.
+      accessMarkedRef.current = false;
+    });
+  }, [hasRequestedLoad, isLoading, projectResult, projectId, projectStore]);
+
+  useEffect(() => {
+    if (!hasRequestedLoad || isLoading || !projectResult) return;
+    if (projectResult.id !== projectId) return;
+    if (
+      analysisSnap.projectId === projectId
+      && (analysisSnap.loadingState === 'loaded' || analysisSnap.loadingState === 'empty')
+    ) {
+      analysisLoadedForProjectRef.current = projectId;
+      return;
+    }
+    if (analysisLoadedForProjectRef.current === projectId) return;
+
+    analysisLoadedForProjectRef.current = projectId;
+    analysisStore.setLoading(projectId);
+
+    projectStore.getChordAnalysis(projectId)
+      .then((result) => {
+        analysisStore.setChordResult(result, projectId);
+      })
+      .catch((err) => {
+        analysisLoadedForProjectRef.current = null;
+        const analysisError: AnalysisErrorDTO = {
+          code: 'RESULT_CHORD_LOAD_FAILED',
+          message: err instanceof Error ? err.message : String(err),
+          userMessage: '和弦分析加载失败',
+          context: {
+            projectId,
+            operation: 'ResultPage.loadChordAnalysis',
+          },
+          retryable: true,
+        };
+        analysisStore.setError(analysisError, projectId);
+      });
+  }, [
+    hasRequestedLoad,
+    isLoading,
+    projectResult,
+    projectId,
+    projectStore,
+    analysisStore,
+    analysisSnap.projectId,
+    analysisSnap.loadingState,
+  ]);
+
   // 打开项目目录
   const handleOpenDir = useCallback(async () => {
     try {
@@ -175,6 +247,44 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const handleEnterPlayer = useCallback(() => {
     onNavigateToPlayer(projectId);
   }, [onNavigateToPlayer, projectId]);
+
+  const handleRenameProject = useCallback(() => {
+    setRenameValue(projectResult?.displayName ?? '');
+    setRenameError(null);
+    setRenameModalOpen(true);
+  }, [projectResult?.displayName]);
+
+  const handleCancelRename = useCallback(() => {
+    if (renameBusy) return;
+    setRenameModalOpen(false);
+    setRenameError(null);
+  }, [renameBusy]);
+
+  const handleConfirmRename = useCallback(async () => {
+    const currentName = projectResult?.displayName ?? '';
+    const nextName = renameValue.trim();
+    if (nextName.length === 0) {
+      setRenameError('项目名称不能为空');
+      return;
+    }
+    if (nextName === currentName) {
+      setRenameModalOpen(false);
+      setRenameError(null);
+      return;
+    }
+
+    try {
+      setRenameBusy(true);
+      setRenameError(null);
+      await projectStore.renameProject(projectId, nextName);
+      await projectStore.loadProjectResult(projectId);
+      setRenameModalOpen(false);
+    } catch (err) {
+      setRenameError(err instanceof Error ? err.message : '重命名失败');
+    } finally {
+      setRenameBusy(false);
+    }
+  }, [projectResult?.displayName, renameValue, projectStore, projectId]);
 
   // 全部导出
   const handleExportAll = useCallback(async () => {
@@ -268,6 +378,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const existingStems = stems.filter(s => s.presence === 'exists');
   const mergedStems = stems.filter(s => s.presence === 'merged');
   const missingStems = stems.filter(s => s.presence === 'missing');
+  const totalTrackCount = existingStems.length + mergedStems.length + missingStems.length;
 
   if (isLoading && !projectResult) {
     return (
@@ -313,7 +424,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
                     ?? projectResult.sourceType}
                 </span>
                 {' · '}
-                {stems.filter(s => s.presence === 'exists').length} 轨 {' · '}
+                {totalTrackCount} 轨 {' · '}
                 {formatSize(projectResult.totalSizeBytes)}
                 {projectResult.durationMs != null && (
                   <> · {formatDuration(projectResult.durationMs)}</>
@@ -325,9 +436,14 @@ export const ResultPage: React.FC<ResultPageProps> = ({
             )}
           </div>
         </div>
-        <button style={styles.newButton} onClick={onNavigateToUpload}>
-          + 新建项目
-        </button>
+        <div style={styles.headerActions}>
+          <button style={styles.headerButton} onClick={handleRenameProject}>
+            重命名
+          </button>
+          <button style={styles.newButton} onClick={onNavigateToUpload}>
+            + 新建项目
+          </button>
+        </div>
       </div>
 
       {/* === mock 鏁版嵁鎻愮ず === */}
@@ -523,6 +639,51 @@ export const ResultPage: React.FC<ResultPageProps> = ({
         <div style={styles.inlineInfo}>{exportInfo}</div>
       )}
 
+      {renameModalOpen && (
+        <div style={styles.modalBackdrop}>
+          <div style={styles.modalCard}>
+            <div style={styles.modalTitle}>重命名工程</div>
+            <input
+              style={styles.modalInput}
+              type="text"
+              value={renameValue}
+              autoFocus
+              disabled={renameBusy}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleConfirmRename();
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  handleCancelRename();
+                }
+              }}
+            />
+            {renameError && (
+              <div style={styles.modalError}>{renameError}</div>
+            )}
+            <div style={styles.modalActions}>
+              <button
+                style={styles.modalSecondaryButton}
+                onClick={handleCancelRename}
+                disabled={renameBusy}
+              >
+                取消
+              </button>
+              <button
+                style={styles.modalPrimaryButton}
+                onClick={handleConfirmRename}
+                disabled={renameBusy}
+              >
+                {renameBusy ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* === 底部操作 === */}
       <div style={styles.footer}>
         <button style={styles.backButton} onClick={onNavigateToHome}>
@@ -674,6 +835,11 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'flex-start',
     marginBottom: '20px',
   },
+  headerActions: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+  },
   title: {
     fontSize: '22px',
     fontWeight: 600,
@@ -704,6 +870,78 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: '6px',
     cursor: 'pointer',
     whiteSpace: 'nowrap' as const,
+  },
+  headerButton: {
+    padding: '8px 12px',
+    fontSize: '13px',
+    backgroundColor: '#f5f5f5',
+    border: '1px solid #ddd',
+    borderRadius: '6px',
+    cursor: 'pointer',
+    color: '#333',
+    whiteSpace: 'nowrap' as const,
+  },
+  modalBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.35)',
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+    padding: '16px',
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: '360px',
+    backgroundColor: '#fff',
+    borderRadius: '10px',
+    border: '1px solid #e0e0e0',
+    padding: '16px',
+    boxShadow: '0 8px 24px rgba(0, 0, 0, 0.16)',
+  },
+  modalTitle: {
+    fontSize: '16px',
+    fontWeight: 600,
+    color: '#1a1a1a',
+    marginBottom: '12px',
+  },
+  modalInput: {
+    width: '100%',
+    boxSizing: 'border-box' as const,
+    padding: '8px 10px',
+    border: '1px solid #d0d0d0',
+    borderRadius: '6px',
+    fontSize: '14px',
+    marginBottom: '8px',
+  },
+  modalError: {
+    fontSize: '12px',
+    color: '#c62828',
+    marginBottom: '8px',
+  },
+  modalActions: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: '8px',
+  },
+  modalSecondaryButton: {
+    padding: '6px 12px',
+    fontSize: '13px',
+    color: '#333',
+    backgroundColor: '#f5f5f5',
+    border: '1px solid #ddd',
+    borderRadius: '6px',
+    cursor: 'pointer',
+  },
+  modalPrimaryButton: {
+    padding: '6px 12px',
+    fontSize: '13px',
+    color: '#fff',
+    backgroundColor: '#2196F3',
+    border: 'none',
+    borderRadius: '6px',
+    cursor: 'pointer',
   },
   cacheHitBanner: {
     padding: '10px 16px',

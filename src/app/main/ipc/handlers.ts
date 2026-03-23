@@ -27,6 +27,13 @@ import { StemType } from '../../../shared/enums';
 import type { Project } from '../../../domain/entities';
 import type { WorkerInfra } from '../workerSetup';
 import { inferStemTypeFromFilename } from '../../../domain/policies';
+import { patchProjectManifestMetadata } from './projectManifestMetadata';
+import {
+  readManifestAnalysisRefs,
+  patchManifestAnalysisRefs,
+  readProjectJsonRecord,
+  writeProjectJsonRecord,
+} from './projectManifestAnalysisCache';
 
 // ============================================================================
 // Worker 鍩虹璁炬柦寮曠敤锛堢敱 registerIpcHandlers 娉ㄥ叆锛?// ============================================================================
@@ -140,6 +147,8 @@ type CachedWaveformEntry = {
 
 const waveformResultCache = new Map<string, CachedWaveformEntry>();
 const chordAnalysisResultCache = new Map<string, CachedChordAnalysisEntry>();
+const DEFAULT_WAVEFORM_CACHE_PATH = 'waveform/master-waveform.json';
+const DEFAULT_CHORD_CACHE_PATH = 'chord/chord-analysis.json';
 
 type RecentProjectEntry = {
   projectId: string;
@@ -348,6 +357,271 @@ function buildWaveformCacheKey(projectId: string, sourceSignature: string, analy
   return `${projectId}::${sourceSignature}::${analysisVersion}`;
 }
 
+async function loadPersistedWaveformResult(
+  project: Project,
+  expectedAnalysisVersion: string,
+  sourceSignature: string | null,
+): Promise<CachedWaveformDTO | null> {
+  const refs = await readManifestAnalysisRefs(project.cacheDir);
+  const waveformRef = refs?.waveform;
+  if (!waveformRef) return null;
+  if (waveformRef.version !== expectedAnalysisVersion) return null;
+
+  const raw = await readProjectJsonRecord(project.cacheDir, waveformRef.path);
+  if (!raw) return null;
+
+  const persistedSignature = typeof raw.sourceSignature === 'string' ? raw.sourceSignature : null;
+  if (sourceSignature && persistedSignature && persistedSignature !== sourceSignature) {
+    return null;
+  }
+
+  const peaks = Array.isArray(raw.peaks)
+    ? raw.peaks.filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+    : [];
+  const channels = typeof raw.channels === 'number' && Number.isFinite(raw.channels)
+    ? Math.max(1, Math.floor(raw.channels))
+    : null;
+  const length = typeof raw.length === 'number' && Number.isFinite(raw.length)
+    ? Math.max(0, Math.floor(raw.length))
+    : null;
+  const sampleRate = typeof raw.sampleRate === 'number' && Number.isFinite(raw.sampleRate)
+    ? Math.max(1, Math.floor(raw.sampleRate))
+    : null;
+  const durationMs = typeof raw.durationMs === 'number' && Number.isFinite(raw.durationMs)
+    ? Math.max(0, Math.floor(raw.durationMs))
+    : null;
+  if (channels == null || length == null || sampleRate == null || durationMs == null) {
+    return null;
+  }
+
+  return {
+    id: typeof raw.id === 'string' && raw.id.trim().length > 0 ? raw.id : 'master',
+    channels,
+    length,
+    sampleRate,
+    peaks,
+    durationMs,
+    analysisVersion:
+      typeof raw.analysisVersion === 'string' && raw.analysisVersion.trim().length > 0
+        ? raw.analysisVersion.trim()
+        : waveformRef.version,
+  };
+}
+
+async function persistWaveformResult(
+  project: Project,
+  waveform: CachedWaveformDTO,
+  sourceSignature: string | null,
+): Promise<void> {
+  const analysisVersion =
+    typeof waveform.analysisVersion === 'string' && waveform.analysisVersion.trim().length > 0
+      ? waveform.analysisVersion.trim()
+      : getWaveformAnalysisVersionHint();
+  const refs = await readManifestAnalysisRefs(project.cacheDir);
+  const waveformPath = refs?.waveform?.path ?? DEFAULT_WAVEFORM_CACHE_PATH;
+
+  await writeProjectJsonRecord(project.cacheDir, waveformPath, {
+    ...waveform,
+    analysisVersion,
+    sourceSignature,
+    generatedAt: Date.now(),
+  });
+  await patchManifestAnalysisRefs(project.cacheDir, {
+    waveform: {
+      path: waveformPath,
+      version: analysisVersion,
+    },
+  });
+}
+
+function normalizePersistedChordSegments(raw: unknown): CachedChordSegmentDTO[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(isObjectLike)
+    .filter((seg) => typeof seg.startMs === 'number' && typeof seg.endMs === 'number' && typeof seg.label === 'string')
+    .map((seg) => ({
+      startMs: Math.max(0, Math.floor(seg.startMs as number)),
+      endMs: Math.max(0, Math.floor(seg.endMs as number)),
+      label: seg.label as string,
+      simplifiedLabel: typeof seg.simplifiedLabel === 'string' ? seg.simplifiedLabel : undefined,
+      confidence: typeof seg.confidence === 'number' ? seg.confidence : undefined,
+      sourceFlags: Array.isArray(seg.sourceFlags) ? seg.sourceFlags.filter((f): f is string => typeof f === 'string') : undefined,
+      symbol: typeof seg.symbol === 'string' ? seg.symbol : undefined,
+      chordType: typeof seg.chordType === 'string' ? seg.chordType : undefined,
+      bassNote: typeof seg.bassNote === 'string' ? seg.bassNote : undefined,
+      extensions: Array.isArray(seg.extensions) ? seg.extensions.filter((v): v is string => typeof v === 'string') : undefined,
+      alterations: Array.isArray(seg.alterations) ? seg.alterations.filter((v): v is string => typeof v === 'string') : undefined,
+      omissions: Array.isArray(seg.omissions) ? seg.omissions.filter((v): v is string => typeof v === 'string') : undefined,
+      candidates: Array.isArray(seg.candidates)
+        ? seg.candidates
+          .filter(isObjectLike)
+          .flatMap((candidate) => {
+            if (typeof candidate.label !== 'string') return [];
+            return [{
+              label: candidate.label,
+              confidence: typeof candidate.confidence === 'number' ? candidate.confidence : undefined,
+              method: typeof candidate.method === 'string' ? candidate.method : undefined,
+            }];
+          })
+        : undefined,
+      method: typeof seg.method === 'string' ? seg.method : undefined,
+      vocabularyTag: typeof seg.vocabularyTag === 'string' ? seg.vocabularyTag : undefined,
+    }));
+}
+
+async function loadPersistedChordResult(
+  project: Project,
+  expectedAnalysisVersion: string,
+  sourceSignature: string | null,
+): Promise<CachedChordAnalysisDTO | null> {
+  const refs = await readManifestAnalysisRefs(project.cacheDir);
+  const chordRef = refs?.chordAnalysis;
+  if (!chordRef) return null;
+  if (chordRef.analysisVersion !== expectedAnalysisVersion) return null;
+
+  const raw = await readProjectJsonRecord(project.cacheDir, chordRef.path);
+  if (!raw) return null;
+
+  const persistedSignature = typeof raw.sourceSignature === 'string' ? raw.sourceSignature : null;
+  if (sourceSignature && persistedSignature && persistedSignature !== sourceSignature) {
+    return null;
+  }
+
+  const segments = normalizePersistedChordSegments(raw.segments);
+  if (!Array.isArray(raw.segments)) return null;
+
+  const elapsedMs = typeof raw.elapsedMs === 'number' && Number.isFinite(raw.elapsedMs)
+    ? Math.max(0, Math.floor(raw.elapsedMs))
+    : 0;
+  const analyzedAt = typeof raw.analyzedAt === 'number' && Number.isFinite(raw.analyzedAt)
+    ? Math.floor(raw.analyzedAt)
+    : Date.now();
+  const audioDurationMs = typeof raw.audioDurationMs === 'number' && Number.isFinite(raw.audioDurationMs)
+    ? Math.max(0, Math.floor(raw.audioDurationMs))
+    : (project.durationMs ?? 0);
+  const estimatedBpm = typeof raw.estimatedBpm === 'number' && Number.isFinite(raw.estimatedBpm)
+    ? raw.estimatedBpm
+    : undefined;
+  const warnings = Array.isArray(raw.warnings)
+    ? raw.warnings.filter((value): value is string => typeof value === 'string')
+    : [];
+  const rawTempo = isObjectLike(raw.tempo) ? raw.tempo : null;
+  const rawAnalysisMethods = isObjectLike(raw.analysisMethods) ? raw.analysisMethods : null;
+  const rawChordVocabulary = isObjectLike(raw.chordVocabulary) ? raw.chordVocabulary : null;
+
+  const tempo = rawTempo
+    ? {
+      primaryBpm: typeof rawTempo.primaryBpm === 'number' ? rawTempo.primaryBpm : undefined,
+      confidence: typeof rawTempo.confidence === 'number' ? rawTempo.confidence : undefined,
+      method: typeof rawTempo.method === 'string' ? rawTempo.method : 'tempo_default',
+      candidates: Array.isArray(rawTempo.candidates)
+        ? rawTempo.candidates
+          .filter(isObjectLike)
+          .filter((item) => typeof item.bpm === 'number' && Number.isFinite(item.bpm))
+          .map((item) => ({
+            bpm: item.bpm as number,
+            confidence: typeof item.confidence === 'number' ? item.confidence : undefined,
+            relation: typeof item.relation === 'string' ? item.relation : undefined,
+            method: typeof item.method === 'string' ? item.method : undefined,
+          }))
+        : [],
+      ambiguity: isObjectLike(rawTempo.ambiguity)
+        ? {
+          isAmbiguous: Boolean(rawTempo.ambiguity.isAmbiguous),
+          halfTimeBpm: typeof rawTempo.ambiguity.halfTimeBpm === 'number'
+            ? rawTempo.ambiguity.halfTimeBpm
+            : undefined,
+          doubleTimeBpm: typeof rawTempo.ambiguity.doubleTimeBpm === 'number'
+            ? rawTempo.ambiguity.doubleTimeBpm
+            : undefined,
+          reason: typeof rawTempo.ambiguity.reason === 'string'
+            ? rawTempo.ambiguity.reason
+            : undefined,
+        }
+        : undefined,
+    }
+    : undefined;
+
+  return {
+    projectId: typeof raw.projectId === 'string' && raw.projectId.trim().length > 0
+      ? raw.projectId
+      : project.id,
+    source: typeof raw.source === 'string' ? raw.source : 'mixed',
+    analyzerType: typeof raw.analyzerType === 'string' ? raw.analyzerType : 'rule_based',
+    analysisMethods: rawAnalysisMethods
+      ? {
+        chordAnalyzer: typeof rawAnalysisMethods.chordAnalyzer === 'string'
+          ? rawAnalysisMethods.chordAnalyzer
+          : 'chord_default',
+        tempoAnalyzer: typeof rawAnalysisMethods.tempoAnalyzer === 'string'
+          ? rawAnalysisMethods.tempoAnalyzer
+          : 'tempo_default',
+      }
+      : undefined,
+    segments,
+    elapsedMs,
+    analyzedAt,
+    audioDurationMs,
+    estimatedKey: typeof raw.estimatedKey === 'string' ? raw.estimatedKey : undefined,
+    estimatedBpm,
+    tempo,
+    analysisVersion:
+      typeof raw.analysisVersion === 'string' && raw.analysisVersion.trim().length > 0
+        ? raw.analysisVersion
+        : chordRef.analysisVersion,
+    vocabularyVersion:
+      typeof raw.vocabularyVersion === 'string' && raw.vocabularyVersion.trim().length > 0
+        ? raw.vocabularyVersion
+        : chordRef.vocabularyVersion,
+    chordVocabulary: rawChordVocabulary
+      ? {
+        selected: typeof rawChordVocabulary.selected === 'string' ? rawChordVocabulary.selected : 'triad',
+        supportsExtendedChords: Boolean(rawChordVocabulary.supportsExtendedChords),
+        supportedDescriptors: Array.isArray(rawChordVocabulary.supportedDescriptors)
+          ? rawChordVocabulary.supportedDescriptors.filter((item): item is string => typeof item === 'string')
+          : [],
+      }
+      : undefined,
+    warnings,
+    generatedAt: typeof raw.generatedAt === 'number' && Number.isFinite(raw.generatedAt)
+      ? Math.floor(raw.generatedAt)
+      : Date.now(),
+  };
+}
+
+async function persistChordResult(
+  project: Project,
+  chordResult: CachedChordAnalysisDTO,
+  sourceSignature: string | null,
+): Promise<void> {
+  const refs = await readManifestAnalysisRefs(project.cacheDir);
+  const chordPath = refs?.chordAnalysis?.path ?? DEFAULT_CHORD_CACHE_PATH;
+  const analysisVersion =
+    typeof chordResult.analysisVersion === 'string' && chordResult.analysisVersion.trim().length > 0
+      ? chordResult.analysisVersion.trim()
+      : getChordAnalysisVersionHint();
+  const vocabularyVersion =
+    typeof chordResult.vocabularyVersion === 'string' && chordResult.vocabularyVersion.trim().length > 0
+      ? chordResult.vocabularyVersion.trim()
+      : 'triad-v1';
+
+  await writeProjectJsonRecord(project.cacheDir, chordPath, {
+    ...chordResult,
+    analysisVersion,
+    vocabularyVersion,
+    segmentCount: chordResult.segments.length,
+    sourceSignature,
+    generatedAt: chordResult.generatedAt ?? Date.now(),
+  });
+  await patchManifestAnalysisRefs(project.cacheDir, {
+    chordAnalysis: {
+      path: chordPath,
+      analysisVersion,
+      vocabularyVersion,
+    },
+  });
+}
+
 // ============================================================================
 // Mock 鏁版嵁鐢熸垚锛圥hase 2 淇濈暀锛歸aveform / chord / mock 鍥為€€锛?// ============================================================================
 
@@ -516,6 +790,7 @@ type ImportedExistingProjectResult = {
   projectId: string;
   displayName: string;
   stemCount: number;
+  updatedAt: number;
 };
 
 function isObjectLike(value: unknown): value is Record<string, unknown> {
@@ -534,6 +809,7 @@ function normalizeStemType(value: unknown, fallbackFilename: string): StemType {
 async function restoreExistingProjectFromDir(
   selectedDir: string,
   infra: WorkerInfra,
+  hints?: { indexUpdatedAt?: number; indexDisplayName?: string },
 ): Promise<ImportedExistingProjectResult> {
   const dirStat = await fs.promises.stat(selectedDir).catch(() => null);
   if (!dirStat || !dirStat.isDirectory()) {
@@ -575,6 +851,8 @@ async function restoreExistingProjectFromDir(
     filePath: string;
     codec: string;
     sizeBytes: number;
+    durationMs: number | null;
+    sampleRate: number | null;
     sourceOrigin: 'engine_output' | 'manual_import';
   }> = [];
 
@@ -599,6 +877,14 @@ async function restoreExistingProjectFromDir(
           ? entry.codec.trim().toLowerCase()
           : ext.replace('.', '') || 'wav',
         sizeBytes: stat.size,
+        durationMs:
+          (typeof entry.durationMs === 'number' && entry.durationMs > 0)
+            ? Math.floor(entry.durationMs)
+            : null,
+        sampleRate:
+          (typeof entry.sampleRate === 'number' && entry.sampleRate > 0)
+            ? Math.floor(entry.sampleRate)
+            : null,
         sourceOrigin: (entry.sourceOrigin === 'manual_import') ? 'manual_import' : 'engine_output',
       });
     }
@@ -619,6 +905,8 @@ async function restoreExistingProjectFromDir(
         filePath: absPath,
         codec: ext.replace('.', '') || 'wav',
         sizeBytes: stat.size,
+        durationMs: null,
+        sampleRate: null,
         sourceOrigin: 'engine_output',
       });
     }
@@ -646,11 +934,38 @@ async function restoreExistingProjectFromDir(
     projectId = `import-${crypto.randomUUID().slice(0, 8)}`;
   }
 
-  const displayName = (manifestData && typeof manifestData.projectId === 'string' && manifestData.projectId.trim().length > 0)
-    ? path.basename(selectedDir)
-    : path.basename(selectedDir);
+  const manifestDisplayName =
+    (manifestData && typeof manifestData.displayName === 'string' && manifestData.displayName.trim().length > 0)
+      ? manifestData.displayName.trim()
+      : '';
+  const displayName = manifestDisplayName
+    || (typeof hints?.indexDisplayName === 'string' && hints.indexDisplayName.trim().length > 0
+      ? hints.indexDisplayName.trim()
+      : path.basename(selectedDir));
 
   const now = Date.now();
+  const inferredDurationMs = stems.reduce((max, s) => {
+    const value = typeof s.durationMs === 'number' ? s.durationMs : 0;
+    return value > max ? value : max;
+  }, 0);
+  const manifestDurationMs =
+    (manifestData && typeof manifestData.durationMs === 'number' && manifestData.durationMs > 0)
+      ? Math.floor(manifestData.durationMs)
+      : null;
+  const projectDurationMs = manifestDurationMs ?? (inferredDurationMs > 0 ? inferredDurationMs : null);
+  const separationElapsedMs =
+    (manifestData && typeof manifestData.separationElapsedMs === 'number' && manifestData.separationElapsedMs >= 0)
+      ? Math.floor(manifestData.separationElapsedMs)
+      : null;
+  const lastAccessedAt =
+    (manifestData && typeof manifestData.lastAccessedAt === 'number' && manifestData.lastAccessedAt >= 0)
+      ? Math.floor(manifestData.lastAccessedAt)
+      : null;
+  const restoredUpdatedAt =
+    (manifestData && typeof manifestData.updatedAt === 'number')
+      ? manifestData.updatedAt
+      : (typeof hints?.indexUpdatedAt === 'number' ? hints.indexUpdatedAt : now);
+  const projectSampleRate = stems.find((s) => typeof s.sampleRate === 'number' && s.sampleRate > 0)?.sampleRate ?? null;
   const totalSizeBytes = stems.reduce((sum, s) => sum + s.sizeBytes, 0);
   const sourceType = (manifestData && manifestData.sourceType === ProjectSourceType.Separation)
     ? ProjectSourceType.Separation
@@ -667,9 +982,11 @@ async function restoreExistingProjectFromDir(
     originalFilePath: null,
     cacheDir: selectedDir,
     createdAt: (manifestData && typeof manifestData.createdAt === 'number') ? manifestData.createdAt : now,
-    updatedAt: now,
-    durationMs: null,
-    sampleRate: null,
+    updatedAt: restoredUpdatedAt,
+    lastAccessedAt,
+    durationMs: projectDurationMs,
+    separationElapsedMs,
+    sampleRate: projectSampleRate,
     channels: null,
     totalSizeBytes,
     status: ProjectStatus.Ready,
@@ -690,8 +1007,8 @@ async function restoreExistingProjectFromDir(
     filePath: s.filePath,
     codec: s.codec,
     sizeBytes: s.sizeBytes,
-    durationMs: null,
-    sampleRate: null,
+    durationMs: s.durationMs,
+    sampleRate: s.sampleRate,
     exists: true,
     sourceOrigin: s.sourceOrigin,
     confidence: null,
@@ -706,6 +1023,7 @@ async function restoreExistingProjectFromDir(
     projectId,
     displayName,
     stemCount: stems.length,
+    updatedAt: restoredUpdatedAt,
   };
 }
 
@@ -733,12 +1051,15 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         const existing = await workerInfra.projectRepo.findById(entry.projectId);
         if (!existing || !fs.existsSync(existing.cacheDir)) {
           try {
-            const restored = await restoreExistingProjectFromDir(entry.projectDir, workerInfra);
+            const restored = await restoreExistingProjectFromDir(entry.projectDir, workerInfra, {
+              indexUpdatedAt: entry.updatedAt,
+              indexDisplayName: entry.displayName,
+            });
             keptEntries.push({
               projectId: restored.projectId,
               displayName: restored.displayName,
               projectDir: entry.projectDir,
-              updatedAt: Date.now(),
+              updatedAt: restored.updatedAt,
             });
           } catch {
             // 索引中的失效工程忽略
@@ -748,7 +1069,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             projectId: existing.id,
             displayName: existing.displayName,
             projectDir: existing.cacheDir,
-            updatedAt: Math.max(entry.updatedAt, existing.updatedAt),
+            updatedAt: existing.updatedAt,
           });
         }
       }
@@ -808,7 +1129,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       cacheDir: outputDir,
       createdAt: now,
       updatedAt: now,
+      lastAccessedAt: null,
       durationMs: null,
+      separationElapsedMs: null,
       sampleRate: null,
       channels: null,
       totalSizeBytes: fileSize || 0,
@@ -872,24 +1195,40 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             projectDir: outputDir,
           });
 
-          // 鍒嗙瀹屾垚鍚庢洿鏂?project 鐨?engineVersion / totalSizeBytes / durationMs
+          // 鍒嗙瀹屾垚鍚庢洿鏂?project 鐨?metadata
           const stemFiles = await infraRef.stemFileRepo.findByProjectId(projectId);
           console.log(`[REAL_CHAIN] handlers.project:startSeparation real_path_after_service projectId="${projectId}" jobId="${jobId}" stemFiles=${stemFiles.length} projectStatusAfter="${result.projectStatusAfter}"`);
-          if (stemFiles.length > 0) {
-            const totalSize = stemFiles.reduce((sum, s) => sum + s.sizeBytes, 0);
-            const durationMs = stemFiles.reduce((max, s) => {
-              const value = typeof s.durationMs === 'number' ? s.durationMs : 0;
-              return value > max ? value : max;
-            }, 0);
-            const resolvedEngineVersion =
-              (typeof result.job.engineVersion === 'string' && result.job.engineVersion.trim().length > 0)
-                ? result.job.engineVersion.trim()
-                : 'demucs';
-            await infraRef.projectRepo.update(projectId, {
-              engineVersion: resolvedEngineVersion,
-              totalSizeBytes: totalSize,
+          const totalSize = stemFiles.reduce((sum, s) => sum + s.sizeBytes, 0);
+          const durationMs = stemFiles.reduce((max, s) => {
+            const value = typeof s.durationMs === 'number' ? s.durationMs : 0;
+            return value > max ? value : max;
+          }, 0);
+          const separationElapsedMs =
+            (typeof result.job.elapsedMs === 'number' && result.job.elapsedMs >= 0)
+              ? Math.floor(result.job.elapsedMs)
+              : null;
+          const resolvedEngineVersion =
+            (typeof result.job.engineVersion === 'string' && result.job.engineVersion.trim().length > 0)
+              ? result.job.engineVersion.trim()
+              : 'demucs';
+
+          await infraRef.projectRepo.update(projectId, {
+            engineVersion: resolvedEngineVersion,
+            totalSizeBytes: stemFiles.length > 0 ? totalSize : project.totalSizeBytes,
+            durationMs: durationMs > 0 ? durationMs : null,
+            separationElapsedMs,
+          });
+
+          try {
+            await patchProjectManifestMetadata(outputDir, {
+              displayName: fileName,
               durationMs: durationMs > 0 ? durationMs : null,
+              separationElapsedMs,
             });
+          } catch (metaErr) {
+            console.warn(
+              `[project:startSeparation] metadata patch skipped projectId="${projectId}" reason="${normalizeErrorMessage(metaErr, 'unknown')}"`,
+            );
           }
 
           if (win && !win.isDestroyed()) {
@@ -957,11 +1296,56 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       displayName: project.displayName,
       sourceType: project.sourceType,
       status: project.status,
-      durationMs: project.durationMs ?? 0,
+      durationMs: project.durationMs,
       totalSizeBytes: project.totalSizeBytes,
       stemCount: stems.length,
       updatedAt: project.updatedAt,
     };
+  });
+
+  ipcMain.handle('project:rename', async (_event, projectId: string, nextDisplayName: string) => {
+    if (!workerInfra) return null;
+    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('缺少项目 ID，无法重命名');
+    }
+    const normalizedName = typeof nextDisplayName === 'string' ? nextDisplayName.trim() : '';
+    if (normalizedName.length === 0) {
+      throw new Error('项目名称不能为空');
+    }
+
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) {
+      throw new Error('项目不存在，无法重命名');
+    }
+
+    await workerInfra.projectRepo.update(projectId, { displayName: normalizedName });
+    const updatedProject = await workerInfra.projectRepo.findById(projectId);
+    if (updatedProject) {
+      await patchProjectManifestMetadata(updatedProject.cacheDir, { displayName: normalizedName });
+      await upsertRecentProjectEntry({
+        projectId: updatedProject.id,
+        displayName: normalizedName,
+        projectDir: updatedProject.cacheDir,
+        updatedAt: updatedProject.updatedAt,
+      });
+    }
+
+    return { projectId, displayName: normalizedName };
+  });
+
+  ipcMain.handle('project:markAccessed', async (_event, projectId: string) => {
+    if (!workerInfra) return null;
+    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+      return null;
+    }
+
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) return null;
+
+    const lastAccessedAt = Date.now();
+    await workerInfra.projectRepo.touchLastAccessedAt(projectId, lastAccessedAt);
+    await patchProjectManifestMetadata(project.cacheDir, { lastAccessedAt });
+    return { projectId, lastAccessedAt };
   });
 
   ipcMain.handle('project:getResult', async (_event, projectId: string) => {
@@ -982,20 +1366,25 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const sourceTypeLabel = isRealSeparation
       ? `Demucs (${resolvedEngineVersion}, ${stems.length} stems)`
       : '等待分离';
-    console.log(`[REAL_CHAIN] handlers.project:getResult decision projectId="${projectId}" projectStatus="${project.status}" stemCount=${stems.length} elapsedMs=${latestJob?.elapsedMs ?? 0} isRealSeparation=${isRealSeparation} sourceTypeLabel="${sourceTypeLabel}"`);
+    const elapsedMs = (typeof latestJob?.elapsedMs === 'number' && latestJob.elapsedMs >= 0)
+      ? latestJob.elapsedMs
+      : ((typeof project.separationElapsedMs === 'number' && project.separationElapsedMs >= 0)
+        ? project.separationElapsedMs
+        : 0);
+    console.log(`[REAL_CHAIN] handlers.project:getResult decision projectId="${projectId}" projectStatus="${project.status}" stemCount=${stems.length} elapsedMs=${elapsedMs} isRealSeparation=${isRealSeparation} sourceTypeLabel="${sourceTypeLabel}"`);
 
     return {
       id: project.id,
       displayName: project.displayName,
       sourceType: project.sourceType,
       status: project.status,
-      durationMs: project.durationMs ?? 0,
+      durationMs: project.durationMs,
       totalSizeBytes: isRealSeparation
         ? stems.reduce((sum, s) => sum + s.sizeBytes, 0)
         : project.totalSizeBytes,
       stemCount: stems.length,
       updatedAt: project.updatedAt,
-      elapsedMs: latestJob?.elapsedMs ?? 0,
+      elapsedMs,
       cacheHit: false,
       cacheHitBannerText: null,
       sourceTypeLabel,
@@ -1021,7 +1410,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         sizeBytes: sf.sizeBytes,
         durationMs: (typeof sf.durationMs === 'number' && sf.durationMs > 0)
           ? sf.durationMs
-          : (project?.durationMs ?? 0),
+          : 0,
         sampleRate: sf.sampleRate ?? 44100,
         exportable: sf.exportable,
         filePath: sf.filePath,
@@ -1061,7 +1450,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         projectId: restored.projectId,
         displayName: restored.displayName,
         projectDir: selectedDir,
-        updatedAt: Date.now(),
+        updatedAt: restored.updatedAt,
       });
     } catch {
       // 最近项目索引写入失败不应阻塞打开流程
@@ -1137,6 +1526,29 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       );
     }
 
+    const persistedWaveform = await loadPersistedWaveformResult(
+      project,
+      expectedAnalysisVersion,
+      sourceSignature,
+    );
+    if (persistedWaveform) {
+      if (sourceSignature) {
+        waveformResultCache.set(projectId, {
+          cacheKey: buildWaveformCacheKey(projectId, sourceSignature, expectedAnalysisVersion),
+          sourceFilePath,
+          sourceSignature,
+          analysisVersion: expectedAnalysisVersion,
+          cachedAt: Date.now(),
+          result: persistedWaveform,
+        });
+      }
+      console.log(
+        `[REAL_CHAIN] handlers.project:getWaveform persisted_hit projectId="${projectId}" ` +
+        `analysisVersion="${expectedAnalysisVersion}"`,
+      );
+      return persistedWaveform;
+    }
+
     if (!ensureWorkerAcceptingRequests(workerInfra)) {
       console.log(`[REAL_CHAIN] handlers.project:getWaveform miss projectId="${projectId}" reason="worker_not_ready"`);
       if (cached) {
@@ -1189,6 +1601,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
       if (project.durationMs == null && waveform.durationMs > 0) {
         await workerInfra.projectRepo.update(projectId, { durationMs: waveform.durationMs });
+        try {
+          await patchProjectManifestMetadata(project.cacheDir, { durationMs: waveform.durationMs });
+        } catch {
+          // metadata write failure should not break waveform query
+        }
       }
 
       const resolvedAnalysisVersion = waveform.analysisVersion ?? expectedAnalysisVersion;
@@ -1201,6 +1618,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           cachedAt: Date.now(),
           result: waveform,
         });
+      }
+      try {
+        await persistWaveformResult(project, waveform, sourceSignature);
+      } catch {
+        // analysis cache write failure should not break waveform query
       }
       console.log(
         `[REAL_CHAIN] handlers.project:getWaveform return projectId="${projectId}" ` +
@@ -1268,6 +1690,29 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         `[REAL_CHAIN] handlers.project:getChordAnalysis cache_bypass projectId="${projectId}" ` +
         `source_kind="${sourceKind}" reason="source_signature_unavailable" analysisVersion="${expectedAnalysisVersion}"`,
       );
+    }
+
+    const persistedChord = await loadPersistedChordResult(
+      project,
+      expectedAnalysisVersion,
+      sourceSignature,
+    );
+    if (persistedChord) {
+      if (sourceSignature) {
+        chordAnalysisResultCache.set(projectId, {
+          cacheKey: buildChordAnalysisCacheKey(projectId, sourceSignature, expectedAnalysisVersion),
+          sourceFilePath,
+          sourceSignature,
+          analysisVersion: expectedAnalysisVersion,
+          cachedAt: Date.now(),
+          result: persistedChord,
+        });
+      }
+      console.log(
+        `[REAL_CHAIN] handlers.project:getChordAnalysis persisted_hit projectId="${projectId}" ` +
+        `analysisVersion="${expectedAnalysisVersion}" segments=${persistedChord.segments.length}`,
+      );
+      return persistedChord;
     }
 
     if (!ensureWorkerAcceptingRequests(workerInfra)) {
@@ -1458,6 +1903,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
       if (project.durationMs == null && chordResult.audioDurationMs > 0) {
         await workerInfra.projectRepo.update(projectId, { durationMs: chordResult.audioDurationMs });
+        try {
+          await patchProjectManifestMetadata(project.cacheDir, { durationMs: chordResult.audioDurationMs });
+        } catch {
+          // metadata write failure should not break chord query
+        }
       }
 
       const resolvedAnalysisVersion = chordResult.analysisVersion ?? expectedAnalysisVersion;
@@ -1470,6 +1920,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           cachedAt: Date.now(),
           result: chordResult,
         });
+      }
+      try {
+        await persistChordResult(project, chordResult, sourceSignature);
+      } catch {
+        // analysis cache write failure should not break chord query
       }
       console.log(
         `[REAL_CHAIN] handlers.project:getChordAnalysis result_summary projectId="${projectId}" ` +
@@ -1517,7 +1972,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           sizeBytes: p.totalSizeBytes,
           stemCount: stems.length,
           createdAt: p.createdAt,
-          lastAccessedAt: p.updatedAt,
+          lastAccessedAt: p.lastAccessedAt ?? p.createdAt,
           openDirAvailable: fs.existsSync(p.cacheDir),
         };
       })),

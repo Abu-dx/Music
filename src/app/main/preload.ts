@@ -17,6 +17,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('project:cancelSeparation', jobId),
   getProject: (projectId: string) =>
     ipcRenderer.invoke('project:get', projectId),
+  renameProject: (projectId: string, displayName: string) =>
+    ipcRenderer.invoke('project:rename', projectId, displayName),
+  markProjectAccessed: (projectId: string) =>
+    ipcRenderer.invoke('project:markAccessed', projectId),
   getProjectResult: (projectId: string) =>
     ipcRenderer.invoke('project:getResult', projectId),
   getStemsByProject: (projectId: string) =>

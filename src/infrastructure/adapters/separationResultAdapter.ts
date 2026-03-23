@@ -193,6 +193,8 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
         relativePath,
         codec: rawStem.codec,
         sizeBytes: rawStem.sizeBytes,
+        durationMs: rawStem.durationMs,
+        sampleRate: rawStem.sampleRate,
         sourceOrigin: 'engine_output',
       });
     }

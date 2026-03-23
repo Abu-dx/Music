@@ -179,7 +179,6 @@ export class PlayerViewController implements IPlayerViewController {
   unloadPlayer(): void {
     this.stopChordTimeTracking();
     this.playbackStore.unload();
-    this.analysisStore.clear();
   }
 
   async openFile(projectId: string): Promise<void> {

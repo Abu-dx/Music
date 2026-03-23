@@ -87,6 +87,14 @@ export class InMemoryProjectRepository implements IProjectRepository {
     Object.assign(p, fields, { updatedAt: Date.now() });
   }
 
+  async touchLastAccessedAt(id: string, timestamp: number): Promise<void> {
+    const p = this.store.get(id);
+    if (!p) {
+      throw new Error(`[InMemoryProjectRepo] Project not found: ${id}`);
+    }
+    p.lastAccessedAt = timestamp;
+  }
+
   async listRecent(pagination?: PaginationParams): Promise<PaginatedResult<Project>> {
     const sorted = Array.from(this.store.values())
       .sort((a, b) => b.updatedAt - a.updatedAt);

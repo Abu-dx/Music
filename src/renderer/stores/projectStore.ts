@@ -1,20 +1,20 @@
 /**
  * @module renderer/stores/projectStore
- * @description 项目 ViewModel — 持有项目生命周期状态、元数据、结果数据
+ * @description 项目 ViewModel �?持有项目生命周期状态、元数据、结果数�?
  *
- * GPT R7 Must Fix #1：任务运行态已拆出到 jobStore.ts。
- * GPT R8 Must Fix #1：结果页数据链路正式闭环 —
- *   getProjectResult / getStemsByProject / openProjectDir。
+ * GPT R7 Must Fix #1：任务运行态已拆出�?jobStore.ts�?
+ * GPT R8 Must Fix #1：结果页数据链路正式闭环 �?
+ *   getProjectResult / getStemsByProject / openProjectDir�?
  *
  * 职责（ADR-003, ADR-004）：
  * - 持有 currentProject + recentProjects + isLoading
- * - 持有当前项目的结果摘要 + 分轨列表（结果页 + 播放器共用）
- * - 通过 IPC 与 main 进程通信（contextBridge）
+ * - 持有当前项目的结果摘�?+ 分轨列表（结果页 + 播放器共用）
+ * - 通过 IPC �?main 进程通信（contextBridge�?
  * - 提供项目创建/查询/结果查询/打开目录接口
  *
  * 不负责：
  * - 任务运行态（stage/progress/warnings）→ jobStore
- * - 播放控制 → playbackStore
+ * - 播放控制 �?playbackStore
  *
  * 幂等性（GPT R7 Suggested #5）：
  * - dispose() 可重复调用，第二次起为空操作
@@ -30,14 +30,14 @@ import {
 } from '../../shared/contracts';
 
 // ============================================================================
-// 1. IPC 接口（projectStore 需要的子集）
+// 1. IPC 接口（projectStore 需要的子集�?
 // ============================================================================
 
 export interface IProjectElectronAPI {
-  /** 获取最近项目列表 */
+  /** 获取最近项目列�?*/
   getRecentProjects(limit: number): Promise<ProjectSummaryDTO[]>;
 
-  /** 通过文件路径创建项目并启动分离 */
+  /** 通过文件路径创建项目并启动分�?*/
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
 
   /** 取消分离任务 */
@@ -45,59 +45,61 @@ export interface IProjectElectronAPI {
 
   /** 获取项目详情 */
   getProject(projectId: string): Promise<ProjectSummaryDTO | null>;
+  renameProject(projectId: string, displayName: string): Promise<{ projectId: string; displayName: string } | null>;
+  markProjectAccessed(projectId: string): Promise<{ projectId: string; lastAccessedAt: number } | null>;
 
-  /** 获取缓存占用摘要（GPT R7 Suggested #2） */
+  /** 获取缓存占用摘要（GPT R7 Suggested #2�?*/
   getCacheStats?(): Promise<{ totalSizeBytes: number; projectCount: number } | null>;
 
   /**
-   * 获取项目结果摘要（GPT R8 Must Fix #1）
+   * 获取项目结果摘要（GPT R8 Must Fix #1�?
    * 包含 elapsedMs / cacheHit / sourceTypeLabel 等结果页专属字段
    */
   getProjectResult(projectId: string): Promise<ProjectResultSummaryDTO | null>;
 
   /**
-   * 获取项目分轨列表（GPT R8 Must Fix #1）
-   * 包含 filePath / presence / mergedFrom 等完整信息
+   * 获取项目分轨列表（GPT R8 Must Fix #1�?
+   * 包含 filePath / presence / mergedFrom 等完整信�?
    */
   getStemsByProject(projectId: string): Promise<StemTrackDTO[]>;
   openExistingProject(): Promise<{ projectId: string; displayName: string; stemCount: number } | null>;
 
   /**
-   * 在系统文件管理器中打开项目目录（GPT R8 Must Fix #2）
+   * 在系统文件管理器中打开项目目录（GPT R8 Must Fix #2�?
    * 通过 Electron shell.openPath() 实现
    */
   openProjectDir(projectId: string): Promise<void>;
 
   /**
-   * 获取项目主波形数据（Round 10，R11 语义修正）
+   * 获取项目主波形数据（Round 10，R11 语义修正�?
    *
-   * GPT R10 Must Fix #3：返回单条主波形（基于原始混合音频生成），
-   * 而非分轨波形集合。null 表示尚未生成。
+   * GPT R10 Must Fix #3：返回单条主波形（基于原始混合音频生成）�?
+   * 而非分轨波形集合。null 表示尚未生成�?
    */
   getMasterWaveform(projectId: string): Promise<MasterWaveformDTO | null>;
 
   /**
-   * 获取和弦分析结果（Round 11）
+   * 获取和弦分析结果（Round 11�?
    *
-   * 返回 null 表示尚未分析或分析失败。
-   * ADR-006：和弦分析不阻塞主链路，可能在项目 ready 后异步完成。
+   * 返回 null 表示尚未分析或分析失败�?
+   * ADR-006：和弦分析不阻塞主链路，可能在项�?ready 后异步完成�?
    */
   getChordAnalysis(projectId: string): Promise<ChordAnalysisResultDTO | null>;
 }
 
 // ============================================================================
-// 2. Store 状态快照
+// 2. Store 状态快�?
 // ============================================================================
 
 export interface ProjectStoreSnapshot {
   currentProject: ProjectSummaryDTO | null;
   recentProjects: ProjectSummaryDTO[];
   isLoading: boolean;
-  /** 缓存占用摘要（GPT R7 Suggested #2） */
+  /** 缓存占用摘要（GPT R7 Suggested #2�?*/
   cacheStats: { totalSizeBytes: number; projectCount: number } | null;
-  /** 项目结果摘要（GPT R8 Must Fix #1） */
+  /** 项目结果摘要（GPT R8 Must Fix #1�?*/
   projectResult: ProjectResultSummaryDTO | null;
-  /** 分轨列表（GPT R8 Must Fix #1） */
+  /** 分轨列表（GPT R8 Must Fix #1�?*/
   stems: StemTrackDTO[];
 }
 
@@ -111,12 +113,16 @@ export interface IProjectStore {
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
   cancelSeparation(jobId?: string): Promise<void>;
   loadProject(projectId: string): Promise<void>;
+  renameProject(projectId: string, displayName: string): Promise<void>;
+  markProjectAccessed(projectId: string): Promise<void>;
   loadCacheStats(): Promise<void>;
-  /** 加载结果摘要 + 分轨列表（GPT R8 Must Fix #1） */
+  /** 加载结果摘要 + 分轨列表（GPT R8 Must Fix #1�?*/
   loadProjectResult(projectId: string): Promise<void>;
   openExistingProject(): Promise<{ projectId: string; displayName: string; stemCount: number } | null>;
-  /** 打开项目目录（GPT R8 Must Fix #2） */
+  /** 打开项目目录（GPT R8 Must Fix #2�?*/
   openProjectDir(projectId: string): Promise<void>;
+  getMasterWaveform(projectId: string): Promise<MasterWaveformDTO | null>;
+  getChordAnalysis(projectId: string): Promise<ChordAnalysisResultDTO | null>;
   subscribe(listener: () => void): () => void;
   dispose(): void;
 }
@@ -135,7 +141,7 @@ export class ProjectStore implements IProjectStore {
 
   private listeners = new Set<() => void>();
   private disposed = false;
-  /** 缓存的 snapshot — useSyncExternalStore 要求引用稳定 */
+  /** 缓存�?snapshot �?useSyncExternalStore 要求引用稳定 */
   private _cachedSnapshot: ProjectStoreSnapshot | null = null;
 
   constructor(private readonly api: IProjectElectronAPI) {}
@@ -193,6 +199,18 @@ export class ProjectStore implements IProjectStore {
     }
   }
 
+  async renameProject(projectId: string, displayName: string): Promise<void> {
+    await this.api.renameProject(projectId, displayName);
+    await Promise.all([
+      this.loadProject(projectId),
+      this.loadRecentProjects(20),
+    ]);
+  }
+
+  async markProjectAccessed(projectId: string): Promise<void> {
+    await this.api.markProjectAccessed(projectId);
+  }
+
   async loadCacheStats(): Promise<void> {
     if (this.api.getCacheStats) {
       this.cacheStats = await this.api.getCacheStats() ?? null;
@@ -231,6 +249,14 @@ export class ProjectStore implements IProjectStore {
     await this.api.openProjectDir(projectId);
   }
 
+  async getMasterWaveform(projectId: string): Promise<MasterWaveformDTO | null> {
+    return this.api.getMasterWaveform(projectId);
+  }
+
+  async getChordAnalysis(projectId: string): Promise<ChordAnalysisResultDTO | null> {
+    return this.api.getChordAnalysis(projectId);
+  }
+
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
@@ -243,9 +269,10 @@ export class ProjectStore implements IProjectStore {
   }
 
   private notify(): void {
-    this._cachedSnapshot = null; // 使 getSnapshot 下次返回新对象
+    this._cachedSnapshot = null; // �?getSnapshot 下次返回新对�?
     for (const listener of this.listeners) {
       try { listener(); } catch { /* View 层错误不影响 Store */ }
     }
   }
 }
+

@@ -496,6 +496,12 @@ export class ManifestManager implements IManifestManager {
         if (typeof stem.sizeBytes !== 'number') {
           issues.push({ type: ManifestIssueType.StructureInvalid, message: `stems[${i}]: missing or invalid sizeBytes`, field: `stems[${i}].sizeBytes` });
         }
+        if (stem.durationMs !== undefined && stem.durationMs !== null && typeof stem.durationMs !== 'number') {
+          issues.push({ type: ManifestIssueType.StructureInvalid, message: `stems[${i}]: invalid durationMs`, field: `stems[${i}].durationMs` });
+        }
+        if (stem.sampleRate !== undefined && stem.sampleRate !== null && typeof stem.sampleRate !== 'number') {
+          issues.push({ type: ManifestIssueType.StructureInvalid, message: `stems[${i}]: invalid sampleRate`, field: `stems[${i}].sampleRate` });
+        }
         if (typeof stem.sourceOrigin !== 'string') {
           issues.push({ type: ManifestIssueType.StructureInvalid, message: `stems[${i}]: missing sourceOrigin`, field: `stems[${i}].sourceOrigin` });
         }

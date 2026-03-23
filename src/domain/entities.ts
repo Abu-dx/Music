@@ -61,7 +61,9 @@ export interface Project {
   cacheDir: string;
   createdAt: number;
   updatedAt: number;
+  lastAccessedAt: number | null;
   durationMs: number | null;
+  separationElapsedMs: number | null;
   sampleRate: number | null;
   channels: number | null;
   totalSizeBytes: number;
@@ -218,6 +220,10 @@ export interface ProjectManifest {
   engineVersion: string | null;
   createdAt: number;
   updatedAt: number;
+  displayName?: string;
+  lastAccessedAt?: number | null;
+  durationMs?: number | null;
+  separationElapsedMs?: number | null;
   stems: ManifestStemEntry[];
   waveform: { path: string; version: string } | null;
   /** 和弦分析引用，版本独立校验（ADR-006） */
@@ -235,6 +241,8 @@ export interface ManifestStemEntry {
   relativePath: string;
   codec: string;
   sizeBytes: number;
+  durationMs?: number | null;
+  sampleRate?: number | null;
   sourceOrigin: StemSourceOrigin;
 }
 

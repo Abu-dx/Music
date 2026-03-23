@@ -111,6 +111,7 @@ export interface IProjectRepository {
    * @throws AppError(DB_QUERY_FAILED) 目标不存在或写入失败
    */
   update(id: string, fields: Partial<Omit<Project, 'id'>>): Promise<void>;
+  touchLastAccessedAt(id: string, timestamp: number): Promise<void>;
 
   /**
    * 更新项目状态
