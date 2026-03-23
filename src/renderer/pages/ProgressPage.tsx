@@ -13,7 +13,7 @@
  * 瀵艰埅锛? * - 瀹屾垚鍚?鈫?杩涘叆缁撴灉椤? * - 澶辫触鍚?鈫?鍙噸璇曪紙璺冲洖涓婁紶椤碉級
  */
 
-import React, { useSyncExternalStore } from 'react';
+import React, { useEffect, useRef, useSyncExternalStore } from 'react';
 import { IProjectStore } from '../stores/projectStore';
 import { IJobStore } from '../stores/jobStore';
 
@@ -54,7 +54,27 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
     () => jobStore.getSnapshot(),
   );
 
+  const resultLoadedProjectRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!jobSnap.isComplete) {
+      resultLoadedProjectRef.current = null;
+      return;
+    }
+    if (!projectId || resultLoadedProjectRef.current === projectId) {
+      return;
+    }
+    resultLoadedProjectRef.current = projectId;
+    projectStore.loadProjectResult(projectId).catch(() => {
+      resultLoadedProjectRef.current = null;
+    });
+  }, [jobSnap.isComplete, projectId, projectStore]);
+
   const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
+  const successTrackCount =
+    projectSnap.projectResult?.id === projectId
+      ? projectSnap.stems.length
+      : null;
 
   // GPT R7 Must Fix #6锛氭墍鏈夎繍琛屾€佺洿鎺ヤ粠 jobStore snapshot 璇诲彇锛屼笉鎺ㄥ
   const { isRunning, isComplete, isFailed, cacheHit, progress, stageDisplayName,
@@ -177,11 +197,10 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
           <div style={styles.successTitle}>
             {cacheHit ? '缓存恢复完成' : '分离完成'}
           </div>
-          {projectSnap.currentProject && (
-            <div style={styles.successMeta}>
-              共 {projectSnap.currentProject.stemCount} 轨{cacheHit && ' · 来自缓存'}
-            </div>
-          )}
+          <div style={styles.successMeta}>
+            {successTrackCount == null ? '轨道数加载中...' : `共 ${successTrackCount} 轨`}
+            {cacheHit && ' · 来自缓存'}
+          </div>
           <div style={styles.successActions}>
             <button
               style={styles.resultButton}

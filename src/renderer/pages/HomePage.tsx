@@ -72,11 +72,20 @@ export const HomePage: React.FC<HomePageProps> = ({
     (cb) => store.subscribe(cb),
     () => store.getSnapshot(),
   );
+  const cacheStatsReady = snapshot.cacheStats !== null;
+  const cacheStatsLoading = !cacheStatsReady;
 
   // 首次加载
   useEffect(() => {
-    store.loadRecentProjects(20);
-    store.loadCacheStats();
+    let cancelled = false;
+    (async () => {
+      await store.loadRecentProjects(20);
+      if (cancelled) return;
+      await store.loadCacheStats();
+    })().catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, [store]);
 
   const handleProjectClick = (project: { id: string; status: string }) => {
@@ -101,14 +110,14 @@ export const HomePage: React.FC<HomePageProps> = ({
       </div>
 
       {/* 缓存占用摘要（GPT R7 Suggested #2） */}
-      {snapshot.cacheStats && (
-        <div style={styles.cacheStats}>
-          <span style={styles.cacheStatsLabel}>缓存占用</span>
-          <span style={styles.cacheStatsValue}>
-            {formatSize(snapshot.cacheStats.totalSizeBytes)} · {snapshot.cacheStats.projectCount} 个项目
-          </span>
-        </div>
-      )}
+      <div style={styles.cacheStats}>
+        <span style={styles.cacheStatsLabel}>缓存占用</span>
+        <span style={styles.cacheStatsValue}>
+          {cacheStatsLoading
+            ? '-- · -- 个项目（加载中）'
+            : `${formatSize(snapshot.cacheStats!.totalSizeBytes)} · ${snapshot.cacheStats!.projectCount} 个项目`}
+        </span>
+      </div>
 
       {/* Loading */}
       {snapshot.isLoading && (

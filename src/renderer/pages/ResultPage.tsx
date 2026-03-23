@@ -378,7 +378,9 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const existingStems = stems.filter(s => s.presence === 'exists');
   const mergedStems = stems.filter(s => s.presence === 'merged');
   const missingStems = stems.filter(s => s.presence === 'missing');
-  const totalTrackCount = existingStems.length + mergedStems.length + missingStems.length;
+  // Header track count must be derived from the same grouped lists used by the UI sections.
+  const headerTrackCount = [existingStems, mergedStems, missingStems]
+    .reduce((sum, group) => sum + group.length, 0);
 
   if (isLoading && !projectResult) {
     return (
@@ -424,7 +426,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
                     ?? projectResult.sourceType}
                 </span>
                 {' · '}
-                {totalTrackCount} 轨 {' · '}
+                {headerTrackCount} 轨 {' · '}
                 {formatSize(projectResult.totalSizeBytes)}
                 {projectResult.durationMs != null && (
                   <> · {formatDuration(projectResult.durationMs)}</>
@@ -613,15 +615,6 @@ export const ResultPage: React.FC<ResultPageProps> = ({
               <div style={styles.chordSummaryRow}>
                 <span style={styles.chordSummaryLabel}>词汇表版本</span>
                 <span style={styles.chordSummaryValue}>{analysisSnap.vocabularyVersion}</span>
-              </div>
-            )}
-            {/* 浣庣疆淇″害鎻愮ず 鈥?浠?warnings 涓繃婊ゅ睍绀?*/}
-            {/* 璇婃柇璀﹀憡锛圧12 GPT R11 Must Fix #5锛?*/}
-            {analysisSnap.warnings.length > 0 && (
-              <div style={styles.chordWarnings}>
-                {analysisSnap.warnings.map((w, i) => (
-                  <div key={i} style={styles.chordWarningItem}>⚠ {w}</div>
-                ))}
               </div>
             )}
           </div>

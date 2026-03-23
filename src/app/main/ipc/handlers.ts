@@ -357,6 +357,21 @@ function buildWaveformCacheKey(projectId: string, sourceSignature: string, analy
   return `${projectId}::${sourceSignature}::${analysisVersion}`;
 }
 
+const WARNING_MOJIBAKE_PATTERN = /[�]|(?:鍜|鍒|鎾|缁|妯|锛|銆|鈥|鈫|浣庣疆|璇婃柇)/;
+
+function sanitizeChordWarnings(rawWarnings: unknown): string[] {
+  if (!Array.isArray(rawWarnings)) return [];
+
+  return rawWarnings
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .filter((item) => !WARNING_MOJIBAKE_PATTERN.test(item))
+    .filter((item) => !item.includes('仅供参考'))
+    .filter((item) => !item.includes('示例占位'))
+    .filter((item, index, array) => array.indexOf(item) === index);
+}
+
 async function loadPersistedWaveformResult(
   project: Project,
   expectedAnalysisVersion: string,
@@ -502,9 +517,7 @@ async function loadPersistedChordResult(
   const estimatedBpm = typeof raw.estimatedBpm === 'number' && Number.isFinite(raw.estimatedBpm)
     ? raw.estimatedBpm
     : undefined;
-  const warnings = Array.isArray(raw.warnings)
-    ? raw.warnings.filter((value): value is string => typeof value === 'string')
-    : [];
+  const warnings = sanitizeChordWarnings(raw.warnings);
   const rawTempo = isObjectLike(raw.tempo) ? raw.tempo : null;
   const rawAnalysisMethods = isObjectLike(raw.analysisMethods) ? raw.analysisMethods : null;
   const rawChordVocabulary = isObjectLike(raw.chordVocabulary) ? raw.chordVocabulary : null;
@@ -1849,12 +1862,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             : undefined,
         }
         : undefined;
-      const warnings = Array.isArray(raw.warnings) ? raw.warnings.filter((w) => typeof w === 'string') : [];
+      const warnings = sanitizeChordWarnings(raw.warnings);
       if (rawEstimatedBpm != null && normalizedEstimatedBpm == null) {
         warnings.push('BPM 估计值不稳定，已隐藏该字段');
-      }
-      if (!warnings.some((w) => w.includes('仅供参考'))) {
-        warnings.push('和弦、调性与 BPM 为算法估计值，仅供参考');
       }
 
       const chordResult: CachedChordAnalysisDTO = {
@@ -1897,7 +1907,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       };
       if (sourceKind !== 'original') {
         chordResult.warnings = Array.from(
-          new Set([...(chordResult.warnings ?? []), '当前和弦/调性分析输入为 stem 回退源，结果稳定性可能降低']),
+          new Set([...(chordResult.warnings ?? []), '当前分析输入为 stem 回退源，结果稳定性可能降低']),
         );
       }
 
