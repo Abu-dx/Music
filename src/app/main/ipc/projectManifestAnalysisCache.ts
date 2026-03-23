@@ -4,12 +4,16 @@ import * as path from 'path';
 export interface ManifestWaveformRef {
   path: string;
   version: string;
+  parentResultId?: string;
+  sourceSignature?: string;
 }
 
 export interface ManifestChordAnalysisRef {
   path: string;
   analysisVersion: string;
   vocabularyVersion: string;
+  parentResultId?: string;
+  sourceSignature?: string;
 }
 
 export interface ManifestAnalysisRefs {
@@ -56,9 +60,19 @@ function readWaveformRef(manifest: Record<string, unknown>): ManifestWaveformRef
   if (!isObjectLike(waveform)) return null;
   if (typeof waveform.path !== 'string' || waveform.path.trim().length === 0) return null;
   if (typeof waveform.version !== 'string' || waveform.version.trim().length === 0) return null;
+  const parentResultId =
+    typeof waveform.parentResultId === 'string' && waveform.parentResultId.trim().length > 0
+      ? waveform.parentResultId.trim()
+      : undefined;
+  const sourceSignature =
+    typeof waveform.sourceSignature === 'string' && waveform.sourceSignature.trim().length > 0
+      ? waveform.sourceSignature.trim()
+      : undefined;
   return {
     path: waveform.path.trim(),
     version: waveform.version.trim(),
+    parentResultId,
+    sourceSignature,
   };
 }
 
@@ -78,10 +92,20 @@ function readChordRef(manifest: Record<string, unknown>): ManifestChordAnalysisR
   ) {
     return null;
   }
+  const parentResultId =
+    typeof chordAnalysis.parentResultId === 'string' && chordAnalysis.parentResultId.trim().length > 0
+      ? chordAnalysis.parentResultId.trim()
+      : undefined;
+  const sourceSignature =
+    typeof chordAnalysis.sourceSignature === 'string' && chordAnalysis.sourceSignature.trim().length > 0
+      ? chordAnalysis.sourceSignature.trim()
+      : undefined;
   return {
     path: chordAnalysis.path.trim(),
     analysisVersion: chordAnalysis.analysisVersion.trim(),
     vocabularyVersion: chordAnalysis.vocabularyVersion.trim(),
+    parentResultId,
+    sourceSignature,
   };
 }
 

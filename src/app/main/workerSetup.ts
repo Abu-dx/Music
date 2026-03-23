@@ -421,6 +421,16 @@ function resolveDemucsPythonPath(workerScriptPath: string): string | null {
   return null;
 }
 
+function resolveEnvironmentRootFromPythonExecutable(executablePath: string): string {
+  const resolved = path.resolve(executablePath);
+  const executableDir = path.dirname(resolved);
+  const lowerDir = executableDir.toLowerCase();
+  if (lowerDir.endsWith(`${path.sep}scripts`) || lowerDir.endsWith(`${path.sep}bin`)) {
+    return path.dirname(executableDir);
+  }
+  return executableDir;
+}
+
 export interface WorkerInfra {
   workerManager: WorkerManager;
   ipcBridge: WorkerIpcBridge;
@@ -461,6 +471,20 @@ export function initWorkerInfra(): WorkerInfra {
   if (demucsPythonPath && !process.env.WORKER_PYTHON_EXE) {
     process.env.WORKER_PYTHON_EXE = demucsPythonPath;
     logger.info('Resolved WORKER_PYTHON_EXE automatically', { workerPythonPath: demucsPythonPath });
+  }
+  if (!process.env.DEMUCS_RUNTIME_PROFILE || process.env.DEMUCS_RUNTIME_PROFILE.trim().length === 0) {
+    process.env.DEMUCS_RUNTIME_PROFILE = 'demucs_env_override';
+  }
+  const pilotExecutable = process.env.DEMUCS_6S_PILOT_PYTHON_EXE?.trim();
+  if (pilotExecutable && (!process.env.DEMUCS_6S_PILOT_ENV_ROOT || process.env.DEMUCS_6S_PILOT_ENV_ROOT.trim().length === 0)) {
+    process.env.DEMUCS_6S_PILOT_ENV_ROOT = resolveEnvironmentRootFromPythonExecutable(pilotExecutable);
+    logger.info('Resolved DEMUCS_6S_PILOT_ENV_ROOT from pilot executable', {
+      pilotExecutable,
+      pilotEnvironmentRoot: process.env.DEMUCS_6S_PILOT_ENV_ROOT,
+    });
+  }
+  if (!process.env.ANALYSIS_RUNTIME_PROFILE || process.env.ANALYSIS_RUNTIME_PROFILE.trim().length === 0) {
+    process.env.ANALYSIS_RUNTIME_PROFILE = 'analysis_default';
   }
 
   const pythonPath = demucsPythonPath ?? (process.platform === 'win32' ? 'python' : 'python3');
@@ -536,6 +560,10 @@ export function initWorkerInfra(): WorkerInfra {
   logger.info('Worker infrastructure + ParseJobService initialized', {
     pythonPath,
     workerScriptPath,
+    demucsRuntimeProfile: process.env.DEMUCS_RUNTIME_PROFILE,
+    demucs6sPilotRuntimeProfile: process.env.DEMUCS_6S_PILOT_PYTHON_EXE ? 'demucs_6s_pilot' : 'disabled',
+    demucs6sPilotEnvironmentRoot: process.env.DEMUCS_6S_PILOT_ENV_ROOT ?? '',
+    analysisRuntimeProfile: process.env.ANALYSIS_RUNTIME_PROFILE,
   });
   console.log(`[REAL_CHAIN] workerSetup.initWorkerInfra pythonPath="${pythonPath}" workerScriptPath="${workerScriptPath}"`);
 

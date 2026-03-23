@@ -18,7 +18,7 @@ import time
 import wave
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional, Protocol
+from typing import Any, Dict, List, Tuple, Optional, Protocol, Set
 from stem_routing import build_stem_routing_plan
 from runtime_profiles import (
     ExecutionRequest,
@@ -47,6 +47,8 @@ DEFAULT_SEPARATION_ENGINE = "demucs"
 ALLOWED_SEPARATION_ENGINES = {"demucs", "bs_roformer_sw"}
 ENV_WORKER_PYTHON_EXE = "WORKER_PYTHON_EXE"
 ENV_DEMUCS_PYTHON_EXE = "DEMUCS_PYTHON_EXE"
+ENV_DEMUCS_6S_PILOT_PYTHON_EXE = "DEMUCS_6S_PILOT_PYTHON_EXE"
+ENV_DEMUCS_6S_PILOT_ENV_ROOT = "DEMUCS_6S_PILOT_ENV_ROOT"
 ENV_DEMUCS_RUNTIME_PROFILE = "DEMUCS_RUNTIME_PROFILE"
 ENV_ANALYSIS_RUNTIME_PROFILE = "ANALYSIS_RUNTIME_PROFILE"
 ENV_STEM_ROUTING_CONFIG_JSON = "STEM_ROUTING_CONFIG_JSON"
@@ -57,6 +59,7 @@ DEFAULT_CHORD_ANALYZER_ID = "chord_rule_chroma_v1"
 DEFAULT_TEMPO_ANALYZER_ID = "tempo_rule_onset_v1"
 DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID = "analysis_default"
 DEFAULT_DEMUCS_RUNTIME_PROFILE_ID = "demucs_env_override"
+PILOT_DEMUCS_RUNTIME_PROFILE_ID = "demucs_6s_pilot"
 
 BS_OUTPUT_CANONICAL_FILENAMES = {
     "vocals": "vocals.wav",
@@ -877,6 +880,47 @@ def _resolve_executable_candidate(candidate: str) -> str:
     return found or value
 
 
+def _resolve_environment_root(executable: str) -> str:
+    resolved = _resolve_executable_candidate(executable)
+    if not resolved:
+        return ""
+    executable_path = os.path.abspath(resolved)
+    executable_dir = os.path.dirname(executable_path)
+    lower_dir = executable_dir.lower()
+    if lower_dir.endswith("\\scripts") or lower_dir.endswith("/scripts"):
+        return os.path.dirname(executable_dir)
+    if lower_dir.endswith("\\bin") or lower_dir.endswith("/bin"):
+        return os.path.dirname(executable_dir)
+    return executable_dir
+
+
+def _create_demucs_profile(
+    *,
+    profile_id: str,
+    executable: str,
+    environment_root: str,
+    demucs_device: str,
+    demucs_model_dir: str,
+) -> RuntimeProfile:
+    resolved_executable = _resolve_executable_candidate(executable)
+    return RuntimeProfile(
+        id=profile_id,
+        model_id="demucs",
+        executable=resolved_executable,
+        environment_root=environment_root,
+        env={"DEMUCS_DEVICE": demucs_device},
+        required_modules=["demucs"],
+        health_check=[resolved_executable, "-c", "import demucs"] if resolved_executable else None,
+        model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
+        device_preference=demucs_device,
+        isolation_mode="subprocess",
+        default_timeout_sec=1800,
+        allow_fallback=False,
+        fallback_profile_id=None,
+        admission_approved=True,
+    )
+
+
 def _build_runtime_profile_registry() -> RuntimeProfileRegistry:
     exe_name = "python.exe" if os.name == "nt" else "python3"
     scripts_dir = "Scripts" if os.name == "nt" else "bin"
@@ -885,66 +929,94 @@ def _build_runtime_profile_registry() -> RuntimeProfileRegistry:
         os.environ.get(ENV_DEMUCS_PYTHON_EXE, "").strip()
         or os.environ.get(ENV_WORKER_PYTHON_EXE, "").strip()
     )
+    env_override_executable = _resolve_executable_candidate(env_override) or _resolve_executable_candidate(sys.executable)
+    pilot_override = os.environ.get(ENV_DEMUCS_6S_PILOT_PYTHON_EXE, "").strip()
+    pilot_override_executable = _resolve_executable_candidate(pilot_override)
+    pilot_env_root = os.environ.get(ENV_DEMUCS_6S_PILOT_ENV_ROOT, "").strip()
+    if pilot_override_executable and not pilot_env_root:
+        pilot_env_root = _resolve_environment_root(pilot_override_executable)
     demucs_device = os.environ.get("DEMUCS_DEVICE", "auto").strip() or "auto"
     demucs_model_dir = os.environ.get("DEMUCS_MODEL_DIR", "").strip()
 
-    profiles = [
+    profiles: List[RuntimeProfile] = [
         RuntimeProfile(
             id=DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID,
+            model_id="analysis",
             executable=sys.executable,
+            environment_root="inprocess://analysis_default",
             required_modules=[],
             isolation_mode="inprocess",
             default_timeout_sec=120,
             allow_fallback=False,
-        ),
-        RuntimeProfile(
-            id="demucs_env_override",
-            executable=_resolve_executable_candidate(env_override),
-            env={"DEMUCS_DEVICE": demucs_device},
-            required_modules=["demucs"],
-            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
-            device_preference=demucs_device,
-            isolation_mode="subprocess",
-            default_timeout_sec=1800,
-            allow_fallback=True,
-            fallback_profile_id="demucs_sys",
-        ),
-        RuntimeProfile(
-            id="demucs_sys",
-            executable=sys.executable,
-            env={"DEMUCS_DEVICE": demucs_device},
-            required_modules=["demucs"],
-            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
-            device_preference=demucs_device,
-            isolation_mode="subprocess",
-            default_timeout_sec=1800,
-            allow_fallback=True,
-            fallback_profile_id="demucs_cwd_venv",
-        ),
-        RuntimeProfile(
-            id="demucs_cwd_venv",
-            executable=os.path.join(os.getcwd(), ".venv", scripts_dir, exe_name),
-            env={"DEMUCS_DEVICE": demucs_device},
-            required_modules=["demucs"],
-            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
-            device_preference=demucs_device,
-            isolation_mode="subprocess",
-            default_timeout_sec=1800,
-            allow_fallback=True,
-            fallback_profile_id="demucs_repo_venv",
-        ),
-        RuntimeProfile(
-            id="demucs_repo_venv",
-            executable=os.path.join(repo_root, ".venv", scripts_dir, exe_name),
-            env={"DEMUCS_DEVICE": demucs_device},
-            required_modules=["demucs"],
-            model_paths={"demucsModelDir": demucs_model_dir} if demucs_model_dir else {},
-            device_preference=demucs_device,
-            isolation_mode="subprocess",
-            default_timeout_sec=1800,
-            allow_fallback=False,
+            admission_approved=True,
         ),
     ]
+    demucs_candidates = [
+        (
+            "demucs_env_override",
+            env_override_executable,
+            _resolve_environment_root(env_override_executable),
+        ),
+        (
+            "demucs_sys",
+            _resolve_executable_candidate(sys.executable),
+            _resolve_environment_root(sys.executable),
+        ),
+        (
+            "demucs_cwd_venv",
+            os.path.join(os.getcwd(), ".venv", scripts_dir, exe_name),
+            _resolve_environment_root(os.path.join(os.getcwd(), ".venv", scripts_dir, exe_name)),
+        ),
+        (
+            "demucs_repo_venv",
+            os.path.join(repo_root, ".venv", scripts_dir, exe_name),
+            _resolve_environment_root(os.path.join(repo_root, ".venv", scripts_dir, exe_name)),
+        ),
+    ]
+    used_roots: Set[str] = set()
+    main_demucs_profiles: List[RuntimeProfile] = []
+    for profile_id, executable, environment_root in demucs_candidates:
+        normalized_root = os.path.normcase(os.path.realpath(os.path.abspath(environment_root))) if environment_root else ""
+        if not normalized_root:
+            continue
+        if normalized_root in used_roots:
+            continue
+        main_demucs_profiles.append(
+            _create_demucs_profile(
+                profile_id=profile_id,
+                executable=executable,
+                environment_root=environment_root,
+                demucs_device=demucs_device,
+                demucs_model_dir=demucs_model_dir,
+            ),
+        )
+        used_roots.add(normalized_root)
+
+    for index, profile in enumerate(main_demucs_profiles):
+        next_profile = main_demucs_profiles[index + 1] if index + 1 < len(main_demucs_profiles) else None
+        profile.fallback_profile_id = next_profile.id if next_profile else None
+        profile.allow_fallback = next_profile is not None
+
+    profiles.extend(main_demucs_profiles)
+
+    if pilot_override_executable and pilot_env_root:
+        profiles.append(
+            _create_demucs_profile(
+                profile_id=PILOT_DEMUCS_RUNTIME_PROFILE_ID,
+                executable=pilot_override_executable,
+                environment_root=pilot_env_root,
+                demucs_device=demucs_device,
+                demucs_model_dir=demucs_model_dir,
+            ),
+        )
+    elif pilot_override or pilot_env_root:
+        log(
+            "WARN",
+            "[REAL_CHAIN] runtime_registry pilot_profile_skipped "
+            f"reason=incomplete_config executable_set={str(bool(pilot_override_executable)).lower()} "
+            f"environment_root_set={str(bool(pilot_env_root)).lower()}",
+        )
+
     return RuntimeProfileRegistry(profiles)
 
 
@@ -954,12 +1026,19 @@ def _resolve_runtime_profile(
     requested_profile_id: str,
     default_profile_id: str,
     context: str,
+    command_name: str,
+    allowed_model_ids: Set[str],
 ) -> RuntimeResolution:
     registry = _build_runtime_profile_registry()
     resolver = RuntimeResolver(registry=registry, health_checker=RuntimeHealthChecker())
     resolution = resolver.resolve(
         requested_profile_id=requested_profile_id,
         default_profile_id=default_profile_id,
+    )
+    registry.validate_for_command(
+        resolution.profile,
+        command_name=command_name,
+        allowed_model_ids=allowed_model_ids,
     )
     fallback = resolution.fallback_reason or "none"
     health = "|".join(resolution.health.checks) if resolution.health.checks else "none"
@@ -1030,12 +1109,16 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
             requested_profile_id=chord_runtime_requested,
             default_profile_id=DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID,
             context="execute_chord_analysis.chord",
+            command_name="execute_chord_analysis",
+            allowed_model_ids={"analysis"},
         )
         tempo_runtime = _resolve_runtime_profile(
             request_id=request_id,
             requested_profile_id=tempo_runtime_requested,
             default_profile_id=DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID,
             context="execute_chord_analysis.tempo",
+            command_name="execute_chord_analysis",
+            allowed_model_ids={"analysis"},
         )
         if chord_runtime.profile.isolation_mode != "inprocess" or tempo_runtime.profile.isolation_mode != "inprocess":
             rejected_runtime = chord_runtime if chord_runtime.profile.isolation_mode != "inprocess" else tempo_runtime
@@ -1220,8 +1303,10 @@ def _run_demucs_engine(
     file_path: str,
     output_dir: str,
     stems_dir: str,
+    model_override: Optional[str] = None,
+    runtime_profile_override: Optional[str] = None,
 ) -> dict:
-    requested_model = os.environ.get("DEMUCS_MODEL", DEFAULT_DEMUCS_MODEL).strip() or DEFAULT_DEMUCS_MODEL
+    requested_model = (model_override or os.environ.get("DEMUCS_MODEL", DEFAULT_DEMUCS_MODEL)).strip() or DEFAULT_DEMUCS_MODEL
     model_name = requested_model
     if model_name not in ALLOWED_DEMUCS_MODELS:
         log(
@@ -1234,14 +1319,26 @@ def _run_demucs_engine(
 
     source_basename = Path(file_path).stem
     requested_runtime_profile = (
-        os.environ.get(ENV_DEMUCS_RUNTIME_PROFILE, "").strip()
+        (runtime_profile_override or os.environ.get(ENV_DEMUCS_RUNTIME_PROFILE, "")).strip()
         or DEFAULT_DEMUCS_RUNTIME_PROFILE_ID
+    )
+    default_runtime_profile = (
+        PILOT_DEMUCS_RUNTIME_PROFILE_ID
+        if requested_runtime_profile == PILOT_DEMUCS_RUNTIME_PROFILE_ID
+        else DEFAULT_DEMUCS_RUNTIME_PROFILE_ID
     )
     demucs_runtime = _resolve_runtime_profile(
         request_id=request_id,
         requested_profile_id=requested_runtime_profile,
-        default_profile_id=DEFAULT_DEMUCS_RUNTIME_PROFILE_ID,
+        default_profile_id=default_runtime_profile,
         context="start_separation.demucs",
+        command_name="start_separation",
+        allowed_model_ids={"demucs"},
+    )
+    log(
+        "INFO",
+        f"[REAL_CHAIN] start_separation demucs_selection request_id={request_id} "
+        f"model={model_name} requested_profile={requested_runtime_profile} actual_profile={demucs_runtime.actual_profile_id}",
     )
 
     cmd = [
@@ -1490,6 +1587,8 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
     """
     file_path = payload.get("filePath", "")
     output_dir = payload.get("outputDir", "")
+    model_override = str(payload.get("modelName", "") or "").strip() or None
+    runtime_profile_override = str(payload.get("runtimeProfileId", "") or "").strip() or None
 
     if not file_path or not os.path.isfile(file_path):
         send_response(request_id, False, error={
@@ -1510,7 +1609,12 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
     os.makedirs(stems_dir, exist_ok=True)
     _cleanup_existing_stems(stems_dir)
 
-    log("INFO", f"[REAL_CHAIN] start_separation begin request_id={request_id} file_path={file_path} output_dir={output_dir} stems_dir={stems_dir}")
+    log(
+        "INFO",
+        f"[REAL_CHAIN] start_separation begin request_id={request_id} "
+        f"file_path={file_path} output_dir={output_dir} stems_dir={stems_dir} "
+        f"model_override={model_override or 'none'} runtime_profile_override={runtime_profile_override or 'none'}",
+    )
 
     # 鍙戦€?progress: preprocessing
     send_event("stage_progress", {
@@ -1550,6 +1654,8 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
                     file_path=file_path,
                     output_dir=output_dir,
                     stems_dir=stems_dir,
+                    model_override=model_override,
+                    runtime_profile_override=runtime_profile_override,
                 )
         else:
             engine_result = _run_demucs_engine(
@@ -1557,6 +1663,8 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
                 file_path=file_path,
                 output_dir=output_dir,
                 stems_dir=stems_dir,
+                model_override=model_override,
+                runtime_profile_override=runtime_profile_override,
             )
 
         if not engine_result or len(engine_result.get("stems", [])) == 0:
@@ -1651,6 +1759,17 @@ COMMAND_HANDLERS = {
 
 
 def main() -> None:
+    try:
+        registry = _build_runtime_profile_registry()
+        profile_ids = ",".join(sorted([profile.id for profile in registry.list()]))
+        log(
+            "INFO",
+            f"[REAL_CHAIN] runtime_profiles_validated profile_count={len(registry.list())} profile_ids={profile_ids}",
+        )
+    except Exception as exc:
+        log("ERROR", f"[REAL_CHAIN] runtime_profiles_invalid error={exc}")
+        raise
+
     log("INFO", "Stem Monitor Python Worker started")
 
     for line in sys.stdin:

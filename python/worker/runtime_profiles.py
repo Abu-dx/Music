@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 ENV_RUNTIME_FORCE_UNHEALTHY_PROFILES = "RUNTIME_FORCE_UNHEALTHY_PROFILES"
 
@@ -14,7 +14,9 @@ ENV_RUNTIME_FORCE_UNHEALTHY_PROFILES = "RUNTIME_FORCE_UNHEALTHY_PROFILES"
 @dataclass
 class RuntimeProfile:
     id: str
+    model_id: str
     executable: str
+    environment_root: str = ""
     working_directory: Optional[str] = None
     env: Dict[str, str] = field(default_factory=dict)
     required_modules: List[str] = field(default_factory=list)
@@ -25,6 +27,7 @@ class RuntimeProfile:
     default_timeout_sec: int = 600
     allow_fallback: bool = True
     fallback_profile_id: Optional[str] = None
+    admission_approved: bool = True
 
 
 @dataclass
@@ -44,10 +47,80 @@ class RuntimeResolution:
 
 class RuntimeProfileRegistry:
     def __init__(self, profiles: List[RuntimeProfile]):
-        self._profiles: Dict[str, RuntimeProfile] = {profile.id: profile for profile in profiles}
+        self._profiles: Dict[str, RuntimeProfile] = {}
+        duplicate_ids: Set[str] = set()
+        for profile in profiles:
+            if profile.id in self._profiles:
+                duplicate_ids.add(profile.id)
+            self._profiles[profile.id] = profile
+        if duplicate_ids:
+            joined = ",".join(sorted(duplicate_ids))
+            raise ValueError(f"runtime profile duplicated id(s): {joined}")
+        self._validate_or_raise()
 
     def get(self, profile_id: str) -> Optional[RuntimeProfile]:
         return self._profiles.get(profile_id)
+
+    def list(self) -> List[RuntimeProfile]:
+        return list(self._profiles.values())
+
+    def validate_for_command(self, profile: RuntimeProfile, command_name: str, allowed_model_ids: Set[str]) -> None:
+        if not profile.admission_approved:
+            raise RuntimeError(f"runtime profile not admitted: {profile.id}")
+        if profile.model_id not in allowed_model_ids:
+            allowed = ",".join(sorted(allowed_model_ids))
+            raise RuntimeError(
+                f"runtime profile model not allowed for command {command_name}: "
+                f"profile={profile.id}, model={profile.model_id}, allowed={allowed}"
+            )
+
+    def _validate_or_raise(self) -> None:
+        if not self._profiles:
+            raise ValueError("runtime profile registry is empty")
+
+        subprocess_roots: Dict[str, str] = {}
+        profile_ids = set(self._profiles.keys())
+
+        for profile in self._profiles.values():
+            if not profile.id or not profile.id.strip():
+                raise ValueError("runtime profile id cannot be empty")
+            if not profile.model_id or not profile.model_id.strip():
+                raise ValueError(f"runtime profile model_id missing: {profile.id}")
+            if profile.fallback_profile_id and profile.fallback_profile_id not in profile_ids:
+                raise ValueError(
+                    f"runtime profile fallback missing: profile={profile.id}, "
+                    f"fallback={profile.fallback_profile_id}"
+                )
+
+            if profile.isolation_mode != "subprocess":
+                continue
+
+            executable = (profile.executable or "").strip()
+            if not executable:
+                raise ValueError(f"runtime profile executable missing: {profile.id}")
+            if not profile.health_check or len(profile.health_check) == 0:
+                raise ValueError(f"runtime profile health_check missing: {profile.id}")
+
+            normalized_root = self._normalize_environment_root(profile.environment_root)
+            if not normalized_root:
+                raise ValueError(f"runtime profile environment_root missing: {profile.id}")
+            profile.environment_root = normalized_root
+
+            existing = subprocess_roots.get(normalized_root)
+            if existing:
+                raise ValueError(
+                    f"runtime profile environment_root duplicated: root={normalized_root}, "
+                    f"profiles={existing},{profile.id}"
+                )
+            subprocess_roots[normalized_root] = profile.id
+
+    def _normalize_environment_root(self, value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        if raw.lower().startswith("inprocess://"):
+            return raw
+        return os.path.normcase(os.path.realpath(os.path.abspath(raw)))
 
 
 class RuntimeHealthChecker:

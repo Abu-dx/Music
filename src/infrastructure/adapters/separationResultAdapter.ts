@@ -54,6 +54,13 @@ export interface RawSeparationResult {
   stems: RawEngineStemOutput[];
 }
 
+export interface SeparationProvenanceContext {
+  jobId?: string;
+  runtimeProfileId?: string;
+  parentResultId?: string;
+  sourceKind?: string;
+}
+
 // ============================================================================
 // 2. 鐩綍绾﹀畾甯搁噺锛堥泦涓鐞嗭紝涓嶆暎钀藉埌搴旂敤灞傦級
 // ============================================================================
@@ -100,6 +107,7 @@ export interface ISeparationResultAdapter {
     raw: RawSeparationResult,
     projectId: string,
     projectDir: string,
+    provenanceContext?: SeparationProvenanceContext,
   ): AdaptedSeparationResult;
 }
 
@@ -141,6 +149,27 @@ function resolveSupportedStemTypes(raw: RawSeparationResult, modelName: string):
   return MODEL_SUPPORTED_STEMS[modelName] ?? MODEL_SUPPORTED_STEMS.htdemucs;
 }
 
+function buildSourceSignature(raw: RawSeparationResult, projectId: string): string {
+  const hash = crypto.createHash('sha1');
+  hash.update(projectId);
+  hash.update('|');
+  hash.update(raw.engineVersion ?? '');
+  hash.update('|');
+  hash.update(raw.modelName ?? '');
+  const sortedStems = raw.stems
+    .slice()
+    .sort((a, b) => a.filename.localeCompare(b.filename));
+  for (const stem of sortedStems) {
+    hash.update('|');
+    hash.update(stem.filename);
+    hash.update('|');
+    hash.update(String(stem.sizeBytes));
+    hash.update('|');
+    hash.update(String(stem.durationMs));
+  }
+  return hash.digest('hex');
+}
+
 export class SeparationResultAdapter implements ISeparationResultAdapter {
   constructor(private readonly logger: ILogger) {}
 
@@ -148,6 +177,7 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
     raw: RawSeparationResult,
     projectId: string,
     projectDir: string,
+    provenanceContext?: SeparationProvenanceContext,
   ): AdaptedSeparationResult {
     const warnings: string[] = [];
     const stemFiles: StemFile[] = [];
@@ -155,6 +185,12 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
     const detectedTypes = new Set<StemType>();
     const modelName = resolveModelName(raw);
     const supportedByModel = resolveSupportedStemTypes(raw, modelName);
+    const sourceSignature = buildSourceSignature(raw, projectId);
+    const parentResultId = provenanceContext?.parentResultId ?? 'main';
+    const runtimeProfileId = provenanceContext?.runtimeProfileId
+      ?? process.env.DEMUCS_RUNTIME_PROFILE
+      ?? 'demucs_env_override';
+    const sourceKind = provenanceContext?.sourceKind ?? 'separation';
 
     for (const rawStem of raw.stems) {
       // 鎺ㄦ柇杞ㄩ亾绫诲瀷
@@ -182,6 +218,12 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
         confidence: null,
         exportable: true,
         status: StemStatus.Detected,
+        modelId: modelName,
+        runtimeProfileId,
+        jobId: provenanceContext?.jobId,
+        parentResultId,
+        sourceSignature,
+        sourceKind,
       };
 
       stemFiles.push(stemFile);
@@ -196,6 +238,12 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
         durationMs: rawStem.durationMs,
         sampleRate: rawStem.sampleRate,
         sourceOrigin: 'engine_output',
+        modelId: modelName,
+        runtimeProfileId,
+        jobId: provenanceContext?.jobId,
+        parentResultId,
+        sourceSignature,
+        sourceKind,
       });
     }
 

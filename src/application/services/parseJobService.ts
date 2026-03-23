@@ -74,6 +74,7 @@ import { IProjectDirManager } from '../../infrastructure/fs/projectDirManager';
 import {
   ISeparationResultAdapter,
   RawSeparationResult,
+  SeparationProvenanceContext,
 } from '../../infrastructure/adapters/separationResultAdapter';
 import { ICacheService } from './cacheService';
 
@@ -93,6 +94,10 @@ export interface ParseJobServiceConfig {
 export const DEFAULT_PARSE_JOB_CONFIG: ParseJobServiceConfig = {
   separationTimeoutMs: 600_000,
 };
+const DEFAULT_ACTIVE_RESULT_ID = 'main';
+const PILOT_RESULT_SET_PREFIX = 'pilot_6s_';
+const PILOT_MODEL_ID = 'htdemucs_6s';
+const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
 
 /** 分离任务启动参数 */
 export interface StartSeparationParams {
@@ -100,6 +105,11 @@ export interface StartSeparationParams {
   sourceFilePath: string;
   projectDir: string;
   engineVersion?: string;
+  resultSetId?: string;
+  preserveExistingStems?: boolean;
+  allowReadyStatus?: boolean;
+  runtimeProfileIdOverride?: string;
+  workerModelOverride?: string;
 }
 
 /**
@@ -252,10 +262,27 @@ export class ParseJobService implements IParseJobService {
 
     // 7. 发送分离命令
     try {
+      const resultSetId = this.normalizeResultSetId(params.resultSetId);
+      const isPilotResultSet = resultSetId.startsWith(PILOT_RESULT_SET_PREFIX);
+      const effectiveWorkerModelOverride = (params.workerModelOverride?.trim().length ?? 0) > 0
+        ? params.workerModelOverride!.trim()
+        : (isPilotResultSet ? PILOT_MODEL_ID : '');
+      const effectiveRuntimeProfileOverride = (params.runtimeProfileIdOverride?.trim().length ?? 0) > 0
+        ? params.runtimeProfileIdOverride!.trim()
+        : (isPilotResultSet ? PILOT_RUNTIME_PROFILE_ID : '');
       const separationPayload = {
         filePath: params.sourceFilePath,
         outputDir: params.projectDir,
+        ...(effectiveWorkerModelOverride
+          ? { modelName: effectiveWorkerModelOverride }
+          : {}),
+        ...(effectiveRuntimeProfileOverride
+          ? { runtimeProfileId: effectiveRuntimeProfileOverride }
+          : {}),
       };
+      console.log(
+        `[REAL_CHAIN] parseJobService.startSeparation overrides jobId="${jobId}" projectId="${params.projectId}" resultSetId="${resultSetId}" modelOverride="${effectiveWorkerModelOverride || 'none'}" runtimeProfileOverride="${effectiveRuntimeProfileOverride || 'none'}"`,
+      );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation send_before jobId="${jobId}" projectId="${params.projectId}" payload=${JSON.stringify(separationPayload)}`);
       const response = await this.ipcBridge.send(
         WorkerCommand.StartSeparation,
@@ -307,9 +334,26 @@ export class ParseJobService implements IParseJobService {
       }
 
       // 9. 通过 adapter 归一化 → 写盘
-      const adapted = this.resultAdapter.adapt(validated.data!, params.projectId, params.projectDir);
+      const parentResultId = resultSetId;
+      const runtimeProfileId = (effectiveRuntimeProfileOverride || process.env.DEMUCS_RUNTIME_PROFILE || 'demucs_env_override').trim()
+        || 'demucs_env_override';
+      const provenanceContext: SeparationProvenanceContext = {
+        jobId,
+        runtimeProfileId,
+        parentResultId,
+        sourceKind: 'separation',
+      };
+      const adapted = this.resultAdapter.adapt(
+        validated.data!,
+        params.projectId,
+        params.projectDir,
+        provenanceContext,
+      );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation adapted jobId="${jobId}" projectId="${params.projectId}" stemFilesLength=${adapted.stemFiles.length}`);
-      await this.handleSeparationSuccess(jobId, params, adapted, startMs);
+      await this.handleSeparationSuccess(jobId, params, adapted, startMs, {
+        parentResultId,
+        preserveExistingStems: !!params.preserveExistingStems,
+      });
 
       const finalJob = await this.parseJobRepo.findById(jobId);
       return {
@@ -474,6 +518,9 @@ export class ParseJobService implements IParseJobService {
       ProjectStatus.ReadyToParse,
       ProjectStatus.Failed, // 允许失败后重试
     ];
+    if (params.allowReadyStatus) {
+      allowedStates.push(ProjectStatus.Ready);
+    }
     if (!allowedStates.includes(project.status)) {
       throw new AppError({
         code: ErrorCode.INVALID_STATE_TRANSITION,
@@ -530,32 +577,125 @@ export class ParseJobService implements IParseJobService {
     params: StartSeparationParams,
     adapted: { stemFiles: import('../../domain/entities').StemFile[]; manifestEntries: import('../../domain/entities').ManifestStemEntry[]; engineVersion: string; warnings: string[] },
     startMs: number,
+    options: {
+      parentResultId: string;
+      preserveExistingStems: boolean;
+    },
   ): Promise<void> {
     const elapsedMs = Date.now() - startMs;
+    const parentResultId = this.normalizeResultSetId(options.parentResultId);
+    const projectFingerprint = await this.resolveProjectFingerprintForManifest(params.projectId, params.sourceFilePath);
+    const signatureFromMain = adapted.manifestEntries.find((entry) =>
+      entry.parentResultId === parentResultId
+      && typeof entry.sourceSignature === 'string'
+      && entry.sourceSignature.trim().length > 0,
+    )?.sourceSignature?.trim();
+    const fallbackSignature = adapted.manifestEntries.find((entry) =>
+      typeof entry.sourceSignature === 'string'
+      && entry.sourceSignature.trim().length > 0,
+    )?.sourceSignature?.trim();
+    const sourceSignature = signatureFromMain ?? fallbackSignature ?? '';
+    if (sourceSignature.length === 0) {
+      throw new AppError({
+        code: ErrorCode.CACHE_MANIFEST_INVALID,
+        message: `Missing sourceSignature for result set "${parentResultId}"`,
+        userMessage: '分离结果元数据不完整，未生成有效结果集标识',
+        context: {
+          projectId: params.projectId,
+          jobId,
+          stage: 'parseJobService.handleSeparationSuccess',
+        },
+        retryable: false,
+      });
+    }
+    const modelId = adapted.manifestEntries.find((entry) =>
+      typeof entry.modelId === 'string' && entry.modelId.trim().length > 0,
+    )?.modelId?.trim() ?? 'demucs';
+    const runtimeProfileId = adapted.manifestEntries.find((entry) =>
+      typeof entry.runtimeProfileId === 'string' && entry.runtimeProfileId.trim().length > 0,
+    )?.runtimeProfileId?.trim() ?? 'demucs_env_override';
+    const resultSetMain = {
+      id: parentResultId,
+      modelId,
+      runtimeProfileId,
+      sourceSignature,
+      createdAt: Date.now(),
+    };
 
     // 1. 写入 DB
-    await this.stemFileRepo.createMany(adapted.stemFiles);
+    if (options.preserveExistingStems) {
+      const existingStems = await this.stemFileRepo.findByProjectId(params.projectId);
+      const keptStems = existingStems.filter((stem) =>
+        this.normalizeResultSetId(stem.parentResultId) !== parentResultId,
+      );
+      await this.stemFileRepo.deleteByProjectId(params.projectId);
+      await this.stemFileRepo.createMany([...keptStems, ...adapted.stemFiles]);
+    } else {
+      await this.stemFileRepo.deleteByProjectId(params.projectId);
+      await this.stemFileRepo.createMany(adapted.stemFiles);
+    }
 
     // 2. 写入 / 更新 manifest
     //    首次分离时 manifest 不存在（read 返回 null），需从头创建
-    const existingManifest = await this.manifestManager.read(params.projectDir);
+    let existingManifest = await this.manifestManager.read(params.projectDir);
+    if (!existingManifest) {
+      existingManifest = await this.tryRecoverManifestWithoutStrictValidation(params.projectDir, projectFingerprint);
+    }
+    const existingResultSets = (existingManifest?.resultSets ?? [])
+      .filter((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        return typeof entry.id === 'string'
+          && typeof entry.modelId === 'string'
+          && typeof entry.runtimeProfileId === 'string'
+          && typeof entry.sourceSignature === 'string'
+          && typeof entry.createdAt === 'number';
+      })
+      .map((entry) => ({
+        id: entry.id.trim(),
+        modelId: entry.modelId.trim(),
+        runtimeProfileId: entry.runtimeProfileId.trim(),
+        sourceSignature: entry.sourceSignature.trim(),
+        createdAt: Math.floor(entry.createdAt),
+      }))
+      .filter((entry) => entry.id.length > 0 && entry.modelId.length > 0 && entry.runtimeProfileId.length > 0 && entry.sourceSignature.length > 0);
+    const mergedResultSets = [
+      ...existingResultSets.filter((entry) => entry.id !== resultSetMain.id),
+      resultSetMain,
+    ].sort((a, b) => a.createdAt - b.createdAt);
+    const mergedManifestStems = options.preserveExistingStems && existingManifest
+      ? [
+          ...(existingManifest.stems ?? []).filter((entry) =>
+            this.normalizeResultSetId(entry.parentResultId) !== parentResultId,
+          ),
+          ...adapted.manifestEntries,
+        ]
+      : adapted.manifestEntries;
+    const rawActiveResultId = existingManifest?.activeResultId?.trim() || DEFAULT_ACTIVE_RESULT_ID;
+    const activeResultId = mergedResultSets.some((entry) => entry.id === rawActiveResultId)
+      ? rawActiveResultId
+      : DEFAULT_ACTIVE_RESULT_ID;
     const manifest: ProjectManifest = existingManifest
       ? {
           // 已有 manifest → 增量更新
           ...existingManifest,
+          fingerprint: existingManifest.fingerprint?.trim() || projectFingerprint,
           engineVersion: adapted.engineVersion,
           updatedAt: Date.now(),
-          stems: adapted.manifestEntries,
+          activeResultId,
+          resultSets: mergedResultSets,
+          stems: mergedManifestStems,
         }
       : {
           // 首次 → 创建最小初始 manifest
           projectId: params.projectId,
-          fingerprint: '',  // Phase 2 不做指纹计算
+          fingerprint: projectFingerprint,
           sourceType: ProjectSourceType.Separation,
           schemaVersion: CURRENT_MANIFEST_SCHEMA_VERSION,
           engineVersion: adapted.engineVersion,
           createdAt: Date.now(),
           updatedAt: Date.now(),
+          activeResultId: DEFAULT_ACTIVE_RESULT_ID,
+          resultSets: [resultSetMain],
           stems: adapted.manifestEntries,
           waveform: null,         // Phase 2 不做真实 waveform
           chordAnalysis: null,    // Phase 2 不做真实 chord
@@ -581,6 +721,66 @@ export class ParseJobService implements IParseJobService {
       elapsedMs,
       stage: 'parseJobService.handleSeparationSuccess',
     });
+  }
+
+  private normalizeResultSetId(value: string | null | undefined): string {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    return normalized.length > 0 ? normalized : DEFAULT_ACTIVE_RESULT_ID;
+  }
+
+  private async resolveProjectFingerprintForManifest(
+    projectId: string,
+    sourceFilePath: string,
+  ): Promise<string> {
+    const existingProject = await this.projectRepo.findById(projectId);
+    const existingFingerprint = existingProject?.fingerprint?.trim() ?? '';
+    if (existingFingerprint.length > 0) {
+      return existingFingerprint;
+    }
+
+    const fallback = await this.buildFallbackFingerprint(projectId, sourceFilePath);
+    await this.projectRepo.update(projectId, { fingerprint: fallback });
+    return fallback;
+  }
+
+  private async buildFallbackFingerprint(projectId: string, sourceFilePath: string): Promise<string> {
+    try {
+      const stat = await fs.promises.stat(sourceFilePath);
+      const resolvedPath = path.resolve(sourceFilePath).toLowerCase();
+      const seed = `${projectId}|${resolvedPath}|${stat.size}|${Math.floor(stat.mtimeMs)}`;
+      const digest = crypto.createHash('sha256').update(seed).digest('hex');
+      return `auto:${digest}:${stat.size}`;
+    } catch {
+      const digest = crypto.createHash('sha256').update(projectId).digest('hex');
+      return `auto:${digest}:0`;
+    }
+  }
+
+  private async tryRecoverManifestWithoutStrictValidation(
+    projectDir: string,
+    fallbackFingerprint: string,
+  ): Promise<ProjectManifest | null> {
+    const manifestPath = path.join(projectDir, 'manifest.json');
+    try {
+      await fs.promises.access(manifestPath, fs.constants.R_OK);
+    } catch {
+      return null;
+    }
+
+    try {
+      const raw = await fs.promises.readFile(manifestPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      const recovered = parsed as ProjectManifest;
+      return {
+        ...recovered,
+        fingerprint: (typeof recovered.fingerprint === 'string' && recovered.fingerprint.trim().length > 0)
+          ? recovered.fingerprint.trim()
+          : fallbackFingerprint,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**

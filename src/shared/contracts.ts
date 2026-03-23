@@ -261,6 +261,12 @@ export interface StemTrackDTO {
   presence: StemPresence;
   /** 合并来源轨道名（presence='merged' 时有值） */
   mergedFrom: string[] | null;
+  modelId?: string;
+  runtimeProfileId?: string;
+  jobId?: string;
+  parentResultId?: string;
+  sourceSignature?: string;
+  sourceKind?: string;
 }
 
 /**
@@ -278,6 +284,7 @@ export interface ProjectResultSummaryDTO extends ProjectSummaryDTO {
   cacheHitBannerText: string | null;
   /** 来源类型显示名（由 main 提供，如 "自动分离"/"手动导入"/"缓存命中"） */
   sourceTypeLabel: string;
+  activeResultId?: string;
 }
 
 // ============================================================================

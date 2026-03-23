@@ -100,6 +100,12 @@ export interface StemFile {
   confidence: number | null;
   exportable: boolean;
   status: StemStatus;
+  modelId?: string;
+  runtimeProfileId?: string;
+  jobId?: string;
+  parentResultId?: string;
+  sourceSignature?: string;
+  sourceKind?: string;
 }
 
 /** 轨道来源 — 值对象 */
@@ -224,14 +230,31 @@ export interface ProjectManifest {
   lastAccessedAt?: number | null;
   durationMs?: number | null;
   separationElapsedMs?: number | null;
+  activeResultId?: string;
+  resultSets?: ManifestResultSetEntry[];
   stems: ManifestStemEntry[];
-  waveform: { path: string; version: string } | null;
+  waveform: {
+    path: string;
+    version: string;
+    parentResultId?: string;
+    sourceSignature?: string;
+  } | null;
   /** 和弦分析引用，版本独立校验（ADR-006） */
   chordAnalysis: {
     path: string;
     analysisVersion: string;
     vocabularyVersion: string;
+    parentResultId?: string;
+    sourceSignature?: string;
   } | null;
+}
+
+export interface ManifestResultSetEntry {
+  id: string;
+  modelId: string;
+  runtimeProfileId: string;
+  sourceSignature: string;
+  createdAt: number;
 }
 
 /** Manifest 中的轨道条目 — 值对象 */
@@ -244,6 +267,12 @@ export interface ManifestStemEntry {
   durationMs?: number | null;
   sampleRate?: number | null;
   sourceOrigin: StemSourceOrigin;
+  modelId?: string;
+  runtimeProfileId?: string;
+  jobId?: string;
+  parentResultId?: string;
+  sourceSignature?: string;
+  sourceKind?: string;
 }
 
 // ============================================================================

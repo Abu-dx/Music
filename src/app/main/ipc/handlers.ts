@@ -27,7 +27,10 @@ import { StemType } from '../../../shared/enums';
 import type { Project } from '../../../domain/entities';
 import type { WorkerInfra } from '../workerSetup';
 import { inferStemTypeFromFilename } from '../../../domain/policies';
-import { patchProjectManifestMetadata } from './projectManifestMetadata';
+import {
+  patchProjectManifestMetadata,
+  ProjectManifestResultSetEntry,
+} from './projectManifestMetadata';
 import {
   readManifestAnalysisRefs,
   patchManifestAnalysisRefs,
@@ -129,6 +132,7 @@ type CachedChordAnalysisDTO = {
 
 type CachedChordAnalysisEntry = {
   cacheKey: string;
+  parentResultId: string;
   sourceFilePath: string;
   sourceSignature: string;
   analysisVersion: string;
@@ -138,6 +142,7 @@ type CachedChordAnalysisEntry = {
 
 type CachedWaveformEntry = {
   cacheKey: string;
+  parentResultId: string;
   sourceFilePath: string;
   sourceSignature: string;
   analysisVersion: string;
@@ -149,6 +154,29 @@ const waveformResultCache = new Map<string, CachedWaveformEntry>();
 const chordAnalysisResultCache = new Map<string, CachedChordAnalysisEntry>();
 const DEFAULT_WAVEFORM_CACHE_PATH = 'waveform/master-waveform.json';
 const DEFAULT_CHORD_CACHE_PATH = 'chord/chord-analysis.json';
+const DEFAULT_ACTIVE_RESULT_ID = 'main';
+const DEFAULT_RESULT_MODEL_ID = 'demucs';
+const DEFAULT_RESULT_RUNTIME_PROFILE_ID = 'demucs_env_override';
+const PILOT_MODEL_ID = 'htdemucs_6s';
+const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
+
+type ActiveResultContext = {
+  activeResultId: string;
+  sourceSignature: string | null;
+};
+
+function normalizeParentResultId(value: string | null | undefined): string {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  return normalized.length > 0 ? normalized : DEFAULT_ACTIVE_RESULT_ID;
+}
+
+function filterStemsForResultSet<T extends { parentResultId?: string }>(
+  stems: T[],
+  activeResultId: string,
+): T[] {
+  const target = normalizeParentResultId(activeResultId);
+  return stems.filter((stem) => normalizeParentResultId(stem.parentResultId) === target);
+}
 
 type RecentProjectEntry = {
   projectId: string;
@@ -267,6 +295,9 @@ function normalizeErrorMessage(err: unknown, fallback: string): string {
 
 function toSeparationFailureMessage(err: unknown): string {
   const raw = normalizeErrorMessage(err, '分离失败，请稍后重试');
+  if (raw.includes('manifest') || raw.includes('MANIFEST')) {
+    return '分离结果已生成，但项目元数据写入失败，请查看日志并重试';
+  }
   if (raw.includes('WORKER_NOT_RUNNING') || raw.includes('worker_not_available')) {
     return 'Worker 不可用，请重启应用后重试';
   }
@@ -293,12 +324,16 @@ function toAnalysisFailureMessage(err: unknown, fallback: string): string {
   return raw;
 }
 
-async function resolveAnalysisSourceFilePath(project: Project, infra: WorkerInfra): Promise<string | null> {
+async function resolveAnalysisSourceFilePath(
+  project: Project,
+  infra: WorkerInfra,
+  stemsOverride?: Array<{ stemType: StemType; exists: boolean; filePath: string }>,
+): Promise<string | null> {
   if (project.originalFilePath && fs.existsSync(project.originalFilePath)) {
     return project.originalFilePath;
   }
 
-  const stems = await infra.stemFileRepo.findByProjectId(project.id);
+  const stems = stemsOverride ?? await infra.stemFileRepo.findByProjectId(project.id);
   if (stems.length === 0) return null;
 
   const existing = stems.filter((s) => s.exists && typeof s.filePath === 'string' && s.filePath.trim().length > 0);
@@ -349,12 +384,194 @@ async function getFileSourceSignature(filePath: string): Promise<string | null> 
   }
 }
 
-function buildChordAnalysisCacheKey(projectId: string, sourceSignature: string, analysisVersion: string): string {
-  return `${projectId}::${sourceSignature}::${analysisVersion}`;
+function normalizeResultSetEntries(raw: unknown): ProjectManifestResultSetEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(isObjectLike)
+    .flatMap((entry) => {
+      const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+      const modelId = typeof entry.modelId === 'string' ? entry.modelId.trim() : '';
+      const runtimeProfileId = typeof entry.runtimeProfileId === 'string' ? entry.runtimeProfileId.trim() : '';
+      const sourceSignature = typeof entry.sourceSignature === 'string' ? entry.sourceSignature.trim() : '';
+      const createdAt = typeof entry.createdAt === 'number' ? Math.floor(entry.createdAt) : Date.now();
+      if (!id || !modelId || !runtimeProfileId || !sourceSignature) return [];
+      return [{ id, modelId, runtimeProfileId, sourceSignature, createdAt }];
+    });
 }
 
-function buildWaveformCacheKey(projectId: string, sourceSignature: string, analysisVersion: string): string {
-  return `${projectId}::${sourceSignature}::${analysisVersion}`;
+function normalizeManifestRelativePath(projectDir: string, filePath: string): string {
+  const relative = path.relative(projectDir, filePath).replace(/\\/g, '/');
+  if (relative.length > 0 && !relative.startsWith('..')) {
+    return relative;
+  }
+  return `stems/${path.basename(filePath)}`;
+}
+
+async function ensurePilotManifestPersistence(
+  project: Project,
+  resultSetId: string,
+  pilotStems: Array<{
+    stemType: string;
+    filePath: string;
+    codec: string;
+    sizeBytes: number;
+    durationMs?: number | null;
+    sampleRate?: number | null;
+    sourceOrigin?: string;
+    modelId?: string;
+    runtimeProfileId?: string;
+    jobId?: string;
+    sourceSignature?: string;
+    sourceKind?: string;
+  }>,
+): Promise<void> {
+  const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+  if (!manifest) {
+    throw new Error(`PILOT_MANIFEST_MISSING projectId="${project.id}" cacheDir="${project.cacheDir}"`);
+  }
+
+  const sourceSignature = pilotStems.find((stem) => typeof stem.sourceSignature === 'string' && stem.sourceSignature.trim().length > 0)?.sourceSignature?.trim() ?? '';
+  const modelId = pilotStems.find((stem) => typeof stem.modelId === 'string' && stem.modelId.trim().length > 0)?.modelId?.trim() ?? PILOT_MODEL_ID;
+  const runtimeProfileId = pilotStems.find((stem) => typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0)?.runtimeProfileId?.trim() ?? PILOT_RUNTIME_PROFILE_ID;
+  if (!sourceSignature) {
+    throw new Error(`PILOT_MANIFEST_SOURCE_SIGNATURE_MISSING resultSetId="${resultSetId}"`);
+  }
+
+  const existingResultSets = normalizeResultSetEntries(manifest.resultSets);
+  const mergedResultSets = [
+    ...existingResultSets.filter((entry) => entry.id !== resultSetId),
+    {
+      id: resultSetId,
+      modelId,
+      runtimeProfileId,
+      sourceSignature,
+      createdAt: Date.now(),
+    },
+  ];
+
+  const rawStems = Array.isArray(manifest.stems)
+    ? manifest.stems.filter(isObjectLike)
+    : [];
+  const keptStems = rawStems.filter((entry) =>
+    normalizeParentResultId(typeof entry.parentResultId === 'string' ? entry.parentResultId : undefined) !== resultSetId,
+  );
+  const pilotManifestStems = pilotStems.map((stem) => ({
+    stemType: stem.stemType,
+    relativePath: normalizeManifestRelativePath(project.cacheDir, stem.filePath),
+    codec: stem.codec,
+    sizeBytes: stem.sizeBytes,
+    durationMs: typeof stem.durationMs === 'number' ? stem.durationMs : null,
+    sampleRate: typeof stem.sampleRate === 'number' ? stem.sampleRate : null,
+    sourceOrigin: stem.sourceOrigin === 'manual_import' ? 'manual_import' : 'engine_output',
+    modelId: stem.modelId ?? modelId,
+    runtimeProfileId: stem.runtimeProfileId ?? runtimeProfileId,
+    jobId: stem.jobId,
+    parentResultId: resultSetId,
+    sourceSignature: stem.sourceSignature ?? sourceSignature,
+    sourceKind: stem.sourceKind ?? 'separation',
+  }));
+
+  const patchedManifest: Record<string, unknown> = {
+    ...manifest,
+    activeResultId:
+      (typeof manifest.activeResultId === 'string' && manifest.activeResultId.trim().length > 0)
+        ? manifest.activeResultId
+        : DEFAULT_ACTIVE_RESULT_ID,
+    resultSets: mergedResultSets,
+    stems: [...keptStems, ...pilotManifestStems],
+    updatedAt: Date.now(),
+  };
+  await writeProjectJsonRecord(project.cacheDir, 'manifest.json', patchedManifest);
+
+  const verified = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+  const verifiedSets = normalizeResultSetEntries(verified?.resultSets);
+  if (!verifiedSets.some((entry) => entry.id === resultSetId)) {
+    throw new Error(`PILOT_MANIFEST_RESULT_SET_NOT_PERSISTED resultSetId="${resultSetId}"`);
+  }
+  const verifiedStems = Array.isArray(verified?.stems) ? verified.stems.filter(isObjectLike) : [];
+  const hasPilotStems = verifiedStems.some((entry) =>
+    normalizeParentResultId(typeof entry.parentResultId === 'string' ? entry.parentResultId : undefined) === resultSetId,
+  );
+  if (!hasPilotStems) {
+    throw new Error(`PILOT_MANIFEST_STEMS_NOT_PERSISTED resultSetId="${resultSetId}"`);
+  }
+}
+
+function buildDefaultResultSetEntry(project: Project, stems: Array<{
+  modelId?: string;
+  runtimeProfileId?: string;
+  sourceSignature?: string;
+}>): ProjectManifestResultSetEntry | null {
+  const signature = stems.find((stem) => typeof stem.sourceSignature === 'string' && stem.sourceSignature.trim().length > 0)?.sourceSignature?.trim();
+  if (!signature) return null;
+  const modelId = stems.find((stem) => typeof stem.modelId === 'string' && stem.modelId.trim().length > 0)?.modelId?.trim()
+    ?? DEFAULT_RESULT_MODEL_ID;
+  const runtimeProfileId = stems.find((stem) => typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0)?.runtimeProfileId?.trim()
+    ?? DEFAULT_RESULT_RUNTIME_PROFILE_ID;
+  return {
+    id: DEFAULT_ACTIVE_RESULT_ID,
+    modelId,
+    runtimeProfileId,
+    sourceSignature: signature,
+    createdAt: project.updatedAt > 0 ? project.updatedAt : Date.now(),
+  };
+}
+
+async function resolveActiveResultContext(
+  project: Project,
+  stems: Array<{ modelId?: string; runtimeProfileId?: string; sourceSignature?: string }> = [],
+): Promise<ActiveResultContext> {
+  const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+  const fromManifest = manifest && typeof manifest.activeResultId === 'string'
+    ? manifest.activeResultId.trim()
+    : '';
+  const normalizedSets = normalizeResultSetEntries(manifest?.resultSets);
+  const fallbackSet = buildDefaultResultSetEntry(project, stems);
+  const resultSets = normalizedSets.length > 0
+    ? normalizedSets
+    : (fallbackSet ? [fallbackSet] : []);
+
+  const fallbackActiveId = resultSets[0]?.id ?? DEFAULT_ACTIVE_RESULT_ID;
+  const activeResultId = (fromManifest && resultSets.some((entry) => entry.id === fromManifest))
+    ? fromManifest
+    : fallbackActiveId;
+  const activeSet = resultSets.find((entry) => entry.id === activeResultId) ?? null;
+
+  if ((normalizedSets.length === 0 || !fromManifest || fromManifest !== activeResultId) && resultSets.length > 0) {
+    try {
+      await patchProjectManifestMetadata(project.cacheDir, {
+        activeResultId,
+        resultSets,
+      });
+    } catch (metaErr) {
+      console.warn(
+        `[project:resolveActiveResult] manifest patch failed projectId="${project.id}" cacheDir="${project.cacheDir}" reason="${normalizeErrorMessage(metaErr, 'unknown')}"`,
+      );
+    }
+  }
+
+  return {
+    activeResultId,
+    sourceSignature: activeSet?.sourceSignature ?? null,
+  };
+}
+
+function buildChordAnalysisCacheKey(
+  projectId: string,
+  parentResultId: string,
+  sourceSignature: string,
+  analysisVersion: string,
+): string {
+  return `${projectId}::${parentResultId}::${sourceSignature}::${analysisVersion}`;
+}
+
+function buildWaveformCacheKey(
+  projectId: string,
+  parentResultId: string,
+  sourceSignature: string,
+  analysisVersion: string,
+): string {
+  return `${projectId}::${parentResultId}::${sourceSignature}::${analysisVersion}`;
 }
 
 const WARNING_MOJIBAKE_PATTERN = /[�]|(?:鍜|鍒|鎾|缁|妯|锛|銆|鈥|鈫|浣庣疆|璇婃柇)/;
@@ -375,12 +592,16 @@ function sanitizeChordWarnings(rawWarnings: unknown): string[] {
 async function loadPersistedWaveformResult(
   project: Project,
   expectedAnalysisVersion: string,
+  parentResultId: string,
   sourceSignature: string | null,
 ): Promise<CachedWaveformDTO | null> {
   const refs = await readManifestAnalysisRefs(project.cacheDir);
   const waveformRef = refs?.waveform;
   if (!waveformRef) return null;
   if (waveformRef.version !== expectedAnalysisVersion) return null;
+  if (waveformRef.parentResultId && waveformRef.parentResultId !== parentResultId) return null;
+  if (!waveformRef.parentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
+  if (sourceSignature && waveformRef.sourceSignature && waveformRef.sourceSignature !== sourceSignature) return null;
 
   const raw = await readProjectJsonRecord(project.cacheDir, waveformRef.path);
   if (!raw) return null;
@@ -389,6 +610,9 @@ async function loadPersistedWaveformResult(
   if (sourceSignature && persistedSignature && persistedSignature !== sourceSignature) {
     return null;
   }
+  const persistedParentResultId = typeof raw.parentResultId === 'string' ? raw.parentResultId.trim() : '';
+  if (persistedParentResultId && persistedParentResultId !== parentResultId) return null;
+  if (!persistedParentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
 
   const peaks = Array.isArray(raw.peaks)
     ? raw.peaks.filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
@@ -426,6 +650,7 @@ async function loadPersistedWaveformResult(
 async function persistWaveformResult(
   project: Project,
   waveform: CachedWaveformDTO,
+  parentResultId: string,
   sourceSignature: string | null,
 ): Promise<void> {
   const analysisVersion =
@@ -437,6 +662,7 @@ async function persistWaveformResult(
 
   await writeProjectJsonRecord(project.cacheDir, waveformPath, {
     ...waveform,
+    parentResultId,
     analysisVersion,
     sourceSignature,
     generatedAt: Date.now(),
@@ -445,6 +671,8 @@ async function persistWaveformResult(
     waveform: {
       path: waveformPath,
       version: analysisVersion,
+      parentResultId,
+      sourceSignature: sourceSignature ?? undefined,
     },
   });
 }
@@ -487,12 +715,16 @@ function normalizePersistedChordSegments(raw: unknown): CachedChordSegmentDTO[] 
 async function loadPersistedChordResult(
   project: Project,
   expectedAnalysisVersion: string,
+  parentResultId: string,
   sourceSignature: string | null,
 ): Promise<CachedChordAnalysisDTO | null> {
   const refs = await readManifestAnalysisRefs(project.cacheDir);
   const chordRef = refs?.chordAnalysis;
   if (!chordRef) return null;
   if (chordRef.analysisVersion !== expectedAnalysisVersion) return null;
+  if (chordRef.parentResultId && chordRef.parentResultId !== parentResultId) return null;
+  if (!chordRef.parentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
+  if (sourceSignature && chordRef.sourceSignature && chordRef.sourceSignature !== sourceSignature) return null;
 
   const raw = await readProjectJsonRecord(project.cacheDir, chordRef.path);
   if (!raw) return null;
@@ -501,6 +733,9 @@ async function loadPersistedChordResult(
   if (sourceSignature && persistedSignature && persistedSignature !== sourceSignature) {
     return null;
   }
+  const persistedParentResultId = typeof raw.parentResultId === 'string' ? raw.parentResultId.trim() : '';
+  if (persistedParentResultId && persistedParentResultId !== parentResultId) return null;
+  if (!persistedParentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
 
   const segments = normalizePersistedChordSegments(raw.segments);
   if (!Array.isArray(raw.segments)) return null;
@@ -605,6 +840,7 @@ async function loadPersistedChordResult(
 async function persistChordResult(
   project: Project,
   chordResult: CachedChordAnalysisDTO,
+  parentResultId: string,
   sourceSignature: string | null,
 ): Promise<void> {
   const refs = await readManifestAnalysisRefs(project.cacheDir);
@@ -620,6 +856,7 @@ async function persistChordResult(
 
   await writeProjectJsonRecord(project.cacheDir, chordPath, {
     ...chordResult,
+    parentResultId,
     analysisVersion,
     vocabularyVersion,
     segmentCount: chordResult.segments.length,
@@ -631,6 +868,8 @@ async function persistChordResult(
       path: chordPath,
       analysisVersion,
       vocabularyVersion,
+      parentResultId,
+      sourceSignature: sourceSignature ?? undefined,
     },
   });
 }
@@ -867,6 +1106,12 @@ async function restoreExistingProjectFromDir(
     durationMs: number | null;
     sampleRate: number | null;
     sourceOrigin: 'engine_output' | 'manual_import';
+    modelId?: string;
+    runtimeProfileId?: string;
+    jobId?: string;
+    parentResultId?: string;
+    sourceSignature?: string;
+    sourceKind?: string;
   }> = [];
 
   if (manifestData && Array.isArray(manifestData.stems)) {
@@ -899,6 +1144,12 @@ async function restoreExistingProjectFromDir(
             ? Math.floor(entry.sampleRate)
             : null,
         sourceOrigin: (entry.sourceOrigin === 'manual_import') ? 'manual_import' : 'engine_output',
+        modelId: typeof entry.modelId === 'string' ? entry.modelId : undefined,
+        runtimeProfileId: typeof entry.runtimeProfileId === 'string' ? entry.runtimeProfileId : undefined,
+        jobId: typeof entry.jobId === 'string' ? entry.jobId : undefined,
+        parentResultId: typeof entry.parentResultId === 'string' ? entry.parentResultId : undefined,
+        sourceSignature: typeof entry.sourceSignature === 'string' ? entry.sourceSignature : undefined,
+        sourceKind: typeof entry.sourceKind === 'string' ? entry.sourceKind : undefined,
       });
     }
   }
@@ -921,16 +1172,20 @@ async function restoreExistingProjectFromDir(
         durationMs: null,
         sampleRate: null,
         sourceOrigin: 'engine_output',
+        sourceKind: 'separation',
       });
     }
   }
 
-  // stemType 去重：每种类型只保留一个（优先文件更大者）
-  const dedupByType = new Map<StemType, typeof stemCandidates[number]>();
+  // stem 去重：
+  // - 旧数据（无 resultSet 维度）按 stemType 去重
+  // - 新数据（有 parentResultId）按 parentResultId+stemType 去重，避免 main/pilot 混写
+  const dedupByType = new Map<string, typeof stemCandidates[number]>();
   for (const candidate of stemCandidates) {
-    const existing = dedupByType.get(candidate.stemType);
+    const dedupKey = `${normalizeParentResultId(candidate.parentResultId)}::${candidate.stemType}`;
+    const existing = dedupByType.get(dedupKey);
     if (!existing || candidate.sizeBytes > existing.sizeBytes) {
-      dedupByType.set(candidate.stemType, candidate);
+      dedupByType.set(dedupKey, candidate);
     }
   }
   const stems = Array.from(dedupByType.values());
@@ -1027,6 +1282,12 @@ async function restoreExistingProjectFromDir(
     confidence: null,
     exportable: true,
     status: StemStatus.Detected,
+    modelId: s.modelId,
+    runtimeProfileId: s.runtimeProfileId,
+    jobId: s.jobId,
+    parentResultId: s.parentResultId,
+    sourceSignature: s.sourceSignature,
+    sourceKind: s.sourceKind,
   })));
 
   waveformResultCache.delete(projectId);
@@ -1211,6 +1472,17 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           // 鍒嗙瀹屾垚鍚庢洿鏂?project 鐨?metadata
           const stemFiles = await infraRef.stemFileRepo.findByProjectId(projectId);
           console.log(`[REAL_CHAIN] handlers.project:startSeparation real_path_after_service projectId="${projectId}" jobId="${jobId}" stemFiles=${stemFiles.length} projectStatusAfter="${result.projectStatusAfter}"`);
+          const missingProvenance = stemFiles.some((stem) => (
+            !stem.modelId
+            || !stem.runtimeProfileId
+            || !stem.jobId
+            || !stem.parentResultId
+            || !stem.sourceSignature
+            || !stem.sourceKind
+          ));
+          if (missingProvenance) {
+            throw new Error('SEPARATION_PROVENANCE_INCOMPLETE');
+          }
           const totalSize = stemFiles.reduce((sum, s) => sum + s.sizeBytes, 0);
           const durationMs = stemFiles.reduce((max, s) => {
             const value = typeof s.durationMs === 'number' ? s.durationMs : 0;
@@ -1224,6 +1496,13 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             (typeof result.job.engineVersion === 'string' && result.job.engineVersion.trim().length > 0)
               ? result.job.engineVersion.trim()
               : 'demucs';
+          const defaultResultSet = buildDefaultResultSetEntry(project, stemFiles);
+          if (!defaultResultSet) {
+            throw new Error(
+              `MANIFEST_RESULT_SET_MAIN_MISSING projectId="${projectId}" outputDir="${outputDir}"`,
+            );
+          }
+          const resultSets = [defaultResultSet];
 
           await infraRef.projectRepo.update(projectId, {
             engineVersion: resolvedEngineVersion,
@@ -1232,17 +1511,16 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             separationElapsedMs,
           });
 
-          try {
-            await patchProjectManifestMetadata(outputDir, {
-              displayName: fileName,
-              durationMs: durationMs > 0 ? durationMs : null,
-              separationElapsedMs,
-            });
-          } catch (metaErr) {
-            console.warn(
-              `[project:startSeparation] metadata patch skipped projectId="${projectId}" reason="${normalizeErrorMessage(metaErr, 'unknown')}"`,
-            );
-          }
+          const metadataPatchResult = await patchProjectManifestMetadata(outputDir, {
+            displayName: fileName,
+            durationMs: durationMs > 0 ? durationMs : null,
+            separationElapsedMs,
+            activeResultId: DEFAULT_ACTIVE_RESULT_ID,
+            resultSets,
+          });
+          console.log(
+            `[REAL_CHAIN] handlers.project:startSeparation manifest_patched projectId="${projectId}" manifestPath="${metadataPatchResult.manifestPath}" activeResultId="${DEFAULT_ACTIVE_RESULT_ID}" resultSetCount=${resultSets.length}`,
+          );
 
           if (win && !win.isDestroyed()) {
             win.webContents.send('separation:complete', {
@@ -1284,6 +1562,147 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     return {
       jobId,
       projectId,
+      warnings: [],
+      cacheHit: false,
+    };
+  });
+
+  ipcMain.handle('project:startPilotSeparation', async (event, projectId: string, sourceFilePath?: string) => {
+    if (!workerInfra) {
+      throw new Error('分离服务不可用，请重启应用后重试');
+    }
+    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('缺少项目 ID，无法启动试点分离');
+    }
+
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) {
+      throw new Error('项目不存在，无法启动试点分离');
+    }
+
+    const resolvedSourceFilePath = (() => {
+      if (typeof sourceFilePath === 'string' && sourceFilePath.trim().length > 0) {
+        return sourceFilePath.trim();
+      }
+      if (typeof project.originalFilePath === 'string' && project.originalFilePath.trim().length > 0) {
+        return project.originalFilePath.trim();
+      }
+      return '';
+    })();
+    if (!resolvedSourceFilePath || !fs.existsSync(resolvedSourceFilePath)) {
+      throw new Error('试点分离输入文件不存在，请传入有效音频路径');
+    }
+
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const jobId = `job-${crypto.randomUUID().slice(0, 8)}`;
+    const resultSetId = `pilot_6s_${Date.now()}`;
+
+    const workerStatus = workerInfra.workerManager.getStatus();
+    if (!workerInfra.workerManager.isAcceptingRequests()) {
+      throw new Error(`Worker 不可用，当前状态：${workerStatus.status}`);
+    }
+
+    const unsubProgress = workerInfra.ipcBridge.on(
+      WorkerEventName.StageProgress,
+      (progressEvent) => {
+        if (win && !win.isDestroyed()) {
+          const rawProgress = typeof progressEvent.payload.progress === 'number'
+            ? progressEvent.payload.progress
+            : 0;
+          const normalizedProgress = rawProgress <= 1 ? rawProgress * 100 : rawProgress;
+          win.webContents.send('separation:progress', {
+            jobId,
+            stage: progressEvent.payload.stage,
+            progress: Math.max(0, Math.min(100, normalizedProgress)),
+          });
+        }
+      },
+    );
+
+    (async () => {
+      try {
+        console.log(
+          `[REAL_CHAIN] handlers.project:startPilotSeparation real_path_enter projectId="${projectId}" jobId="${jobId}" resultSetId="${resultSetId}" model="${PILOT_MODEL_ID}" runtimeProfile="${PILOT_RUNTIME_PROFILE_ID}"`,
+        );
+        const result = await workerInfra!.parseJobService.startSeparation({
+          projectId,
+          sourceFilePath: resolvedSourceFilePath,
+          projectDir: project.cacheDir,
+          resultSetId,
+          preserveExistingStems: true,
+          allowReadyStatus: true,
+          runtimeProfileIdOverride: PILOT_RUNTIME_PROFILE_ID,
+          workerModelOverride: PILOT_MODEL_ID,
+        });
+        if (result.projectStatusAfter !== ProjectStatus.Ready) {
+          const explicitError = result.job.errorMessage
+            || result.job.errorCode
+            || `pilot separation failed: projectStatusAfter=${result.projectStatusAfter}`;
+          throw new Error(explicitError);
+        }
+
+        const stemFiles = await workerInfra!.stemFileRepo.findByProjectId(projectId);
+        const pilotStems = filterStemsForResultSet(stemFiles, resultSetId);
+        if (pilotStems.length === 0) {
+          throw new Error(`PILOT_RESULT_EMPTY resultSetId="${resultSetId}"`);
+        }
+        const missingProvenance = pilotStems.some((stem) => (
+          !stem.modelId
+          || !stem.runtimeProfileId
+          || !stem.jobId
+          || !stem.parentResultId
+          || !stem.sourceSignature
+          || !stem.sourceKind
+        ));
+        if (missingProvenance) {
+          throw new Error('PILOT_SEPARATION_PROVENANCE_INCOMPLETE');
+        }
+        const mismatchStem = pilotStems.find((stem) =>
+          stem.modelId !== PILOT_MODEL_ID || stem.runtimeProfileId !== PILOT_RUNTIME_PROFILE_ID,
+        );
+        if (mismatchStem) {
+          throw new Error(
+            `PILOT_PROFILE_MISMATCH expectedModel="${PILOT_MODEL_ID}" expectedRuntimeProfile="${PILOT_RUNTIME_PROFILE_ID}" actualModel="${mismatchStem.modelId ?? 'unknown'}" actualRuntimeProfile="${mismatchStem.runtimeProfileId ?? 'unknown'}"`,
+          );
+        }
+        await ensurePilotManifestPersistence(project, resultSetId, pilotStems);
+        console.log(
+          `[REAL_CHAIN] handlers.project:startPilotSeparation manifest_persisted projectId="${projectId}" resultSetId="${resultSetId}" pilotStemCount=${pilotStems.length}`,
+        );
+
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('separation:complete', {
+            jobId,
+            projectId,
+            success: result.projectStatusAfter === ProjectStatus.Ready,
+            warnings: result.warnings,
+            cacheHit: false,
+          });
+        }
+      } catch (err) {
+        console.error(
+          `[REAL_CHAIN] handlers.project:startPilotSeparation real_path_error projectId="${projectId}" jobId="${jobId}" error="${err instanceof Error ? err.message : String(err)}"`,
+        );
+        if (win && !win.isDestroyed()) {
+          const normalizedError = toSeparationFailureMessage(err);
+          win.webContents.send('separation:complete', {
+            jobId,
+            projectId,
+            success: false,
+            errorMessage: normalizedError,
+            warnings: [normalizedError],
+            cacheHit: false,
+          });
+        }
+      } finally {
+        unsubProgress();
+      }
+    })();
+
+    return {
+      jobId,
+      projectId,
+      resultSetId,
       warnings: [],
       cacheHit: false,
     };
@@ -1368,8 +1787,10 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const project = await workerInfra.projectRepo.findById(projectId);
     if (!project) return null;
 
-    const stems = await workerInfra.stemFileRepo.findByProjectId(projectId);
+    const allStems = await workerInfra.stemFileRepo.findByProjectId(projectId);
     const latestJob = await workerInfra.parseJobRepo.findLatestByProjectId(projectId);
+    const activeResultContext = await resolveActiveResultContext(project, allStems);
+    const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
 
     const isRealSeparation = project.status === ProjectStatus.Ready && stems.length > 0;
     const resolvedEngineVersion =
@@ -1379,11 +1800,17 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const sourceTypeLabel = isRealSeparation
       ? `Demucs (${resolvedEngineVersion}, ${stems.length} stems)`
       : '等待分离';
-    const elapsedMs = (typeof latestJob?.elapsedMs === 'number' && latestJob.elapsedMs >= 0)
-      ? latestJob.elapsedMs
-      : ((typeof project.separationElapsedMs === 'number' && project.separationElapsedMs >= 0)
+    const elapsedMs = activeResultContext.activeResultId === DEFAULT_ACTIVE_RESULT_ID
+      ? ((typeof project.separationElapsedMs === 'number' && project.separationElapsedMs >= 0)
         ? project.separationElapsedMs
-        : 0);
+        : ((typeof latestJob?.elapsedMs === 'number' && latestJob.elapsedMs >= 0)
+          ? latestJob.elapsedMs
+          : 0))
+      : ((typeof latestJob?.elapsedMs === 'number' && latestJob.elapsedMs >= 0)
+        ? latestJob.elapsedMs
+        : ((typeof project.separationElapsedMs === 'number' && project.separationElapsedMs >= 0)
+          ? project.separationElapsedMs
+          : 0));
     console.log(`[REAL_CHAIN] handlers.project:getResult decision projectId="${projectId}" projectStatus="${project.status}" stemCount=${stems.length} elapsedMs=${elapsedMs} isRealSeparation=${isRealSeparation} sourceTypeLabel="${sourceTypeLabel}"`);
 
     return {
@@ -1401,6 +1828,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       cacheHit: false,
       cacheHitBannerText: null,
       sourceTypeLabel,
+      activeResultId: activeResultContext.activeResultId,
     };
   });
 
@@ -1409,13 +1837,16 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     if (!workerInfra) return [];
 
     // 鏌ヨ鐪熷疄 stem 鏂囦欢
-    const stems = await workerInfra.stemFileRepo.findByProjectId(projectId);
-    console.log(`[REAL_CHAIN] handlers.project:getStems repo_result projectId="${projectId}" stemsLength=${stems.length}`);
+    const allStems = await workerInfra.stemFileRepo.findByProjectId(projectId);
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) return [];
+    const activeResultContext = await resolveActiveResultContext(project, allStems);
+    const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
+    console.log(`[REAL_CHAIN] handlers.project:getStems repo_result projectId="${projectId}" activeResultId="${activeResultContext.activeResultId}" stemsLength=${stems.length}`);
 
     if (stems.length > 0) {
       console.log(`[REAL_CHAIN] handlers.project:getStems fallbackHit=false projectId="${projectId}"`);
       // 鏈夌湡瀹?stems 鈥?杩斿洖 StemTrackDTO
-      const project = await workerInfra.projectRepo.findById(projectId);
       return stems.map(sf => ({
         id: sf.id,
         stemType: sf.stemType,
@@ -1430,13 +1861,17 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         lastModifiedAt: project?.createdAt ?? Date.now(),
         presence: 'exists' as const,
         mergedFrom: null,
+        modelId: sf.modelId,
+        runtimeProfileId: sf.runtimeProfileId,
+        jobId: sf.jobId,
+        parentResultId: sf.parentResultId,
+        sourceSignature: sf.sourceSignature,
+        sourceKind: sf.sourceKind,
       }));
     }
 
     // 鏃犵湡瀹?stems 鈥?mock honest fallback
     console.log(`[REAL_CHAIN] handlers.project:getStems fallbackHit=true projectId="${projectId}"`);
-    const project = await workerInfra.projectRepo.findById(projectId);
-    if (!project) return [];
     return getMockHonestStems(project);
   });
 
@@ -1509,19 +1944,24 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const project = await workerInfra.projectRepo.findById(projectId);
     if (!project) return null;
 
-    // Prefer original mixed source; fallback to first valid analysis source to keep waveform renderable.
-    const sourceFilePath = await resolveAnalysisSourceFilePath(project, workerInfra);
+    const allStems = await workerInfra.stemFileRepo.findByProjectId(projectId);
+    const activeResultContext = await resolveActiveResultContext(project, allStems);
+    const activeStems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
+    // Prefer original mixed source; fallback to first valid analysis source for the active result set.
+    const sourceFilePath = await resolveAnalysisSourceFilePath(project, workerInfra, activeStems);
     if (!sourceFilePath) {
       console.log(`[REAL_CHAIN] handlers.project:getWaveform miss projectId="${projectId}" reason="no_source_file"`);
       return null;
     }
 
     const expectedAnalysisVersion = getWaveformAnalysisVersionHint();
-    const sourceSignature = await getFileSourceSignature(sourceFilePath);
+    const sourceSignature = activeResultContext.sourceSignature ?? await getFileSourceSignature(sourceFilePath);
+    const parentResultId = activeResultContext.activeResultId;
     const cached = waveformResultCache.get(projectId);
     if (cached && sourceSignature) {
       const cacheHit =
-        cached.sourceSignature === sourceSignature
+        cached.parentResultId === parentResultId
+        && cached.sourceSignature === sourceSignature
         && cached.analysisVersion === expectedAnalysisVersion;
       if (cacheHit) {
         console.log(`[REAL_CHAIN] handlers.project:getWaveform cache_hit projectId="${projectId}" analysisVersion="${cached.analysisVersion}"`);
@@ -1542,12 +1982,14 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const persistedWaveform = await loadPersistedWaveformResult(
       project,
       expectedAnalysisVersion,
+      parentResultId,
       sourceSignature,
     );
     if (persistedWaveform) {
       if (sourceSignature) {
         waveformResultCache.set(projectId, {
-          cacheKey: buildWaveformCacheKey(projectId, sourceSignature, expectedAnalysisVersion),
+          cacheKey: buildWaveformCacheKey(projectId, parentResultId, sourceSignature, expectedAnalysisVersion),
+          parentResultId,
           sourceFilePath,
           sourceSignature,
           analysisVersion: expectedAnalysisVersion,
@@ -1564,7 +2006,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
     if (!ensureWorkerAcceptingRequests(workerInfra)) {
       console.log(`[REAL_CHAIN] handlers.project:getWaveform miss projectId="${projectId}" reason="worker_not_ready"`);
-      if (cached) {
+      if (cached && cached.parentResultId === parentResultId) {
         console.log(`[REAL_CHAIN] handlers.project:getWaveform return_stale_cache projectId="${projectId}"`);
         return cached.result;
       }
@@ -1616,15 +2058,18 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         await workerInfra.projectRepo.update(projectId, { durationMs: waveform.durationMs });
         try {
           await patchProjectManifestMetadata(project.cacheDir, { durationMs: waveform.durationMs });
-        } catch {
-          // metadata write failure should not break waveform query
+        } catch (metaErr) {
+          console.warn(
+            `[project:getWaveform] metadata patch failed projectId="${projectId}" cacheDir="${project.cacheDir}" reason="${normalizeErrorMessage(metaErr, 'unknown')}"`,
+          );
         }
       }
 
       const resolvedAnalysisVersion = waveform.analysisVersion ?? expectedAnalysisVersion;
       if (sourceSignature) {
         waveformResultCache.set(projectId, {
-          cacheKey: buildWaveformCacheKey(projectId, sourceSignature, resolvedAnalysisVersion),
+          cacheKey: buildWaveformCacheKey(projectId, parentResultId, sourceSignature, resolvedAnalysisVersion),
+          parentResultId,
           sourceFilePath,
           sourceSignature,
           analysisVersion: resolvedAnalysisVersion,
@@ -1633,7 +2078,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         });
       }
       try {
-        await persistWaveformResult(project, waveform, sourceSignature);
+        await persistWaveformResult(project, waveform, parentResultId, sourceSignature);
       } catch {
         // analysis cache write failure should not break waveform query
       }
@@ -1644,7 +2089,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       return waveform;
     } catch (err) {
       console.warn(`[Analysis] getWaveform unavailable. projectId=${projectId}, reason=${normalizeErrorMessage(err, 'unknown')}`);
-      if (cached) {
+      if (cached && cached.parentResultId === parentResultId) {
         console.log(`[REAL_CHAIN] handlers.project:getWaveform return_stale_cache_on_error projectId="${projectId}"`);
         return cached.result;
       }
@@ -1658,7 +2103,10 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const project = await workerInfra.projectRepo.findById(projectId);
     if (!project) return null;
 
-    const sourceFilePath = await resolveAnalysisSourceFilePath(project, workerInfra);
+    const allStems = await workerInfra.stemFileRepo.findByProjectId(projectId);
+    const activeResultContext = await resolveActiveResultContext(project, allStems);
+    const activeStems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
+    const sourceFilePath = await resolveAnalysisSourceFilePath(project, workerInfra, activeStems);
     if (!sourceFilePath) {
       console.log(
         `[REAL_CHAIN] handlers.project:getChordAnalysis miss projectId="${projectId}" ` +
@@ -1672,7 +2120,8 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       ? 'original'
       : 'stem';
 
-    const sourceSignature = await getFileSourceSignature(sourceFilePath);
+    const sourceSignature = activeResultContext.sourceSignature ?? await getFileSourceSignature(sourceFilePath);
+    const parentResultId = activeResultContext.activeResultId;
     console.log(
       `[REAL_CHAIN] handlers.project:getChordAnalysis source_resolved projectId="${projectId}" ` +
       `source_kind="${sourceKind}" source_signature_available=${sourceSignature != null}`,
@@ -1682,7 +2131,8 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const cached = chordAnalysisResultCache.get(projectId);
     if (cached && sourceSignature) {
       const cacheHit =
-        cached.sourceSignature === sourceSignature
+        cached.parentResultId === parentResultId
+        && cached.sourceSignature === sourceSignature
         && cached.analysisVersion === expectedAnalysisVersion;
       if (cacheHit) {
         const cachedResult = cached.result;
@@ -1708,12 +2158,14 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const persistedChord = await loadPersistedChordResult(
       project,
       expectedAnalysisVersion,
+      parentResultId,
       sourceSignature,
     );
     if (persistedChord) {
       if (sourceSignature) {
         chordAnalysisResultCache.set(projectId, {
-          cacheKey: buildChordAnalysisCacheKey(projectId, sourceSignature, expectedAnalysisVersion),
+          cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, expectedAnalysisVersion),
+          parentResultId,
           sourceFilePath,
           sourceSignature,
           analysisVersion: expectedAnalysisVersion,
@@ -1733,7 +2185,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         `[REAL_CHAIN] handlers.project:getChordAnalysis miss projectId="${projectId}" ` +
         'reason="worker_not_ready"',
       );
-      if (cached) {
+      if (cached && cached.parentResultId === parentResultId) {
         console.log(
           `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache projectId="${projectId}"`,
         );
@@ -1915,15 +2367,18 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         await workerInfra.projectRepo.update(projectId, { durationMs: chordResult.audioDurationMs });
         try {
           await patchProjectManifestMetadata(project.cacheDir, { durationMs: chordResult.audioDurationMs });
-        } catch {
-          // metadata write failure should not break chord query
+        } catch (metaErr) {
+          console.warn(
+            `[project:getChordAnalysis] metadata patch failed projectId="${projectId}" cacheDir="${project.cacheDir}" reason="${normalizeErrorMessage(metaErr, 'unknown')}"`,
+          );
         }
       }
 
       const resolvedAnalysisVersion = chordResult.analysisVersion ?? expectedAnalysisVersion;
       if (sourceSignature) {
         chordAnalysisResultCache.set(projectId, {
-          cacheKey: buildChordAnalysisCacheKey(projectId, sourceSignature, resolvedAnalysisVersion),
+          cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, resolvedAnalysisVersion),
+          parentResultId,
           sourceFilePath,
           sourceSignature,
           analysisVersion: resolvedAnalysisVersion,
@@ -1932,7 +2387,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         });
       }
       try {
-        await persistChordResult(project, chordResult, sourceSignature);
+        await persistChordResult(project, chordResult, parentResultId, sourceSignature);
       } catch {
         // analysis cache write failure should not break chord query
       }
@@ -1948,7 +2403,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       console.warn(
         `[Analysis] getChordAnalysis unavailable. projectId=${projectId}, reason=${warning}`,
       );
-      if (cached) {
+      if (cached && cached.parentResultId === parentResultId) {
         console.log(
           `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache_on_error projectId="${projectId}"`,
         );
