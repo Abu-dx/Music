@@ -285,6 +285,14 @@ export interface ProjectResultSummaryDTO extends ProjectSummaryDTO {
   /** 来源类型显示名（由 main 提供，如 "自动分离"/"手动导入"/"缓存命中"） */
   sourceTypeLabel: string;
   activeResultId?: string;
+  sourceFilePath?: string | null;
+  resultSets?: Array<{
+    id: string;
+    modelId: string;
+    runtimeProfileId: string;
+    sourceSignature: string;
+    createdAt: number;
+  }>;
 }
 
 // ============================================================================

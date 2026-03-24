@@ -12,7 +12,7 @@
  * - DI 实例化 → composition/root.ts
  */
 
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useSyncExternalStore } from 'react';
 import { createCompositionRoot } from './composition/root';
 
 // Pages
@@ -41,8 +41,13 @@ interface RouteState {
 export const App: React.FC = () => {
   // composition root 保证单例（模块级缓存）
   const deps = useMemo(() => createCompositionRoot(), []);
+  const jobSnap = useSyncExternalStore(
+    (cb) => deps.jobStore.subscribe(cb),
+    () => deps.jobStore.getSnapshot(),
+  );
 
   const [route, setRoute] = useState<RouteState>({ page: 'home', projectId: null });
+  const [pendingCancelRefreshJobId, setPendingCancelRefreshJobId] = useState<string | null>(null);
 
   // ── 导航回调 ──
   const goHome = useCallback(() => setRoute({ page: 'home', projectId: null }), []);
@@ -58,10 +63,43 @@ export const App: React.FC = () => {
   const goProject = useCallback((projectId: string) =>
     setRoute({ page: 'result', projectId }), []);
 
-  const handleCancel = useCallback((jobId?: string) => {
-    deps.projectStore.cancelSeparation(jobId);
-    goHome();
-  }, [deps.projectStore, goHome]);
+  const handleCancel = useCallback(async (jobId?: string) => {
+    const targetJobId = jobId ?? deps.jobStore.getSnapshot().currentJobId;
+    if (targetJobId) {
+      setPendingCancelRefreshJobId(targetJobId);
+    }
+    try {
+      await deps.projectStore.cancelSeparation(jobId);
+    } finally {
+      goHome();
+    }
+  }, [deps.projectStore, deps.jobStore, goHome]);
+
+  useEffect(() => {
+    if (!pendingCancelRefreshJobId) return;
+    if (jobSnap.currentJobId !== pendingCancelRefreshJobId) return;
+    if (!jobSnap.isComplete) return;
+
+    const isCancelled = (jobSnap.errorMessage ?? '').includes('取消')
+      || jobSnap.warnings.some((w) => typeof w === 'string' && w.includes('取消'));
+    if (!isCancelled) {
+      setPendingCancelRefreshJobId(null);
+      return;
+    }
+
+    deps.projectStore.loadRecentProjects(20)
+      .catch(() => undefined)
+      .finally(() => {
+        setPendingCancelRefreshJobId(null);
+      });
+  }, [
+    deps.projectStore,
+    jobSnap.currentJobId,
+    jobSnap.errorMessage,
+    jobSnap.isComplete,
+    jobSnap.warnings,
+    pendingCancelRefreshJobId,
+  ]);
 
   // ── 页面渲染 ──
   switch (route.page) {
@@ -100,7 +138,7 @@ export const App: React.FC = () => {
           onNavigateToHome={goHome}
           onNavigateToUpload={goUpload}
           onNavigateToResult={goResult}
-          onCancel={handleCancel}
+          onCancelSeparation={handleCancel}
         />
       );
 

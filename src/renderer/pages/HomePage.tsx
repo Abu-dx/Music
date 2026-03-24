@@ -148,7 +148,18 @@ export const HomePage: React.FC<HomePageProps> = ({
               <div style={styles.cardLeft}>
                 <div style={styles.projectName}>{project.displayName}</div>
                 <div style={styles.projectMeta}>
-                  {project.stemCount > 0 && `${project.stemCount} 轨 · `}
+                  {(() => {
+                    const activeResultId = typeof project.activeResultId === 'string' && project.activeResultId.trim().length > 0
+                      ? project.activeResultId.trim()
+                      : null;
+                    const activeStemCount = typeof project.activeStemCount === 'number' && Number.isFinite(project.activeStemCount)
+                      ? Math.max(0, Math.floor(project.activeStemCount))
+                      : null;
+                    if (activeResultId && activeStemCount != null) {
+                      return `总轨道 ${project.stemCount} · 当前(${activeResultId}) ${activeStemCount} · `;
+                    }
+                    return project.stemCount > 0 ? `${project.stemCount} 轨 · ` : '';
+                  })()}
                   {formatSize(project.totalSizeBytes)}
                   {' · '}
                   {formatTime(project.updatedAt)}

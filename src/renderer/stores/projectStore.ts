@@ -29,16 +29,22 @@ import {
   ChordAnalysisResultDTO,
 } from '../../shared/contracts';
 
+export type RecentProjectSummaryDTO = ProjectSummaryDTO & {
+  activeResultId?: string;
+  activeStemCount?: number;
+};
+
 // ============================================================================
 // 1. IPC 接口（projectStore 需要的子集�?
 // ============================================================================
 
 export interface IProjectElectronAPI {
   /** 获取最近项目列�?*/
-  getRecentProjects(limit: number): Promise<ProjectSummaryDTO[]>;
+  getRecentProjects(limit: number): Promise<RecentProjectSummaryDTO[]>;
 
   /** 通过文件路径创建项目并启动分�?*/
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
+  startPilotSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
 
   /** 取消分离任务 */
   cancelSeparation(jobId?: string): Promise<void>;
@@ -47,6 +53,7 @@ export interface IProjectElectronAPI {
   getProject(projectId: string): Promise<ProjectSummaryDTO | null>;
   renameProject(projectId: string, displayName: string): Promise<{ projectId: string; displayName: string } | null>;
   markProjectAccessed(projectId: string): Promise<{ projectId: string; lastAccessedAt: number } | null>;
+  setActiveResult(projectId: string, resultSetId: string): Promise<{ projectId: string; activeResultId: string } | null>;
 
   /** 获取缓存占用摘要（GPT R7 Suggested #2�?*/
   getCacheStats?(): Promise<{ totalSizeBytes: number; projectCount: number } | null>;
@@ -93,7 +100,7 @@ export interface IProjectElectronAPI {
 
 export interface ProjectStoreSnapshot {
   currentProject: ProjectSummaryDTO | null;
-  recentProjects: ProjectSummaryDTO[];
+  recentProjects: RecentProjectSummaryDTO[];
   isLoading: boolean;
   /** 缓存占用摘要（GPT R7 Suggested #2�?*/
   cacheStats: { totalSizeBytes: number; projectCount: number } | null;
@@ -111,10 +118,12 @@ export interface IProjectStore {
   getSnapshot(): ProjectStoreSnapshot;
   loadRecentProjects(limit?: number): Promise<void>;
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
+  startPilotSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
   cancelSeparation(jobId?: string): Promise<void>;
   loadProject(projectId: string): Promise<void>;
   renameProject(projectId: string, displayName: string): Promise<void>;
   markProjectAccessed(projectId: string): Promise<void>;
+  setActiveResult(projectId: string, resultSetId: string): Promise<void>;
   loadCacheStats(): Promise<void>;
   /** 加载结果摘要 + 分轨列表（GPT R8 Must Fix #1�?*/
   loadProjectResult(projectId: string): Promise<void>;
@@ -133,7 +142,7 @@ export interface IProjectStore {
 
 export class ProjectStore implements IProjectStore {
   private currentProject: ProjectSummaryDTO | null = null;
-  private recentProjects: ProjectSummaryDTO[] = [];
+  private recentProjects: RecentProjectSummaryDTO[] = [];
   private isLoading = false;
   private cacheStats: { totalSizeBytes: number; projectCount: number } | null = null;
   private projectResult: ProjectResultSummaryDTO | null = null;
@@ -199,6 +208,11 @@ export class ProjectStore implements IProjectStore {
     }
   }
 
+  async startPilotSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO> {
+    const result = await this.api.startPilotSeparation(projectId, sourceFilePath);
+    return result;
+  }
+
   async renameProject(projectId: string, displayName: string): Promise<void> {
     await this.api.renameProject(projectId, displayName);
     await Promise.all([
@@ -209,6 +223,10 @@ export class ProjectStore implements IProjectStore {
 
   async markProjectAccessed(projectId: string): Promise<void> {
     await this.api.markProjectAccessed(projectId);
+  }
+
+  async setActiveResult(projectId: string, resultSetId: string): Promise<void> {
+    await this.api.setActiveResult(projectId, resultSetId);
   }
 
   async loadCacheStats(): Promise<void> {

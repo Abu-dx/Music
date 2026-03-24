@@ -104,6 +104,7 @@ export interface StartSeparationParams {
   projectId: string;
   sourceFilePath: string;
   projectDir: string;
+  workerOutputDirOverride?: string;
   engineVersion?: string;
   resultSetId?: string;
   preserveExistingStems?: boolean;
@@ -168,6 +169,7 @@ export interface IParseJobService {
 export class ParseJobService implements IParseJobService {
   private currentJobId: string | null = null;
   private progressUnsubscribe: (() => void) | null = null;
+  private readonly cancelRequestedJobIds = new Set<string>();
 
   constructor(
     private readonly parseJobRepo: IParseJobRepository,
@@ -186,7 +188,10 @@ export class ParseJobService implements IParseJobService {
   ) {}
 
   async startSeparation(params: StartSeparationParams): Promise<SeparationStartResult> {
-    console.log(`[REAL_CHAIN] parseJobService.startSeparation entry projectId="${params.projectId}" sourceFilePath="${params.sourceFilePath}" projectDir="${params.projectDir}"`);
+    const currentJobIdBefore = this.currentJobId;
+    console.log(
+      `[REAL_CHAIN] parseJobService.startSeparation entry projectId="${params.projectId}" sourceFilePath="${params.sourceFilePath}" projectDir="${params.projectDir}" currentJobIdBefore="${currentJobIdBefore ?? 'none'}"`,
+    );
     // 1. 串行约束
     if (this.currentJobId) {
       throw new AppError({
@@ -232,6 +237,13 @@ export class ParseJobService implements IParseJobService {
 
     await this.parseJobRepo.create(job);
     this.currentJobId = jobId;
+    this.cancelRequestedJobIds.delete(jobId);
+    this.logger.info('startSeparation createdParseJobId', {
+      createdParseJobId: jobId,
+      currentJobIdBefore: currentJobIdBefore ?? null,
+      projectId: params.projectId,
+      stage: 'parseJobService.startSeparation',
+    });
 
     this.logger.info('Separation job created', {
       jobId,
@@ -261,8 +273,9 @@ export class ParseJobService implements IParseJobService {
     );
 
     // 7. 发送分离命令
+    const resultSetId = this.normalizeResultSetId(params.resultSetId);
+    const workerOutputDir = this.resolveWorkerOutputDir(params.projectDir, params.workerOutputDirOverride, resultSetId, jobId);
     try {
-      const resultSetId = this.normalizeResultSetId(params.resultSetId);
       const isPilotResultSet = resultSetId.startsWith(PILOT_RESULT_SET_PREFIX);
       const effectiveWorkerModelOverride = (params.workerModelOverride?.trim().length ?? 0) > 0
         ? params.workerModelOverride!.trim()
@@ -270,9 +283,10 @@ export class ParseJobService implements IParseJobService {
       const effectiveRuntimeProfileOverride = (params.runtimeProfileIdOverride?.trim().length ?? 0) > 0
         ? params.runtimeProfileIdOverride!.trim()
         : (isPilotResultSet ? PILOT_RUNTIME_PROFILE_ID : '');
+      await fs.promises.mkdir(workerOutputDir, { recursive: true });
       const separationPayload = {
         filePath: params.sourceFilePath,
-        outputDir: params.projectDir,
+        outputDir: workerOutputDir,
         ...(effectiveWorkerModelOverride
           ? { modelName: effectiveWorkerModelOverride }
           : {}),
@@ -299,6 +313,18 @@ export class ParseJobService implements IParseJobService {
       if (!response.success) {
         const errCode = response.error?.code as string ?? 'UNKNOWN_WORKER_ERROR';
         const errMsg = response.error?.message as string ?? 'Worker returned error without details';
+        if (errCode === ErrorCode.TASK_CANCELLED) {
+          await this.finalizeCancelledJob(jobId, params.projectId, startMs);
+          const cancelledJob = await this.parseJobRepo.findById(jobId);
+          return {
+            job: cancelledJob ?? {
+              ...job,
+              status: JobStatus.Cancelled,
+            },
+            projectStatusAfter: ProjectStatus.Cancelled,
+            warnings: [],
+          };
+        }
         await this.failJob(jobId, params.projectId, startMs,
           errCode, errMsg, this.classifyFailure(errCode),
         );
@@ -318,6 +344,7 @@ export class ParseJobService implements IParseJobService {
         response,
       );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation schema_validated jobId="${jobId}" projectId="${params.projectId}" valid=${validated.valid}`);
+      await this.throwIfCancelRequested(jobId, params.projectId, 'after_worker_response');
 
       if (!validated.valid) {
         await this.failJob(jobId, params.projectId, startMs,
@@ -349,7 +376,16 @@ export class ParseJobService implements IParseJobService {
         params.projectDir,
         provenanceContext,
       );
+      await this.throwIfCancelRequested(jobId, params.projectId, 'before_materialize');
+      await this.materializeSeparatedStemFiles(
+        validated.data!,
+        workerOutputDir,
+        adapted.stemFiles,
+        jobId,
+        params.projectId,
+      );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation adapted jobId="${jobId}" projectId="${params.projectId}" stemFilesLength=${adapted.stemFiles.length}`);
+      await this.throwIfCancelRequested(jobId, params.projectId, 'before_handle_success');
       await this.handleSeparationSuccess(jobId, params, adapted, startMs, {
         parentResultId,
         preserveExistingStems: !!params.preserveExistingStems,
@@ -366,10 +402,31 @@ export class ParseJobService implements IParseJobService {
 
       if (err instanceof AppError) {
         const currentJob = await this.parseJobRepo.findById(jobId);
-        if (currentJob && (currentJob.status === JobStatus.Failed || currentJob.status === JobStatus.Success)) {
+        if (currentJob && (
+          currentJob.status === JobStatus.Failed
+          || currentJob.status === JobStatus.Success
+          || currentJob.status === JobStatus.Cancelled
+        )) {
+          if (this.currentJobId === jobId) {
+            this.currentJobId = null;
+          }
           return {
             job: currentJob,
-            projectStatusAfter: currentJob.status === JobStatus.Success ? ProjectStatus.Ready : ProjectStatus.Failed,
+            projectStatusAfter: currentJob.status === JobStatus.Success
+              ? ProjectStatus.Ready
+              : (currentJob.status === JobStatus.Cancelled ? ProjectStatus.Cancelled : ProjectStatus.Failed),
+            warnings: [],
+          };
+        }
+        if (err.code === ErrorCode.TASK_CANCELLED) {
+          await this.finalizeCancelledJob(jobId, params.projectId, startMs);
+          const cancelledJob = await this.parseJobRepo.findById(jobId);
+          return {
+            job: cancelledJob ?? {
+              ...job,
+              status: JobStatus.Cancelled,
+            },
+            projectStatusAfter: ProjectStatus.Cancelled,
             warnings: [],
           };
         }
@@ -402,17 +459,38 @@ export class ParseJobService implements IParseJobService {
         projectStatusAfter: ProjectStatus.Failed,
         warnings: [],
       };
+    } finally {
+      await this.cleanupWorkerOutputDir(workerOutputDir, params.projectDir);
+      this.cancelRequestedJobIds.delete(jobId);
     }
   }
 
   async cancelSeparation(jobId?: string): Promise<void> {
     // GPT R6 Must Fix #5：接受可选 jobId
-    const targetJobId = jobId ?? this.currentJobId;
+    let targetJobId = jobId ?? this.currentJobId;
     if (!targetJobId) {
       return; // 幂等
     }
 
     // 首版串行约束：只允许取消当前任务
+    if (targetJobId !== this.currentJobId) {
+      this.logger.warn('cancel_request_rejected job_mismatch', {
+        targetJobId,
+        currentJobId: this.currentJobId,
+        stage: 'parseJobService.cancelSeparation',
+      });
+      if (this.currentJobId) {
+        targetJobId = this.currentJobId;
+      } else {
+        return;
+      }
+    }
+
+    this.logger.info('cancel_request_accepted', {
+      currentJobId: this.currentJobId,
+      stage: 'parseJobService.cancelSeparation',
+    });
+
     if (targetJobId !== this.currentJobId) {
       this.logger.warn('Cannot cancel non-current job in serial mode', {
         targetJobId,
@@ -426,11 +504,21 @@ export class ParseJobService implements IParseJobService {
       jobId: targetJobId,
       stage: 'parseJobService.cancelSeparation',
     });
+    this.cancelRequestedJobIds.add(targetJobId);
+    this.logger.info('Separation job marked cancel_requested', {
+      jobId: targetJobId,
+      stage: 'parseJobService.cancelSeparation',
+    });
 
     const job = await this.parseJobRepo.findById(targetJobId);
-    if (job && job.status === JobStatus.Running) {
-      assertJobTransition(targetJobId, JobStatus.Running, JobStatus.Cancelled);
-      await this.parseJobRepo.updateStatus(targetJobId, JobStatus.Cancelled);
+    if (job && (job.status === JobStatus.Running || job.status === JobStatus.Pending)) {
+      assertJobTransition(targetJobId, job.status, JobStatus.Cancelled);
+      await this.parseJobRepo.updateStatus(
+        targetJobId,
+        JobStatus.Cancelled,
+        ErrorCode.TASK_CANCELLED,
+        'Cancelled by user',
+      );
 
       const elapsed = job.startedAt ? Date.now() - job.startedAt : 0;
       await this.parseJobRepo.complete(targetJobId, JobStatus.Cancelled, elapsed);
@@ -442,7 +530,6 @@ export class ParseJobService implements IParseJobService {
     this.sendCancelBestEffort(job?.projectId ?? '');
 
     this.cleanupProgressListener();
-    this.currentJobId = null;
   }
 
   isRunning(): boolean {
@@ -582,6 +669,7 @@ export class ParseJobService implements IParseJobService {
       preserveExistingStems: boolean;
     },
   ): Promise<void> {
+    await this.throwIfCancelRequested(jobId, params.projectId, 'handle_success_entry');
     const elapsedMs = Date.now() - startMs;
     const parentResultId = this.normalizeResultSetId(options.parentResultId);
     const projectFingerprint = await this.resolveProjectFingerprintForManifest(params.projectId, params.sourceFilePath);
@@ -703,6 +791,7 @@ export class ParseJobService implements IParseJobService {
     await this.manifestManager.write(params.projectDir, manifest);
 
     // 3. 完成 Job
+    await this.throwIfCancelRequested(jobId, params.projectId, 'before_mark_success');
     assertJobTransition(jobId, JobStatus.Running, JobStatus.Success);
     await this.parseJobRepo.complete(jobId, JobStatus.Success, elapsedMs);
 
@@ -781,6 +870,120 @@ export class ParseJobService implements IParseJobService {
     } catch {
       return null;
     }
+  }
+
+  private resolveWorkerOutputDir(
+    projectDir: string,
+    overrideDir: string | undefined,
+    resultSetId: string,
+    jobId: string,
+  ): string {
+    const normalizedOverride = typeof overrideDir === 'string' ? overrideDir.trim() : '';
+    if (normalizedOverride.length > 0) {
+      return path.resolve(normalizedOverride);
+    }
+    const safeResultSet = this.normalizeResultSetId(resultSetId).replace(/[^a-zA-Z0-9._-]/g, '_');
+    return path.join(projectDir, '.tmp-separation', `${safeResultSet}_${jobId}`);
+  }
+
+  private async materializeSeparatedStemFiles(
+    raw: RawSeparationResult,
+    workerOutputDir: string,
+    stemFiles: import('../../domain/entities').StemFile[],
+    jobId: string,
+    projectId: string,
+  ): Promise<void> {
+    const workerStemsDir = path.join(workerOutputDir, 'stems');
+    const targetByFileName = new Map<string, string>();
+    for (const stem of stemFiles) {
+      targetByFileName.set(path.basename(stem.filePath), stem.filePath);
+    }
+
+    for (const rawStem of raw.stems) {
+      await this.throwIfCancelRequested(jobId, projectId, 'materialize_before_file');
+      const sourcePath = path.join(workerStemsDir, rawStem.filename);
+      const targetPath = targetByFileName.get(rawStem.filename);
+      if (!targetPath) continue;
+
+      try {
+        await fs.promises.access(sourcePath, fs.constants.R_OK);
+      } catch {
+        throw new AppError({
+          code: ErrorCode.DISK_WRITE_FAILED,
+          message: `Separated stem file missing before materialization: ${sourcePath}`,
+          userMessage: '分离输出文件缺失，无法完成结果写入',
+          context: {
+            stage: 'parseJobService.materializeSeparatedStemFiles',
+            projectId,
+            jobId,
+            sourcePath,
+            targetPath,
+          },
+          retryable: false,
+        });
+      }
+
+      await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+      if (path.resolve(sourcePath) === path.resolve(targetPath)) {
+        continue;
+      }
+
+      await fs.promises.copyFile(sourcePath, targetPath);
+      await fs.promises.unlink(sourcePath).catch(() => undefined);
+    }
+  }
+
+  private async isCancelRequested(jobId: string): Promise<boolean> {
+    if (this.cancelRequestedJobIds.has(jobId)) return true;
+    const job = await this.parseJobRepo.findById(jobId);
+    return job?.status === JobStatus.Cancelled;
+  }
+
+  private async throwIfCancelRequested(jobId: string, projectId: string, stage: string): Promise<void> {
+    if (!(await this.isCancelRequested(jobId))) return;
+    this.logger.info('Separation success chain short-circuited by cancel request', {
+      jobId,
+      projectId,
+      stage,
+    });
+    throw new AppError({
+      code: ErrorCode.TASK_CANCELLED,
+      message: `Separation cancelled: ${stage}`,
+      userMessage: '已取消分离任务',
+      context: {
+        jobId,
+        projectId,
+        stage,
+      },
+      retryable: false,
+    });
+  }
+
+  private async finalizeCancelledJob(jobId: string, projectId: string, startMs: number): Promise<void> {
+    const job = await this.parseJobRepo.findById(jobId);
+    if (job && job.status !== JobStatus.Cancelled) {
+      await this.parseJobRepo.updateStatus(
+        jobId,
+        JobStatus.Cancelled,
+        ErrorCode.TASK_CANCELLED,
+        'Cancelled by user',
+      );
+      await this.parseJobRepo.complete(jobId, JobStatus.Cancelled, Math.max(0, Date.now() - startMs));
+    } else if (job && job.finishedAt === null) {
+      await this.parseJobRepo.complete(jobId, JobStatus.Cancelled, Math.max(0, Date.now() - startMs));
+    }
+    await this.projectRepo.updateStatus(projectId, ProjectStatus.Cancelled).catch(() => undefined);
+    this.currentJobId = null;
+  }
+
+  private async cleanupWorkerOutputDir(workerOutputDir: string, projectDir: string): Promise<void> {
+    const normalizedWorkerDir = path.resolve(workerOutputDir);
+    const normalizedProjectDir = path.resolve(projectDir);
+    if (normalizedWorkerDir === normalizedProjectDir) return;
+
+    const tempRoot = path.resolve(projectDir, '.tmp-separation');
+    if (!normalizedWorkerDir.startsWith(tempRoot)) return;
+    await fs.promises.rm(normalizedWorkerDir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   /**

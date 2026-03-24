@@ -160,6 +160,53 @@ const DEFAULT_RESULT_RUNTIME_PROFILE_ID = 'demucs_env_override';
 const PILOT_MODEL_ID = 'htdemucs_6s';
 const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
 
+function buildProjectScopedCachePrefix(projectId: string): string {
+  return `${projectId}::`;
+}
+
+function clearProjectScopedCacheEntries<T>(cache: Map<string, T>, projectId: string): void {
+  const prefix = buildProjectScopedCachePrefix(projectId);
+  const keysToDelete: string[] = [];
+  for (const key of cache.keys()) {
+    if (key.startsWith(prefix)) {
+      keysToDelete.push(key);
+    }
+  }
+  for (const key of keysToDelete) {
+    cache.delete(key);
+  }
+}
+
+function getWaveformCacheEntry(
+  projectId: string,
+  parentResultId: string,
+  sourceSignature: string | null,
+  analysisVersion: string,
+): CachedWaveformEntry | null {
+  if (!sourceSignature) return null;
+  const cacheKey = buildWaveformCacheKey(projectId, parentResultId, sourceSignature, analysisVersion);
+  return waveformResultCache.get(cacheKey) ?? null;
+}
+
+function setWaveformCacheEntry(entry: CachedWaveformEntry): void {
+  waveformResultCache.set(entry.cacheKey, entry);
+}
+
+function getChordCacheEntry(
+  projectId: string,
+  parentResultId: string,
+  sourceSignature: string | null,
+  analysisVersion: string,
+): CachedChordAnalysisEntry | null {
+  if (!sourceSignature) return null;
+  const cacheKey = buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, analysisVersion);
+  return chordAnalysisResultCache.get(cacheKey) ?? null;
+}
+
+function setChordCacheEntry(entry: CachedChordAnalysisEntry): void {
+  chordAnalysisResultCache.set(entry.cacheKey, entry);
+}
+
 type ActiveResultContext = {
   activeResultId: string;
   sourceSignature: string | null;
@@ -295,6 +342,9 @@ function normalizeErrorMessage(err: unknown, fallback: string): string {
 
 function toSeparationFailureMessage(err: unknown): string {
   const raw = normalizeErrorMessage(err, '分离失败，请稍后重试');
+  if (raw.includes('TASK_CANCELLED') || raw.includes('cancelled') || raw.includes('已取消')) {
+    return '分离已取消';
+  }
   if (raw.includes('manifest') || raw.includes('MANIFEST')) {
     return '分离结果已生成，但项目元数据写入失败，请查看日志并重试';
   }
@@ -322,6 +372,90 @@ function toAnalysisFailureMessage(err: unknown, fallback: string): string {
     return '分析 Worker 不可用，未返回分析结果';
   }
   return raw;
+}
+
+function isSeparationCancelledError(err: unknown): boolean {
+  if (isObjectLike(err)) {
+    const code = typeof err.code === 'string' ? err.code : '';
+    if (code === 'TASK_CANCELLED') return true;
+  }
+  const raw = normalizeErrorMessage(err, '');
+  if (!raw) return false;
+  return raw.includes('TASK_CANCELLED') || raw.includes('cancelled') || raw.includes('已取消');
+}
+
+async function runCancelledNewProjectCleanup(
+  infra: WorkerInfra,
+  projectId: string,
+): Promise<void> {
+  console.log(`[REAL_CHAIN] handlers.project:startSeparation cleanup_begin projectId="${projectId}"`);
+
+  try {
+    await infra.stemFileRepo.deleteByProjectId(projectId);
+    console.log(`[REAL_CHAIN] handlers.project:startSeparation cleanup_delete_stems ok projectId="${projectId}"`);
+  } catch (err) {
+    console.warn(
+      `[REAL_CHAIN] handlers.project:startSeparation cleanup_delete_stems fail projectId="${projectId}" error="${normalizeErrorMessage(err, 'unknown')}"`,
+    );
+  }
+
+  try {
+    await infra.projectRepo.delete(projectId);
+    console.log(`[REAL_CHAIN] handlers.project:startSeparation cleanup_delete_project ok projectId="${projectId}"`);
+  } catch (err) {
+    console.warn(
+      `[REAL_CHAIN] handlers.project:startSeparation cleanup_delete_project fail projectId="${projectId}" error="${normalizeErrorMessage(err, 'unknown')}"`,
+    );
+  }
+
+  try {
+    const beforeEntries = await readRecentProjectsIndex();
+    const beforeCount = beforeEntries.length;
+    await removeRecentProjectEntryByProjectId(projectId);
+    const afterEntries = await readRecentProjectsIndex();
+    const afterCount = afterEntries.length;
+    console.log(
+      `[REAL_CHAIN] handlers.project:startSeparation cleanup_remove_recent ok projectId="${projectId}" beforeCount=${beforeCount} afterCount=${afterCount}`,
+    );
+  } catch (err) {
+    console.warn(
+      `[REAL_CHAIN] handlers.project:startSeparation cleanup_remove_recent fail projectId="${projectId}" error="${normalizeErrorMessage(err, 'unknown')}"`,
+    );
+  }
+
+  clearProjectScopedCacheEntries(waveformResultCache, projectId);
+  clearProjectScopedCacheEntries(chordAnalysisResultCache, projectId);
+
+  let repoExists = false;
+  try {
+    repoExists = !!(await infra.projectRepo.findById(projectId));
+  } catch {
+    repoExists = false;
+  }
+  console.log(
+    `[REAL_CHAIN] handlers.project:startSeparation cleanup_done projectId="${projectId}" repoExists=${repoExists}`,
+  );
+}
+
+async function shouldCleanupFailedNewProject(
+  infra: WorkerInfra,
+  projectId: string,
+  projectDir: string,
+): Promise<{ cleanup: boolean; stemCount: number; resultSetCount: number }> {
+  const stems = await infra.stemFileRepo.findByProjectId(projectId).catch(() => []);
+  const stemCount = stems.length;
+  let resultSetCount = 0;
+  try {
+    const manifest = await readProjectJsonRecord(projectDir, 'manifest.json');
+    resultSetCount = normalizeResultSetEntries(manifest?.resultSets).length;
+  } catch {
+    resultSetCount = 0;
+  }
+  return {
+    cleanup: stemCount === 0 && resultSetCount === 0,
+    stemCount,
+    resultSetCount,
+  };
 }
 
 async function resolveAnalysisSourceFilePath(
@@ -498,35 +632,63 @@ async function ensurePilotManifestPersistence(
 }
 
 function buildDefaultResultSetEntry(project: Project, stems: Array<{
+  parentResultId?: string;
   modelId?: string;
   runtimeProfileId?: string;
   sourceSignature?: string;
-}>): ProjectManifestResultSetEntry | null {
-  const signature = stems.find((stem) => typeof stem.sourceSignature === 'string' && stem.sourceSignature.trim().length > 0)?.sourceSignature?.trim();
-  if (!signature) return null;
-  const modelId = stems.find((stem) => typeof stem.modelId === 'string' && stem.modelId.trim().length > 0)?.modelId?.trim()
-    ?? DEFAULT_RESULT_MODEL_ID;
-  const runtimeProfileId = stems.find((stem) => typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0)?.runtimeProfileId?.trim()
+}>, preferredResultId: string = DEFAULT_ACTIVE_RESULT_ID): ProjectManifestResultSetEntry | null {
+  const normalizedPreferredId = normalizeParentResultId(preferredResultId);
+  const stemsWithSignature = stems
+    .filter((stem) => typeof stem.sourceSignature === 'string' && stem.sourceSignature.trim().length > 0)
+    .map((stem) => ({
+      parentResultId: normalizeParentResultId(stem.parentResultId),
+      modelId: typeof stem.modelId === 'string' && stem.modelId.trim().length > 0
+        ? stem.modelId.trim()
+        : '',
+      runtimeProfileId: typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0
+        ? stem.runtimeProfileId.trim()
+        : '',
+      sourceSignature: (stem.sourceSignature as string).trim(),
+    }));
+  if (stemsWithSignature.length === 0) return null;
+
+  const uniqueParentIds = Array.from(new Set(stemsWithSignature.map((stem) => stem.parentResultId))).sort();
+  const targetParentId = stemsWithSignature.some((stem) => stem.parentResultId === normalizedPreferredId)
+    ? normalizedPreferredId
+    : (stemsWithSignature.some((stem) => stem.parentResultId === DEFAULT_ACTIVE_RESULT_ID)
+      ? DEFAULT_ACTIVE_RESULT_ID
+      : uniqueParentIds[0]);
+  const scoped = stemsWithSignature
+    .filter((stem) => stem.parentResultId === targetParentId)
+    .sort((a, b) =>
+      a.sourceSignature.localeCompare(b.sourceSignature)
+      || a.modelId.localeCompare(b.modelId)
+      || a.runtimeProfileId.localeCompare(b.runtimeProfileId));
+  const primary = scoped[0];
+  if (!primary) return null;
+
+  const modelId = scoped.find((stem) => stem.modelId.length > 0)?.modelId ?? DEFAULT_RESULT_MODEL_ID;
+  const runtimeProfileId = scoped.find((stem) => stem.runtimeProfileId.length > 0)?.runtimeProfileId
     ?? DEFAULT_RESULT_RUNTIME_PROFILE_ID;
   return {
-    id: DEFAULT_ACTIVE_RESULT_ID,
+    id: targetParentId,
     modelId,
     runtimeProfileId,
-    sourceSignature: signature,
+    sourceSignature: primary.sourceSignature,
     createdAt: project.updatedAt > 0 ? project.updatedAt : Date.now(),
   };
 }
 
 async function resolveActiveResultContext(
   project: Project,
-  stems: Array<{ modelId?: string; runtimeProfileId?: string; sourceSignature?: string }> = [],
+  stems: Array<{ parentResultId?: string; modelId?: string; runtimeProfileId?: string; sourceSignature?: string }> = [],
 ): Promise<ActiveResultContext> {
   const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
   const fromManifest = manifest && typeof manifest.activeResultId === 'string'
     ? manifest.activeResultId.trim()
     : '';
   const normalizedSets = normalizeResultSetEntries(manifest?.resultSets);
-  const fallbackSet = buildDefaultResultSetEntry(project, stems);
+  const fallbackSet = buildDefaultResultSetEntry(project, stems, fromManifest || DEFAULT_ACTIVE_RESULT_ID);
   const resultSets = normalizedSets.length > 0
     ? normalizedSets
     : (fallbackSet ? [fallbackSet] : []);
@@ -536,6 +698,13 @@ async function resolveActiveResultContext(
     ? fromManifest
     : fallbackActiveId;
   const activeSet = resultSets.find((entry) => entry.id === activeResultId) ?? null;
+  const filteredStemsCount = filterStemsForResultSet(stems, activeResultId).length;
+  const fallbackReason = normalizedSets.length > 0
+    ? (!fromManifest ? 'manifest_active_missing' : (fromManifest === activeResultId ? 'manifest_active_match' : 'manifest_active_invalid'))
+    : (fallbackSet ? (fallbackSet.id === normalizeParentResultId(fromManifest || DEFAULT_ACTIVE_RESULT_ID)
+      ? 'fallback_from_stems_preferred'
+      : 'fallback_from_stems_degraded')
+      : 'fallback_no_result_set');
 
   if ((normalizedSets.length === 0 || !fromManifest || fromManifest !== activeResultId) && resultSets.length > 0) {
     try {
@@ -549,6 +718,12 @@ async function resolveActiveResultContext(
       );
     }
   }
+
+  console.log(
+    `[REAL_CHAIN] handlers.resolveActiveResultContext projectId="${project.id}" ` +
+    `activeResultId="${activeResultId}" allStemsCount=${stems.length} filteredStemsCount=${filteredStemsCount} ` +
+    `resolvedSourceSignature="${activeSet?.sourceSignature ?? ''}" fallbackReason="${fallbackReason}"`,
+  );
 
   return {
     activeResultId,
@@ -1290,8 +1465,8 @@ async function restoreExistingProjectFromDir(
     sourceKind: s.sourceKind,
   })));
 
-  waveformResultCache.delete(projectId);
-  chordAnalysisResultCache.delete(projectId);
+  clearProjectScopedCacheEntries(waveformResultCache, projectId);
+  clearProjectScopedCacheEntries(chordAnalysisResultCache, projectId);
 
   return {
     projectId,
@@ -1325,10 +1500,16 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         const existing = await workerInfra.projectRepo.findById(entry.projectId);
         if (!existing || !fs.existsSync(existing.cacheDir)) {
           try {
+            console.log(
+              `[REAL_CHAIN] handlers.project:getRecent getRecent_restore_attempt projectId="${entry.projectId}" projectDir="${entry.projectDir}" reason="${!existing ? 'repo_missing' : 'cache_dir_missing'}"`,
+            );
             const restored = await restoreExistingProjectFromDir(entry.projectDir, workerInfra, {
               indexUpdatedAt: entry.updatedAt,
               indexDisplayName: entry.displayName,
             });
+            console.log(
+              `[REAL_CHAIN] handlers.project:getRecent getRecent_restore_success projectId="${restored.projectId}" projectDir="${entry.projectDir}" stemCount=${restored.stemCount}`,
+            );
             keptEntries.push({
               projectId: restored.projectId,
               displayName: restored.displayName,
@@ -1355,6 +1536,8 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const result = await workerInfra.projectRepo.listRecent({ limit, offset: 0 });
     const mapped = await Promise.all(result.items.map(async (p) => {
       const stems = await workerInfra!.stemFileRepo.findByProjectId(p.id);
+      const activeResultContext = await resolveActiveResultContext(p, stems);
+      const activeStems = filterStemsForResultSet(stems, activeResultContext.activeResultId);
       return {
         id: p.id,
         displayName: p.displayName,
@@ -1363,6 +1546,8 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         durationMs: p.durationMs,
         totalSizeBytes: p.totalSizeBytes,
         stemCount: stems.length,
+        activeResultId: activeResultContext.activeResultId,
+        activeStemCount: activeStems.length,
         updatedAt: p.updatedAt,
       };
     }));
@@ -1376,9 +1561,21 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     if (!fs.existsSync(filePath)) {
       throw new Error('输入文件不存在或不可访问，请重新选择音频文件');
     }
-
     const projectId = `proj-${crypto.randomUUID().slice(0, 8)}`;
     const jobId = `job-${crypto.randomUUID().slice(0, 8)}`;
+    const parseCurrentJobIdBefore = workerInfra?.parseJobService.getCurrentJobId() ?? null;
+    console.log(
+      `[REAL_CHAIN] handlers.project:startSeparation start_request_received projectId="${projectId}" jobId="${jobId}" parseCurrentJobIdBefore="${parseCurrentJobIdBefore ?? 'none'}"`,
+    );
+    if (workerInfra) {
+      if (parseCurrentJobIdBefore) {
+        console.warn(
+          `[REAL_CHAIN] handlers.project:startSeparation reject_running_job currentJobId="${parseCurrentJobIdBefore}" filePath="${filePath}"`,
+        );
+        throw new Error('已有分离任务在运行中，请等待当前任务完成后再试');
+      }
+    }
+
     const fileName = path.basename(filePath);
     const fileExists = fs.existsSync(filePath);
     let fileSize = 0;
@@ -1418,6 +1615,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     if (workerInfra) {
       await workerInfra.projectRepo.create(project);
     }
+    let recentUpserted = false;
     try {
       await upsertRecentProjectEntry({
         projectId,
@@ -1425,9 +1623,13 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         projectDir: outputDir,
         updatedAt: now,
       });
+      recentUpserted = true;
     } catch {
       // 最近项目索引写入失败不应阻塞主流程
     }
+    console.log(
+      `[REAL_CHAIN] handlers.project:startSeparation start_project_created projectId="${projectId}" recent_upserted=${recentUpserted}`,
+    );
 
     console.log(`[REAL_CHAIN] handlers.project:startSeparation entry filePath="${filePath}" projectId="${projectId}" jobId="${jobId}" outputDir="${outputDir}"`);
 
@@ -1468,9 +1670,58 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             sourceFilePath: filePath,
             projectDir: outputDir,
           });
+          console.log(
+            `[REAL_CHAIN] handlers.project:startSeparation service_result projectId="${projectId}" jobId="${jobId}" projectStatusAfter="${result.projectStatusAfter}" jobStatus="${result.job.status}" jobErrorCode="${result.job.errorCode ?? 'none'}" jobErrorMessage="${result.job.errorMessage ?? ''}"`,
+          );
+          const cancelled = result.projectStatusAfter === ProjectStatus.Cancelled || result.job.status === 'cancelled';
+          if (cancelled) {
+            console.log(
+              `[REAL_CHAIN] handlers.project:startSeparation cancelled_cleanup projectId="${projectId}" jobId="${jobId}"`,
+            );
+            await runCancelledNewProjectCleanup(infraRef, projectId);
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('separation:complete', {
+                jobId,
+                projectId,
+                success: false,
+                errorMessage: '分离已取消，项目未保存',
+                warnings: ['分离已取消，项目未保存'],
+                cacheHit: false,
+              });
+            }
+            return;
+          }
+          if (result.projectStatusAfter !== ProjectStatus.Ready) {
+            const explicitError = (() => {
+              if (typeof result.job.errorMessage === 'string' && result.job.errorMessage.trim().length > 0) {
+                return result.job.errorMessage.trim();
+              }
+              if (typeof result.job.errorCode === 'string' && result.job.errorCode.trim().length > 0) {
+                return result.job.errorCode.trim();
+              }
+              return `分离未成功（projectStatusAfter=${result.projectStatusAfter}）`;
+            })();
+            console.warn(
+              `[REAL_CHAIN] handlers.project:startSeparation non_ready_short_circuit projectId="${projectId}" jobId="${jobId}" projectStatusAfter="${result.projectStatusAfter}" jobStatus="${result.job.status}" error="${explicitError}"`,
+            );
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('separation:complete', {
+                jobId,
+                projectId,
+                success: false,
+                errorMessage: explicitError,
+                warnings: [explicitError],
+                cacheHit: false,
+              });
+            }
+            return;
+          }
 
           // 鍒嗙瀹屾垚鍚庢洿鏂?project 鐨?metadata
           const stemFiles = await infraRef.stemFileRepo.findByProjectId(projectId);
+          console.log(
+            `[REAL_CHAIN] handlers.project:startSeparation metadata_postprocess_begin projectId="${projectId}" jobId="${jobId}" projectStatusAfter="${result.projectStatusAfter}" stemFilesCount=${stemFiles.length}`,
+          );
           console.log(`[REAL_CHAIN] handlers.project:startSeparation real_path_after_service projectId="${projectId}" jobId="${jobId}" stemFiles=${stemFiles.length} projectStatusAfter="${result.projectStatusAfter}"`);
           const missingProvenance = stemFiles.some((stem) => (
             !stem.modelId
@@ -1532,14 +1783,54 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             });
           }
         } catch (err) {
-          console.error(`[REAL_CHAIN] handlers.project:startSeparation real_path_error projectId="${projectId}" jobId="${jobId}" error="${err instanceof Error ? err.message : String(err)}"`);
+          const originalError = normalizeErrorMessage(err, 'unknown_error');
+          console.error(`[REAL_CHAIN] handlers.project:startSeparation real_path_error projectId="${projectId}" jobId="${jobId}" error="${originalError}"`);
+          if (isSeparationCancelledError(err)) {
+            await runCancelledNewProjectCleanup(infraRef, projectId);
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('separation:complete', {
+                jobId,
+                projectId,
+                success: false,
+                errorMessage: '分离已取消，项目未保存',
+                warnings: ['分离已取消，项目未保存'],
+                cacheHit: false,
+              });
+            }
+            return;
+          }
+          const normalizedError = toSeparationFailureMessage(err);
+          const cleanupDecision = await shouldCleanupFailedNewProject(infraRef, projectId, outputDir);
+          if (cleanupDecision.cleanup) {
+            console.warn(
+              `[REAL_CHAIN] handlers.project:startSeparation failed_cleanup projectId="${projectId}" jobId="${jobId}" stemCount=${cleanupDecision.stemCount} resultSetCount=${cleanupDecision.resultSetCount}`,
+            );
+            await runCancelledNewProjectCleanup(infraRef, projectId);
+            if (win && !win.isDestroyed()) {
+              console.error(
+                `[REAL_CHAIN] handlers.project:startSeparation real_path_error_mapped projectId="${projectId}" jobId="${jobId}" errorOriginal="${originalError}" mappedError="${normalizedError}"`,
+              );
+              win.webContents.send('separation:complete', {
+                jobId,
+                projectId,
+                success: false,
+                errorMessage: normalizedError,
+                warnings: [normalizedError],
+                cacheHit: false,
+              });
+            }
+            return;
+          }
+
           // 鏇存柊 project 鐘舵€?
           try {
             await infraRef.projectRepo.updateStatus(projectId, ProjectStatus.Failed);
           } catch { /* ignore */ }
 
           if (win && !win.isDestroyed()) {
-            const normalizedError = toSeparationFailureMessage(err);
+            console.error(
+              `[REAL_CHAIN] handlers.project:startSeparation real_path_error_mapped projectId="${projectId}" jobId="${jobId}" errorOriginal="${originalError}" mappedError="${normalizedError}"`,
+            );
             win.webContents.send('separation:complete', {
               jobId,
               projectId,
@@ -1596,6 +1887,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const win = BrowserWindow.fromWebContents(event.sender);
     const jobId = `job-${crypto.randomUUID().slice(0, 8)}`;
     const resultSetId = `pilot_6s_${Date.now()}`;
+    const workerOutputDir = path.join(project.cacheDir, '.tmp-separation', `${resultSetId}_${jobId}`);
 
     const workerStatus = workerInfra.workerManager.getStatus();
     if (!workerInfra.workerManager.isAcceptingRequests()) {
@@ -1628,12 +1920,27 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           projectId,
           sourceFilePath: resolvedSourceFilePath,
           projectDir: project.cacheDir,
+          workerOutputDirOverride: workerOutputDir,
           resultSetId,
           preserveExistingStems: true,
           allowReadyStatus: true,
           runtimeProfileIdOverride: PILOT_RUNTIME_PROFILE_ID,
           workerModelOverride: PILOT_MODEL_ID,
         });
+        const cancelled = result.projectStatusAfter === ProjectStatus.Cancelled || result.job.status === 'cancelled';
+        if (cancelled) {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send('separation:complete', {
+              jobId,
+              projectId,
+              success: false,
+              errorMessage: '实验分离已取消',
+              warnings: ['实验分离已取消'],
+              cacheHit: false,
+            });
+          }
+          return;
+        }
         if (result.projectStatusAfter !== ProjectStatus.Ready) {
           const explicitError = result.job.errorMessage
             || result.job.errorCode
@@ -1671,10 +1978,12 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         );
 
         if (win && !win.isDestroyed()) {
+          const cancelled = result.job.status === 'cancelled';
           win.webContents.send('separation:complete', {
             jobId,
             projectId,
             success: result.projectStatusAfter === ProjectStatus.Ready,
+            ...(cancelled ? { errorMessage: '实验分离已取消' } : {}),
             warnings: result.warnings,
             cacheHit: false,
           });
@@ -1710,7 +2019,17 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
   ipcMain.handle('project:cancelSeparation', async (_event, jobId?: string) => {
     if (workerInfra) {
-      await workerInfra.parseJobService.cancelSeparation(jobId ?? undefined);
+      const incomingJobId = typeof jobId === 'string' && jobId.trim().length > 0 ? jobId.trim() : '';
+      const parseCurrentJobId = workerInfra.parseJobService.getCurrentJobId();
+      console.log(
+        `[REAL_CHAIN] handlers.project:cancelSeparation cancel_begin incomingJobId="${incomingJobId || 'none'}" parseCurrentJobId="${parseCurrentJobId ?? 'none'}"`,
+      );
+      const dispatchJobId = parseCurrentJobId ?? (incomingJobId || undefined);
+      const mode = parseCurrentJobId ? 'current' : 'explicit';
+      console.log(
+        `[REAL_CHAIN] handlers.project:cancelSeparation cancel_dispatched mode=${mode} targetJobId="${dispatchJobId ?? 'none'}"`,
+      );
+      await workerInfra.parseJobService.cancelSeparation(dispatchJobId);
     }
     if (jobId) cancelledMockJobs.add(jobId);
     return undefined;
@@ -1780,6 +2099,41 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     return { projectId, lastAccessedAt };
   });
 
+  ipcMain.handle('project:setActiveResult', async (_event, projectId: string, resultSetId: string) => {
+    if (!workerInfra) return null;
+    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('缺少项目 ID，无法切换结果集');
+    }
+    const normalizedResultSetId = typeof resultSetId === 'string' ? resultSetId.trim() : '';
+    if (!normalizedResultSetId) {
+      throw new Error('缺少结果集 ID，无法切换结果集');
+    }
+
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) {
+      throw new Error('项目不存在，无法切换结果集');
+    }
+
+    const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+    const manifestResultSets = normalizeResultSetEntries(manifest?.resultSets);
+    if (!manifestResultSets.some((entry) => entry.id === normalizedResultSetId)) {
+      throw new Error(`结果集不存在，无法切换：${normalizedResultSetId}`);
+    }
+
+    await patchProjectManifestMetadata(project.cacheDir, {
+      activeResultId: normalizedResultSetId,
+    });
+
+    console.log(
+      `[REAL_CHAIN] handlers.project:setActiveResult projectId="${projectId}" activeResultId="${normalizedResultSetId}"`,
+    );
+
+    return {
+      projectId,
+      activeResultId: normalizedResultSetId,
+    };
+  });
+
   ipcMain.handle('project:getResult', async (_event, projectId: string) => {
     console.log(`[REAL_CHAIN] handlers.project:getResult query projectId="${projectId}"`);
     if (!workerInfra) return null;
@@ -1791,6 +2145,12 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const latestJob = await workerInfra.parseJobRepo.findLatestByProjectId(projectId);
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
+    const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+    const manifestResultSets = normalizeResultSetEntries(manifest?.resultSets);
+    const fallbackResultSet = buildDefaultResultSetEntry(project, allStems, activeResultContext.activeResultId);
+    const resultSets = manifestResultSets.length > 0
+      ? manifestResultSets
+      : (fallbackResultSet ? [fallbackResultSet] : []);
 
     const isRealSeparation = project.status === ProjectStatus.Ready && stems.length > 0;
     const resolvedEngineVersion =
@@ -1829,6 +2189,8 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       cacheHitBannerText: null,
       sourceTypeLabel,
       activeResultId: activeResultContext.activeResultId,
+      sourceFilePath: project.originalFilePath ?? null,
+      resultSets,
     };
   });
 
@@ -1842,10 +2204,17 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     if (!project) return [];
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
-    console.log(`[REAL_CHAIN] handlers.project:getStems repo_result projectId="${projectId}" activeResultId="${activeResultContext.activeResultId}" stemsLength=${stems.length}`);
+    console.log(
+      `[REAL_CHAIN] handlers.project:getStems context projectId="${projectId}" ` +
+      `activeResultId="${activeResultContext.activeResultId}" allStemsCount=${allStems.length} ` +
+      `filteredStemsCount=${stems.length} resolvedSourceSignature="${activeResultContext.sourceSignature ?? ''}"`,
+    );
 
     if (stems.length > 0) {
-      console.log(`[REAL_CHAIN] handlers.project:getStems fallbackHit=false projectId="${projectId}"`);
+      console.log(
+        `[REAL_CHAIN] handlers.project:getStems fallbackHit=false projectId="${projectId}" ` +
+        'fallbackReason="none"',
+      );
       // 鏈夌湡瀹?stems 鈥?杩斿洖 StemTrackDTO
       return stems.map(sf => ({
         id: sf.id,
@@ -1870,9 +2239,20 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       }));
     }
 
-    // 鏃犵湡瀹?stems 鈥?mock honest fallback
-    console.log(`[REAL_CHAIN] handlers.project:getStems fallbackHit=true projectId="${projectId}"`);
-    return getMockHonestStems(project);
+    if (allStems.length === 0) {
+      // 鏃犵湡瀹?stems 鈥?mock honest fallback
+      console.log(
+        `[REAL_CHAIN] handlers.project:getStems fallbackHit=true projectId="${projectId}" ` +
+        'fallbackReason="repo_empty"',
+      );
+      return getMockHonestStems(project);
+    }
+
+    console.warn(
+      `[REAL_CHAIN] handlers.project:getStems fallbackHit=false projectId="${projectId}" ` +
+      `fallbackReason="active_result_no_matching_stems" activeResultId="${activeResultContext.activeResultId}"`,
+    );
+    return [];
   });
 
   ipcMain.handle('project:openExisting', async () => {
@@ -1957,25 +2337,21 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const expectedAnalysisVersion = getWaveformAnalysisVersionHint();
     const sourceSignature = activeResultContext.sourceSignature ?? await getFileSourceSignature(sourceFilePath);
     const parentResultId = activeResultContext.activeResultId;
-    const cached = waveformResultCache.get(projectId);
-    if (cached && sourceSignature) {
-      const cacheHit =
-        cached.parentResultId === parentResultId
-        && cached.sourceSignature === sourceSignature
-        && cached.analysisVersion === expectedAnalysisVersion;
-      if (cacheHit) {
-        console.log(`[REAL_CHAIN] handlers.project:getWaveform cache_hit projectId="${projectId}" analysisVersion="${cached.analysisVersion}"`);
-        return cached.result;
-      }
-      console.log(
-        `[REAL_CHAIN] handlers.project:getWaveform cache_miss projectId="${projectId}" ` +
-        `reason="signature_or_version_changed" cachedVersion="${cached.analysisVersion}" expectedVersion="${expectedAnalysisVersion}"`,
-      );
-    } else if (!sourceSignature) {
+    const cached = getWaveformCacheEntry(projectId, parentResultId, sourceSignature, expectedAnalysisVersion);
+    if (cached) {
+      console.log(`[REAL_CHAIN] handlers.project:getWaveform cache_hit projectId="${projectId}" analysisVersion="${cached.analysisVersion}"`);
+      return cached.result;
+    }
+    if (!sourceSignature) {
       // Signature unavailable: never trust old cache, but still try to generate fresh waveform.
       console.log(
         `[REAL_CHAIN] handlers.project:getWaveform cache_bypass projectId="${projectId}" ` +
         `reason="source_signature_unavailable"`,
+      );
+    } else {
+      console.log(
+        `[REAL_CHAIN] handlers.project:getWaveform cache_miss projectId="${projectId}" ` +
+        `reason="cache_key_not_found" analysisVersion="${expectedAnalysisVersion}"`,
       );
     }
 
@@ -1987,7 +2363,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     );
     if (persistedWaveform) {
       if (sourceSignature) {
-        waveformResultCache.set(projectId, {
+        setWaveformCacheEntry({
           cacheKey: buildWaveformCacheKey(projectId, parentResultId, sourceSignature, expectedAnalysisVersion),
           parentResultId,
           sourceFilePath,
@@ -2006,10 +2382,6 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
     if (!ensureWorkerAcceptingRequests(workerInfra)) {
       console.log(`[REAL_CHAIN] handlers.project:getWaveform miss projectId="${projectId}" reason="worker_not_ready"`);
-      if (cached && cached.parentResultId === parentResultId) {
-        console.log(`[REAL_CHAIN] handlers.project:getWaveform return_stale_cache projectId="${projectId}"`);
-        return cached.result;
-      }
       return null;
     }
 
@@ -2067,7 +2439,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
       const resolvedAnalysisVersion = waveform.analysisVersion ?? expectedAnalysisVersion;
       if (sourceSignature) {
-        waveformResultCache.set(projectId, {
+        setWaveformCacheEntry({
           cacheKey: buildWaveformCacheKey(projectId, parentResultId, sourceSignature, resolvedAnalysisVersion),
           parentResultId,
           sourceFilePath,
@@ -2089,10 +2461,6 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       return waveform;
     } catch (err) {
       console.warn(`[Analysis] getWaveform unavailable. projectId=${projectId}, reason=${normalizeErrorMessage(err, 'unknown')}`);
-      if (cached && cached.parentResultId === parentResultId) {
-        console.log(`[REAL_CHAIN] handlers.project:getWaveform return_stale_cache_on_error projectId="${projectId}"`);
-        return cached.result;
-      }
       return null;
     }
   });
@@ -2128,30 +2496,26 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     );
 
     const expectedAnalysisVersion = getChordAnalysisVersionHint();
-    const cached = chordAnalysisResultCache.get(projectId);
-    if (cached && sourceSignature) {
-      const cacheHit =
-        cached.parentResultId === parentResultId
-        && cached.sourceSignature === sourceSignature
-        && cached.analysisVersion === expectedAnalysisVersion;
-      if (cacheHit) {
-        const cachedResult = cached.result;
-        console.log(
-          `[REAL_CHAIN] handlers.project:getChordAnalysis cache_hit projectId="${projectId}" ` +
-          `source_kind="${sourceKind}" analysisVersion="${cached.analysisVersion}" ` +
-          `segments=${cachedResult.segments.length} key_empty=${!cachedResult.estimatedKey} ` +
-          `has_warning=${(cachedResult.warnings?.length ?? 0) > 0}`,
-        );
-        return cached.result;
-      }
+    const cached = getChordCacheEntry(projectId, parentResultId, sourceSignature, expectedAnalysisVersion);
+    if (cached) {
+      const cachedResult = cached.result;
       console.log(
-        `[REAL_CHAIN] handlers.project:getChordAnalysis cache_miss projectId="${projectId}" ` +
-        `reason="signature_or_version_changed" cachedVersion="${cached.analysisVersion}" expectedVersion="${expectedAnalysisVersion}"`,
+        `[REAL_CHAIN] handlers.project:getChordAnalysis cache_hit projectId="${projectId}" ` +
+        `source_kind="${sourceKind}" analysisVersion="${cached.analysisVersion}" ` +
+        `segments=${cachedResult.segments.length} key_empty=${!cachedResult.estimatedKey} ` +
+        `has_warning=${(cachedResult.warnings?.length ?? 0) > 0}`,
       );
-    } else if (!sourceSignature) {
+      return cached.result;
+    }
+    if (!sourceSignature) {
       console.log(
         `[REAL_CHAIN] handlers.project:getChordAnalysis cache_bypass projectId="${projectId}" ` +
         `source_kind="${sourceKind}" reason="source_signature_unavailable" analysisVersion="${expectedAnalysisVersion}"`,
+      );
+    } else {
+      console.log(
+        `[REAL_CHAIN] handlers.project:getChordAnalysis cache_miss projectId="${projectId}" ` +
+        `reason="cache_key_not_found" analysisVersion="${expectedAnalysisVersion}"`,
       );
     }
 
@@ -2163,7 +2527,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     );
     if (persistedChord) {
       if (sourceSignature) {
-        chordAnalysisResultCache.set(projectId, {
+        setChordCacheEntry({
           cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, expectedAnalysisVersion),
           parentResultId,
           sourceFilePath,
@@ -2185,12 +2549,6 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         `[REAL_CHAIN] handlers.project:getChordAnalysis miss projectId="${projectId}" ` +
         'reason="worker_not_ready"',
       );
-      if (cached && cached.parentResultId === parentResultId) {
-        console.log(
-          `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache projectId="${projectId}"`,
-        );
-        return cached.result;
-      }
       return null;
     }
 
@@ -2376,7 +2734,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
       const resolvedAnalysisVersion = chordResult.analysisVersion ?? expectedAnalysisVersion;
       if (sourceSignature) {
-        chordAnalysisResultCache.set(projectId, {
+        setChordCacheEntry({
           cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, resolvedAnalysisVersion),
           parentResultId,
           sourceFilePath,
@@ -2403,12 +2761,6 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       console.warn(
         `[Analysis] getChordAnalysis unavailable. projectId=${projectId}, reason=${warning}`,
       );
-      if (cached && cached.parentResultId === parentResultId) {
-        console.log(
-          `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache_on_error projectId="${projectId}"`,
-        );
-        return cached.result;
-      }
       console.log(
         `[REAL_CHAIN] handlers.project:getChordAnalysis fail_summary projectId="${projectId}" ` +
         `source_kind="${sourceKind}" analysisVersion="${expectedAnalysisVersion}" ` +
@@ -2449,8 +2801,8 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       await workerInfra.stemFileRepo.deleteByProjectId(projectId);
       await workerInfra.projectRepo.delete(projectId);
     }
-    waveformResultCache.delete(projectId);
-    chordAnalysisResultCache.delete(projectId);
+    clearProjectScopedCacheEntries(waveformResultCache, projectId);
+    clearProjectScopedCacheEntries(chordAnalysisResultCache, projectId);
     try {
       await removeRecentProjectEntryByProjectId(projectId);
     } catch {

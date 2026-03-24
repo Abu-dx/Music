@@ -71,6 +71,13 @@ export interface SeparationProvenanceContext {
  * 鎵€鏈?stem 鐨?manifest relativePath 閮戒互姝や负鍓嶇紑銆? */
 const STEMS_RELATIVE_DIR = 'stems';
 
+function normalizeResultSetDirName(value: string | undefined): string {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  if (!normalized) return 'main';
+  const safe = normalized.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return safe.length > 0 ? safe : 'main';
+}
+
 // ============================================================================
 // 3. 閫傞厤缁撴灉绫诲瀷
 // ============================================================================
@@ -186,7 +193,10 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
     const modelName = resolveModelName(raw);
     const supportedByModel = resolveSupportedStemTypes(raw, modelName);
     const sourceSignature = buildSourceSignature(raw, projectId);
-    const parentResultId = provenanceContext?.parentResultId ?? 'main';
+    const parentResultId = (typeof provenanceContext?.parentResultId === 'string' && provenanceContext.parentResultId.trim().length > 0)
+      ? provenanceContext.parentResultId.trim()
+      : 'main';
+    const resultSetDir = normalizeResultSetDirName(parentResultId);
     const runtimeProfileId = provenanceContext?.runtimeProfileId
       ?? process.env.DEMUCS_RUNTIME_PROFILE
       ?? 'demucs_env_override';
@@ -198,7 +208,7 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
       detectedTypes.add(stemType);
 
       // 鐢熸垚 relativePath锛堢洰褰曠害瀹氶泦涓鐞嗭級
-      const relativePath = `${STEMS_RELATIVE_DIR}/${rawStem.filename}`;
+      const relativePath = `${STEMS_RELATIVE_DIR}/${resultSetDir}/${rawStem.filename}`;
 
       // 鐢熸垚 filePath 缁濆璺緞锛圙PT R7 Decision #3锛氫娇鐢?path.join锛?
       const filePath = path.join(projectDir, relativePath);

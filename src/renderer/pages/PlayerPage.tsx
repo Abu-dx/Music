@@ -111,6 +111,7 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
   const [projectMissing, setProjectMissing] = useState(false);
 
   const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
+  const activeResultId = projectSnap.projectResult?.activeResultId ?? 'main';
   const isPlayable = pbSnap.status === PlaybackStatus.Playing
     || pbSnap.status === PlaybackStatus.Paused
     || pbSnap.status === PlaybackStatus.Ended;
@@ -305,7 +306,9 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
         </>
       )}
       {analysisSnap.loadingState === 'loading' && (
-        <div style={styles.chordLoadingBar}>和弦分析加载中...</div>
+        <div style={styles.chordLoadingBar}>
+          当前结果（{activeResultId}）分析中，和弦/BPM/Key 正在加载...
+        </div>
       )}
       {analysisSnap.loadingState === 'empty' && (
         <div style={styles.chordEmptyBar}>未检测到和弦分析结果</div>

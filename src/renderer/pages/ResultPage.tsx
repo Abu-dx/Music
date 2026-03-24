@@ -131,6 +131,11 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const [renameValue, setRenameValue] = useState('');
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameBusy, setRenameBusy] = useState(false);
+  const [pilotBusy, setPilotBusy] = useState(false);
+  const [pilotInfo, setPilotInfo] = useState<string | null>(null);
+  const [pilotError, setPilotError] = useState<string | null>(null);
+  const [activeSwitchBusy, setActiveSwitchBusy] = useState(false);
+  const [activeSwitchError, setActiveSwitchError] = useState<string | null>(null);
   const accessMarkedRef = useRef(false);
   const analysisLoadedForProjectRef = useRef<string | null>(null);
 
@@ -286,6 +291,54 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     }
   }, [projectResult?.displayName, renameValue, projectStore, projectId]);
 
+  const handleStartPilotSeparation = useCallback(async () => {
+    const hasExistingPilotResultSet = (projectResult?.resultSets ?? [])
+      .some((entry) => entry.id.startsWith('pilot_6s_'));
+    if (hasExistingPilotResultSet) {
+      const confirmed = window.confirm('继续分离将追加新的实验结果集，是否继续？');
+      if (!confirmed) return;
+    }
+
+    try {
+      setPilotBusy(true);
+      setPilotError(null);
+      setPilotInfo(null);
+      const preferredSourceFilePath =
+        (typeof projectResult?.sourceFilePath === 'string' && projectResult.sourceFilePath.trim().length > 0)
+          ? projectResult.sourceFilePath.trim()
+          : undefined;
+      const result = await projectStore.startPilotSeparation(projectId, preferredSourceFilePath);
+      setPilotInfo(`实验6轨任务已启动（jobId: ${result.jobId}）`);
+      await Promise.all([
+        projectStore.loadProjectResult(projectId),
+        projectStore.loadRecentProjects(20),
+      ]);
+    } catch (err) {
+      setPilotError(err instanceof Error ? err.message : '实验6轨分离启动失败');
+    } finally {
+      setPilotBusy(false);
+    }
+  }, [projectStore, projectId, projectResult?.resultSets, projectResult?.sourceFilePath]);
+
+  const handleSwitchResultSet = useCallback(async (nextResultSetId: string) => {
+    const normalized = nextResultSetId.trim();
+    const current = projectResult?.activeResultId ?? 'main';
+    if (!normalized || normalized === current) return;
+
+    try {
+      setActiveSwitchBusy(true);
+      setActiveSwitchError(null);
+      analysisLoadedForProjectRef.current = null;
+      analysisStore.setLoading(projectId);
+      await projectStore.setActiveResult(projectId, normalized);
+      await projectStore.loadProjectResult(projectId);
+    } catch (err) {
+      setActiveSwitchError(err instanceof Error ? err.message : '切换结果集失败');
+    } finally {
+      setActiveSwitchBusy(false);
+    }
+  }, [projectResult?.activeResultId, projectStore, projectId, analysisStore]);
+
   // 全部导出
   const handleExportAll = useCallback(async () => {
     const existingIds = stems
@@ -378,6 +431,23 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const existingStems = stems.filter(s => s.presence === 'exists');
   const mergedStems = stems.filter(s => s.presence === 'merged');
   const missingStems = stems.filter(s => s.presence === 'missing');
+  const resultSetOptions = (projectResult?.resultSets ?? [])
+    .filter((entry) => entry.id === 'main' || entry.id.startsWith('pilot_6s_'));
+  const hasResultSetSwitcher = resultSetOptions.length > 1;
+  const selectedResultSetId = resultSetOptions.some((entry) => entry.id === (projectResult?.activeResultId ?? 'main'))
+    ? (projectResult?.activeResultId ?? 'main')
+    : (resultSetOptions[0]?.id ?? 'main');
+  const currentSourceStem = stems.find((stem) =>
+    (typeof stem.modelId === 'string' && stem.modelId.trim().length > 0)
+    || (typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0),
+  );
+  const currentModelSource = currentSourceStem?.modelId
+    ?? currentSourceStem?.runtimeProfileId
+    ?? 'unknown';
+  const showPilotProcessingBanner = projectResult?.status === 'processing' && (projectResult?.activeResultId ?? 'main') === 'main';
+  const showAnalysisLoadingHint =
+    analysisSnap.projectId === projectId
+    && (analysisSnap.loadingState === 'loading' || activeSwitchBusy);
   // Header track count must be derived from the same grouped lists used by the UI sections.
   const headerTrackCount = [existingStems, mergedStems, missingStems]
     .reduce((sum, group) => sum + group.length, 0);
@@ -427,6 +497,8 @@ export const ResultPage: React.FC<ResultPageProps> = ({
                 </span>
                 {' · '}
                 {headerTrackCount} 轨 {' · '}
+                当前结果：{projectResult.activeResultId ?? 'main'} · {stems.length}轨 {' · '}
+                模型：{currentModelSource} {' · '}
                 {formatSize(projectResult.totalSizeBytes)}
                 {projectResult.durationMs != null && (
                   <> · {formatDuration(projectResult.durationMs)}</>
@@ -439,14 +511,46 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           </div>
         </div>
         <div style={styles.headerActions}>
+          {hasResultSetSwitcher && (
+            <label style={styles.resultSetSwitchLabel}>
+              结果集
+              <select
+                style={styles.resultSetSwitchSelect}
+                value={selectedResultSetId}
+                onChange={(e) => { void handleSwitchResultSet(e.target.value); }}
+                disabled={activeSwitchBusy}
+              >
+                {resultSetOptions.map((entry) => (
+                  <option key={entry.id} value={entry.id}>{entry.id}</option>
+                ))}
+              </select>
+            </label>
+          )}
           <button style={styles.headerButton} onClick={handleRenameProject}>
             重命名
+          </button>
+          <button
+            style={{
+              ...styles.headerButton,
+              ...(pilotBusy ? styles.headerButtonDisabled : {}),
+            }}
+            onClick={handleStartPilotSeparation}
+            disabled={pilotBusy}
+            title="实验功能：追加 6 轨结果集，不覆盖主线 main 结果"
+          >
+            {pilotBusy ? '实验6轨启动中...' : '实验6轨分离'}
           </button>
           <button style={styles.newButton} onClick={onNavigateToUpload}>
             + 新建项目
           </button>
         </div>
       </div>
+      <div style={styles.experimentalHint}>实验功能：仅追加 pilot 结果，不覆盖当前主线（main）结果。</div>
+      {showPilotProcessingBanner && (
+        <div style={styles.processingBanner}>
+          当前仍显示 main 结果，pilot 正在处理中，完成后可切换查看。
+        </div>
+      )}
 
       {/* === mock 鏁版嵁鎻愮ず === */}
       {projectResult?.sourceTypeLabel?.includes('模拟') && (
@@ -483,6 +587,18 @@ export const ResultPage: React.FC<ResultPageProps> = ({
       </div>
       {openDirError && (
         <div style={styles.inlineError}>{openDirError}</div>
+      )}
+      {pilotError && (
+        <div style={styles.inlineError}>{pilotError}</div>
+      )}
+      {pilotInfo && (
+        <div style={styles.inlineInfo}>{pilotInfo}</div>
+      )}
+      {activeSwitchError && (
+        <div style={styles.inlineError}>{activeSwitchError}</div>
+      )}
+      {showAnalysisLoadingHint && (
+        <div style={styles.inlineInfo}>当前结果分析中，和弦/BPM/Key 正在加载...</div>
       )}
 
       {/* === 已生成轨道 === */}
@@ -550,7 +666,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           )}
         </h3>
         {analysisSnap.loadingState === 'loading' && (
-          <div style={styles.chordPlaceholder}>和弦分析加载中...</div>
+          <div style={styles.chordPlaceholder}>当前结果分析中，和弦/BPM/Key 正在加载...</div>
         )}
         {analysisSnap.loadingState === 'empty' && (
           <div style={styles.chordPlaceholder}>未检测到和弦分析结果</div>
@@ -761,6 +877,9 @@ const StemTrackCard: React.FC<{
             合并来源: {stem.mergedFrom.join(', ')}
           </div>
         )}
+        <div style={styles.trackSourceText}>
+          来源结果: {stem.parentResultId ?? 'main'} · 模型: {stem.modelId ?? stem.runtimeProfileId ?? 'unknown'}
+        </div>
       </div>
       <div style={styles.trackActions}>
         {/* GPT R8 Must Fix #5锛氬崟杞ㄥ鍑?disabled + reason */}
@@ -833,6 +952,22 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     gap: '8px',
   },
+  resultSetSwitchLabel: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontSize: '12px',
+    color: '#555',
+  },
+  resultSetSwitchSelect: {
+    height: '30px',
+    borderRadius: '6px',
+    border: '1px solid #d0d0d0',
+    backgroundColor: '#fff',
+    color: '#333',
+    padding: '0 8px',
+    fontSize: '12px',
+  },
   title: {
     fontSize: '22px',
     fontWeight: 600,
@@ -873,6 +1008,25 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
     color: '#333',
     whiteSpace: 'nowrap' as const,
+  },
+  headerButtonDisabled: {
+    opacity: 0.6,
+    cursor: 'not-allowed',
+  },
+  experimentalHint: {
+    marginTop: '-4px',
+    marginBottom: '10px',
+    fontSize: '12px',
+    color: '#666',
+  },
+  processingBanner: {
+    marginBottom: '12px',
+    padding: '10px 12px',
+    borderRadius: '6px',
+    backgroundColor: '#e3f2fd',
+    color: '#1565c0',
+    fontSize: '13px',
+    border: '1px solid #bbdefb',
   },
   modalBackdrop: {
     position: 'fixed' as const,
@@ -1046,6 +1200,11 @@ const styles: Record<string, React.CSSProperties> = {
   mergedFromText: {
     fontSize: '12px',
     color: '#2196F3',
+    marginTop: '4px',
+  },
+  trackSourceText: {
+    fontSize: '12px',
+    color: '#666',
     marginTop: '4px',
   },
   trackActions: {

@@ -12,7 +12,9 @@ JSON-line stdio 鍗忚瀹炵幇 + Demucs 鍒嗙寮曟搸鎺ュ叆銆?
 import json
 import sys
 import os
+import shlex
 import subprocess
+import threading
 import traceback
 import time
 import wave
@@ -22,6 +24,7 @@ from typing import Any, Dict, List, Tuple, Optional, Protocol, Set
 from stem_routing import build_stem_routing_plan
 from runtime_profiles import (
     ExecutionRequest,
+    ExecutionResult,
     ProcessLauncher,
     RuntimeHealthChecker,
     RuntimeProfile,
@@ -868,6 +871,162 @@ def select_tempo_analyzer(request_id: str) -> TempoAnalyzer:
 
 
 PROCESS_LAUNCHER = ProcessLauncher()
+TASK_CANCELLED_CODE = "TASK_CANCELLED"
+
+_ACTIVE_TASK_LOCK = threading.Lock()
+_ACTIVE_TASK_THREAD: Optional[threading.Thread] = None
+_ACTIVE_TASK_REQUEST_ID: Optional[str] = None
+_ACTIVE_TASK_COMMAND: Optional[str] = None
+_ACTIVE_TASK_CANCEL_REQUESTED = False
+_ACTIVE_SEPARATION_PROCESS: Optional[subprocess.Popen[str]] = None
+
+
+class TaskCancelledError(RuntimeError):
+    pass
+
+
+def _set_active_task_context(request_id: str, command: str, thread: threading.Thread) -> None:
+    global _ACTIVE_TASK_THREAD, _ACTIVE_TASK_REQUEST_ID, _ACTIVE_TASK_COMMAND
+    global _ACTIVE_TASK_CANCEL_REQUESTED, _ACTIVE_SEPARATION_PROCESS
+    with _ACTIVE_TASK_LOCK:
+        _ACTIVE_TASK_THREAD = thread
+        _ACTIVE_TASK_REQUEST_ID = request_id
+        _ACTIVE_TASK_COMMAND = command
+        _ACTIVE_TASK_CANCEL_REQUESTED = False
+        _ACTIVE_SEPARATION_PROCESS = None
+
+
+def _clear_active_task_context(request_id: str) -> None:
+    global _ACTIVE_TASK_THREAD, _ACTIVE_TASK_REQUEST_ID, _ACTIVE_TASK_COMMAND
+    global _ACTIVE_TASK_CANCEL_REQUESTED, _ACTIVE_SEPARATION_PROCESS
+    with _ACTIVE_TASK_LOCK:
+        if _ACTIVE_TASK_REQUEST_ID == request_id:
+            _ACTIVE_TASK_THREAD = None
+            _ACTIVE_TASK_REQUEST_ID = None
+            _ACTIVE_TASK_COMMAND = None
+            _ACTIVE_TASK_CANCEL_REQUESTED = False
+            _ACTIVE_SEPARATION_PROCESS = None
+
+
+def _is_cancel_requested() -> bool:
+    with _ACTIVE_TASK_LOCK:
+        return _ACTIVE_TASK_CANCEL_REQUESTED
+
+
+def _set_active_separation_process(proc: Optional[subprocess.Popen[str]]) -> None:
+    global _ACTIVE_SEPARATION_PROCESS
+    with _ACTIVE_TASK_LOCK:
+        _ACTIVE_SEPARATION_PROCESS = proc
+
+
+def _terminate_process(proc: subprocess.Popen[str], request_id: str, reason: str) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        log("INFO", f"[REAL_CHAIN] cancel_task terminate_sent request_id={request_id} reason={reason} pid={proc.pid}")
+    except Exception as exc:
+        log("WARN", f"[REAL_CHAIN] cancel_task terminate_failed request_id={request_id} reason={reason} error={exc}")
+        return
+
+    try:
+        proc.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if proc.poll() is None:
+        try:
+            proc.kill()
+            log("WARN", f"[REAL_CHAIN] cancel_task kill_sent request_id={request_id} reason={reason} pid={proc.pid}")
+            proc.wait(timeout=2)
+        except Exception as exc:
+            log("ERROR", f"[REAL_CHAIN] cancel_task kill_failed request_id={request_id} reason={reason} error={exc}")
+
+
+def _raise_if_cancel_requested(request_id: str, stage: str) -> None:
+    if not _is_cancel_requested():
+        return
+    log("INFO", f"[REAL_CHAIN] start_separation cancel_short_circuit request_id={request_id} stage={stage}")
+    raise TaskCancelledError(f"Separation cancelled during {stage}")
+
+
+def _run_subprocess_cancellable(
+    *,
+    request_id: str,
+    command: str | List[str],
+    shell: bool,
+    cwd: Optional[str],
+    env: Dict[str, str],
+    timeout_sec: Optional[int],
+) -> subprocess.CompletedProcess[str]:
+    started = time.time()
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=shell,
+        cwd=cwd,
+        env=env,
+    )
+    _set_active_separation_process(proc)
+    try:
+        while True:
+            _raise_if_cancel_requested(request_id, "engine_wait")
+            if proc.poll() is not None:
+                break
+            if timeout_sec and timeout_sec > 0 and (time.time() - started) > timeout_sec:
+                _terminate_process(proc, request_id, "timeout")
+                raise subprocess.TimeoutExpired(command, timeout_sec)
+            time.sleep(0.1)
+
+        stdout, stderr = proc.communicate()
+        return subprocess.CompletedProcess(command, proc.returncode, stdout or "", stderr or "")
+    except TaskCancelledError:
+        _terminate_process(proc, request_id, "cancel_requested")
+        raise
+    finally:
+        _set_active_separation_process(None)
+
+
+def _launch_profile_command_cancellable(
+    profile: RuntimeProfile,
+    request: ExecutionRequest,
+    *,
+    request_id: str,
+) -> "ExecutionResult":
+    env = dict(os.environ)
+    env.update(profile.env)
+    env.update(request.extra_env)
+
+    command = list(request.args)
+    if request.prepend_executable and not request.shell:
+        command = [profile.executable] + command
+    if request.shell:
+        cmd_obj: str | List[str] = command[0] if len(command) == 1 else " ".join(shlex.quote(x) for x in command)
+    else:
+        cmd_obj = command
+
+    display = cmd_obj if isinstance(cmd_obj, str) else " ".join(shlex.quote(x) for x in cmd_obj)
+    started = time.time()
+    timeout_sec = request.timeout_sec if request.timeout_sec and request.timeout_sec > 0 else profile.default_timeout_sec
+    completed = _run_subprocess_cancellable(
+        request_id=request_id,
+        command=cmd_obj,
+        shell=request.shell,
+        cwd=profile.working_directory or None,
+        env=env,
+        timeout_sec=timeout_sec,
+    )
+    elapsed_ms = int((time.time() - started) * 1000)
+    return ExecutionResult(
+        command_display=display,
+        returncode=completed.returncode,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+        elapsed_ms=elapsed_ms,
+    )
 
 
 def _resolve_executable_candidate(candidate: str) -> str:
@@ -1347,13 +1506,15 @@ def _run_demucs_engine(
         "-o", output_dir,
         file_path,
     ]
-    execution = PROCESS_LAUNCHER.launch(
+    _raise_if_cancel_requested(request_id, "before_demucs_launch")
+    execution = _launch_profile_command_cancellable(
         demucs_runtime.profile,
         ExecutionRequest(
             args=cmd,
             timeout_sec=1800,
             prepend_executable=True,
         ),
+        request_id=request_id,
     )
     log(
         "INFO",
@@ -1372,6 +1533,8 @@ def _run_demucs_engine(
             f"Demucs exited with code {execution.returncode}; "
             f"runtime={demucs_runtime.actual_profile_id}; stderr={stderr_tail}"
         )
+
+    _raise_if_cancel_requested(request_id, "after_demucs_return")
 
     demucs_output_dir = os.path.join(output_dir, model_name, source_basename)
     if not os.path.isdir(demucs_output_dir):
@@ -1497,22 +1660,26 @@ def _run_bs_roformer_engine(
     last_error = "unknown"
     for cmd, use_shell in candidates:
         try:
+            _raise_if_cancel_requested(request_id, "before_bs_launch")
             if use_shell:
                 log("INFO", f"[REAL_CHAIN] start_separation bs_cmd request_id={request_id} cmd={cmd[0]}")
-                result = subprocess.run(
-                    cmd[0],
-                    capture_output=True,
-                    text=True,
-                    timeout=2400,
+                result = _run_subprocess_cancellable(
+                    request_id=request_id,
+                    command=cmd[0],
                     shell=True,
+                    cwd=None,
+                    env=dict(os.environ),
+                    timeout_sec=2400,
                 )
             else:
                 log("INFO", f"[REAL_CHAIN] start_separation bs_cmd request_id={request_id} cmd={' '.join(cmd)}")
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=2400,
+                result = _run_subprocess_cancellable(
+                    request_id=request_id,
+                    command=cmd,
+                    shell=False,
+                    cwd=None,
+                    env=dict(os.environ),
+                    timeout_sec=2400,
                 )
             if result.returncode == 0:
                 break
@@ -1589,6 +1756,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
     output_dir = payload.get("outputDir", "")
     model_override = str(payload.get("modelName", "") or "").strip() or None
     runtime_profile_override = str(payload.get("runtimeProfileId", "") or "").strip() or None
+    _raise_if_cancel_requested(request_id, "before_validate_inputs")
 
     if not file_path or not os.path.isfile(file_path):
         send_response(request_id, False, error={
@@ -1623,6 +1791,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
     })
 
     try:
+        _raise_if_cancel_requested(request_id, "before_engine_select")
         selected_engine = _resolve_separation_engine(request_id)
         log("INFO", f"[REAL_CHAIN] start_separation engine_selected request_id={request_id} engine={selected_engine}")
 
@@ -1637,6 +1806,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
 
         if selected_engine == "bs_roformer_sw":
             try:
+                _raise_if_cancel_requested(request_id, "before_bs_runner")
                 engine_result = _run_bs_roformer_engine(
                     request_id=request_id,
                     file_path=file_path,
@@ -1649,6 +1819,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
                     "WARN",
                     f"[REAL_CHAIN] start_separation bs_failed_fallback_demucs request_id={request_id} error={bs_exc}",
                 )
+                _raise_if_cancel_requested(request_id, "before_demucs_fallback")
                 engine_result = _run_demucs_engine(
                     request_id=request_id,
                     file_path=file_path,
@@ -1658,6 +1829,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
                     runtime_profile_override=runtime_profile_override,
                 )
         else:
+            _raise_if_cancel_requested(request_id, "before_demucs_runner")
             engine_result = _run_demucs_engine(
                 request_id=request_id,
                 file_path=file_path,
@@ -1669,6 +1841,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
 
         if not engine_result or len(engine_result.get("stems", [])) == 0:
             raise RuntimeError("No stems produced by selected separation engine")
+        _raise_if_cancel_requested(request_id, "after_engine_output")
 
         # Build stem-level route metadata (base-only execution this round).
         engine_version = str(engine_result.get("engineVersion", ""))
@@ -1732,6 +1905,12 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
             f"[REAL_CHAIN] start_separation complete request_id={request_id} engine={selected_engine} fallback={used_fallback} stems_count={len(response_data['stems'])}",
         )
 
+    except TaskCancelledError as cancelled:
+        log("WARN", f"[REAL_CHAIN] start_separation cancelled request_id={request_id} message={cancelled}")
+        send_response(request_id, False, error={
+            "code": TASK_CANCELLED_CODE,
+            "message": "Separation cancelled by user",
+        })
     except subprocess.TimeoutExpired:
         log("ERROR", f"[REAL_CHAIN] start_separation timeout request_id={request_id} message=Engine process timed out")
         send_response(request_id, False, error={
@@ -1746,6 +1925,45 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
         })
 
 
+def _run_start_separation_async(request_id: str, payload: dict) -> None:
+    try:
+        handle_start_separation(request_id, payload)
+    except Exception:
+        log("ERROR", f"Handler error for start_separation: {traceback.format_exc()}")
+        send_response(request_id, False, error={
+            "code": "ENGINE_CRASH",
+            "message": "Unhandled worker exception during separation",
+        })
+    finally:
+        _clear_active_task_context(request_id)
+
+
+def handle_cancel_task(request_id: str, payload: dict) -> None:
+    global _ACTIVE_TASK_CANCEL_REQUESTED
+    del payload
+    proc_to_stop: Optional[subprocess.Popen[str]] = None
+    active_request_id: Optional[str] = None
+    active_command: Optional[str] = None
+    with _ACTIVE_TASK_LOCK:
+        _ACTIVE_TASK_CANCEL_REQUESTED = True
+        proc_to_stop = _ACTIVE_SEPARATION_PROCESS
+        active_request_id = _ACTIVE_TASK_REQUEST_ID
+        active_command = _ACTIVE_TASK_COMMAND
+    log(
+        "INFO",
+        f"[REAL_CHAIN] cancel_task received request_id={request_id} "
+        f"active_request_id={active_request_id or 'none'} active_command={active_command or 'none'} "
+        f"has_active_process={proc_to_stop is not None}",
+    )
+    if proc_to_stop is not None:
+        _terminate_process(proc_to_stop, active_request_id or "unknown", "cancel_task")
+
+    send_response(request_id, True, data={
+        "accepted": active_request_id is not None,
+        "activeRequestId": active_request_id,
+    })
+
+
 # ============================================================================
 # 涓诲惊鐜細璇?stdin JSON-line锛屽垎鍙戝埌 handler
 # ============================================================================
@@ -1753,6 +1971,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
 COMMAND_HANDLERS = {
     "health_check": handle_health_check,
     "start_separation": handle_start_separation,
+    "cancel_task": handle_cancel_task,
     "generate_waveform": handle_generate_waveform,
     "execute_chord_analysis": handle_execute_chord_analysis,
 }
@@ -1800,6 +2019,26 @@ def main() -> None:
                 "code": "UNKNOWN_COMMAND",
                 "message": f"Unknown command: {command}",
             })
+            continue
+
+        if command == "start_separation":
+            with _ACTIVE_TASK_LOCK:
+                active_running = _ACTIVE_TASK_THREAD is not None and _ACTIVE_TASK_THREAD.is_alive()
+            if active_running:
+                send_response(request_id, False, error={
+                    "code": "INVALID_STATE_TRANSITION",
+                    "message": "Another separation task is already running",
+                })
+                continue
+
+            thread = threading.Thread(
+                target=_run_start_separation_async,
+                args=(request_id, payload),
+                daemon=True,
+                name=f"start_separation_{request_id}",
+            )
+            _set_active_task_context(request_id, command, thread)
+            thread.start()
             continue
 
         try:

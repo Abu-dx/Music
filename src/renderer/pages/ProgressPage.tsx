@@ -28,7 +28,7 @@ export interface ProgressPageProps {
   onNavigateToHome: () => void;
   onNavigateToUpload: () => void;
   onNavigateToResult: (projectId: string) => void;
-  onCancel: (jobId?: string) => void;
+  onCancelSeparation: (jobId?: string) => Promise<void> | void;
 }
 
 // ============================================================================
@@ -42,7 +42,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
   onNavigateToHome,
   onNavigateToUpload,
   onNavigateToResult,
-  onCancel,
+  onCancelSeparation,
 }) => {
   const projectSnap = useSyncExternalStore(
     (cb) => projectStore.subscribe(cb),
@@ -219,11 +219,18 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
       {isRunning && (
         <div style={styles.actions}>
           <button
+            style={styles.homeButton}
+            onClick={onNavigateToHome}
+          >
+            返回主页
+          </button>
+          <button
             style={styles.cancelButton}
-            onClick={() => onCancel(jobSnap.currentJobId ?? undefined)}
+            onClick={() => { void onCancelSeparation(jobSnap.currentJobId ?? undefined); }}
           >
             取消分离
           </button>
+          <div style={styles.cancelHint}>取消分离会发送取消请求，后台可能需要少许时间停止。</div>
         </div>
       )}
     </div>
@@ -434,6 +441,10 @@ const styles: Record<string, React.CSSProperties> = {
   actions: {
     textAlign: 'center' as const,
     marginTop: '24px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: '8px',
   },
   cancelButton: {
     padding: '10px 24px',
@@ -443,6 +454,10 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #F44336',
     borderRadius: '6px',
     cursor: 'pointer',
+  },
+  cancelHint: {
+    fontSize: '12px',
+    color: '#777',
   },
 };
 
