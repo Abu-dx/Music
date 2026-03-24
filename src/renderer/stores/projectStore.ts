@@ -63,6 +63,13 @@ export interface IProjectElectronAPI {
    * 包含 elapsedMs / cacheHit / sourceTypeLabel 等结果页专属字段
    */
   getProjectResult(projectId: string): Promise<ProjectResultSummaryDTO | null>;
+  clearProjectCache?(projectId: string): Promise<{
+    succeededIds: string[];
+    failedItems: Array<{ projectId: string; error: { message?: string; userMessage?: string } }>;
+    allSuccess: boolean;
+    freedBytes: number;
+    elapsedMs: number;
+  }>;
 
   /**
    * 获取项目分轨列表（GPT R8 Must Fix #1�?
@@ -125,6 +132,7 @@ export interface IProjectStore {
   markProjectAccessed(projectId: string): Promise<void>;
   setActiveResult(projectId: string, resultSetId: string): Promise<void>;
   loadCacheStats(): Promise<void>;
+  clearProjectCache(projectId: string): Promise<void>;
   /** 加载结果摘要 + 分轨列表（GPT R8 Must Fix #1�?*/
   loadProjectResult(projectId: string): Promise<void>;
   openExistingProject(): Promise<{ projectId: string; displayName: string; stemCount: number } | null>;
@@ -234,6 +242,13 @@ export class ProjectStore implements IProjectStore {
       this.cacheStats = await this.api.getCacheStats() ?? null;
       this.notify();
     }
+  }
+
+  async clearProjectCache(projectId: string): Promise<void> {
+    if (!this.api.clearProjectCache) {
+      throw new Error('当前环境不支持清除项目缓存');
+    }
+    await this.api.clearProjectCache(projectId);
   }
 
   async loadProjectResult(projectId: string): Promise<void> {

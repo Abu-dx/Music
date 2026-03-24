@@ -16,7 +16,7 @@
  * - 项目卡片点击 → ProgressPage（如 Running）或 ProjectDetailPage（如 Ready）
  */
 
-import React, { useEffect, useSyncExternalStore } from 'react';
+import React, { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { IProjectStore } from '../stores/projectStore';
 
 // ============================================================================
@@ -74,6 +74,8 @@ export const HomePage: React.FC<HomePageProps> = ({
   );
   const cacheStatsReady = snapshot.cacheStats !== null;
   const cacheStatsLoading = !cacheStatsReady;
+  const [clearingFailedProjectId, setClearingFailedProjectId] = useState<string | null>(null);
+  const [clearFailedError, setClearFailedError] = useState<string | null>(null);
 
   // 首次加载
   useEffect(() => {
@@ -95,6 +97,22 @@ export const HomePage: React.FC<HomePageProps> = ({
       onNavigateToProject(project.id);
     }
   };
+
+  const handleClearFailedProject = useCallback(async (projectId: string) => {
+    try {
+      setClearingFailedProjectId(projectId);
+      setClearFailedError(null);
+      await store.clearProjectCache(projectId);
+      await Promise.all([
+        store.loadRecentProjects(20),
+        store.loadCacheStats(),
+      ]);
+    } catch (err) {
+      setClearFailedError(err instanceof Error ? err.message : '清除失败项目失败');
+    } finally {
+      setClearingFailedProjectId(null);
+    }
+  }, [store]);
 
   return (
     <div className="home-page" style={styles.container}>
@@ -122,6 +140,9 @@ export const HomePage: React.FC<HomePageProps> = ({
       {/* Loading */}
       {snapshot.isLoading && (
         <div style={styles.loading}>加载中...</div>
+      )}
+      {clearFailedError && (
+        <div style={styles.errorBanner}>{clearFailedError}</div>
       )}
 
       {/* 项目列表 */}
@@ -175,6 +196,18 @@ export const HomePage: React.FC<HomePageProps> = ({
                 >
                   {STATUS_LABELS[project.status] ?? project.status}
                 </span>
+                {project.status === 'failed' && (
+                  <button
+                    style={styles.clearFailedButton}
+                    disabled={clearingFailedProjectId === project.id}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleClearFailedProject(project.id);
+                    }}
+                  >
+                    {clearingFailedProjectId === project.id ? '清除中...' : '清除'}
+                  </button>
+                )}
               </div>
             </div>
           ))}
@@ -262,6 +295,15 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '40px',
     color: '#666',
   },
+  errorBanner: {
+    marginBottom: '12px',
+    padding: '8px 10px',
+    borderRadius: '6px',
+    border: '1px solid #ffb3b3',
+    color: '#b71c1c',
+    backgroundColor: '#fff3f3',
+    fontSize: '13px',
+  },
   empty: {
     textAlign: 'center' as const,
     padding: '60px 20px',
@@ -293,6 +335,9 @@ const styles: Record<string, React.CSSProperties> = {
   },
   cardRight: {
     marginLeft: '16px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
   },
   projectName: {
     fontSize: '15px',
@@ -310,5 +355,14 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: '4px',
     border: '1px solid',
     fontWeight: 500,
+  },
+  clearFailedButton: {
+    fontSize: '12px',
+    padding: '4px 8px',
+    borderRadius: '4px',
+    border: '1px solid #d32f2f',
+    backgroundColor: '#fff',
+    color: '#d32f2f',
+    cursor: 'pointer',
   },
 };

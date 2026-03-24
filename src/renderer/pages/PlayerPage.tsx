@@ -110,8 +110,22 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
   const [hasRequestedLoad, setHasRequestedLoad] = useState(false);
   const [projectMissing, setProjectMissing] = useState(false);
 
-  const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
+  const projectName =
+    projectSnap.projectResult?.displayName
+    ?? projectSnap.currentProject?.displayName
+    ?? '未命名项目';
   const activeResultId = projectSnap.projectResult?.activeResultId ?? 'main';
+  const activeResultStems = projectSnap.stems.filter(
+    (stem) => (stem.parentResultId ?? 'main') === activeResultId,
+  );
+  const sourceStem = activeResultStems.find((stem) =>
+    (typeof stem.modelId === 'string' && stem.modelId.trim().length > 0)
+    || (typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0),
+  ) ?? projectSnap.stems.find((stem) =>
+    (typeof stem.modelId === 'string' && stem.modelId.trim().length > 0)
+    || (typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0),
+  );
+  const currentModelSource = sourceStem?.modelId ?? sourceStem?.runtimeProfileId ?? 'unknown';
   const isPlayable = pbSnap.status === PlaybackStatus.Playing
     || pbSnap.status === PlaybackStatus.Paused
     || pbSnap.status === PlaybackStatus.Ended;
@@ -199,7 +213,12 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
         <button style={styles.backButton} onClick={() => onNavigateToResult(projectId)}>
           &larr; 结果页
         </button>
-        <h2 style={styles.title}>{projectName}</h2>
+        <div style={styles.titleWrap}>
+          <h2 style={styles.title}>{projectName}</h2>
+          <div style={styles.titleMeta}>
+            当前结果：{activeResultId} · 模型：{currentModelSource}
+          </div>
+        </div>
         <div style={styles.headerActions}>
           <button style={styles.openFileButton} onClick={handleOpenFile} title="打开项目目录">
             {'\u{1F4C2}'}
@@ -714,7 +733,18 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     margin: 0,
     color: '#1a1a1a',
+    lineHeight: 1.2,
+  },
+  titleWrap: {
     flex: 1,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: '2px',
+  },
+  titleMeta: {
+    fontSize: '12px',
+    color: '#666',
     textAlign: 'center' as const,
   },
   headerActions: {

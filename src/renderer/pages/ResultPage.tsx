@@ -723,7 +723,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
             )}
             {analysisSnap.analysisVersion && (
               <div style={styles.chordSummaryRow}>
-                <span style={styles.chordSummaryLabel}>引擎版本</span>
+                <span style={styles.chordSummaryLabel}>分析版本</span>
                 <span style={styles.chordSummaryValue}>{analysisSnap.analysisVersion}</span>
               </div>
             )}
