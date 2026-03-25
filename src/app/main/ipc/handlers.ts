@@ -136,6 +136,7 @@ type CachedChordAnalysisEntry = {
   sourceFilePath: string;
   sourceSignature: string;
   analysisVersion: string;
+  analysisMethodKey: string;
   cachedAt: number;
   result: CachedChordAnalysisDTO;
 };
@@ -157,11 +158,15 @@ const DEFAULT_CHORD_CACHE_PATH = 'chord/chord-analysis.json';
 const DEFAULT_ACTIVE_RESULT_ID = 'main';
 const DEFAULT_RESULT_MODEL_ID = 'demucs';
 const DEFAULT_RESULT_RUNTIME_PROFILE_ID = 'demucs_env_override';
+const DEFAULT_CHORD_ANALYZER_ID = 'chord_rule_chroma_v1';
+const DEFAULT_TEMPO_ANALYZER_ID = 'tempo_rule_onset_v2_pilot';
 const PILOT_MODEL_ID = 'htdemucs_6s';
 const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
 
 type ActiveResultContext = {
   activeResultId: string;
+  manifestActiveResultId: string | null;
+  fallbackReason: string | null;
   sourceSignature: string | null;
   resultSets: ProjectManifestResultSetEntry[];
   modelId: string | null;
@@ -428,6 +433,26 @@ function getChordAnalysisVersionHint(): string {
   return hint && hint.length > 0 ? hint : 'chord-v1';
 }
 
+function normalizeAnalyzerId(value: string | null | undefined, fallback: string): string {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return normalized.length > 0 ? normalized : fallback;
+}
+
+function buildAnalysisMethodKey(
+  analysisMethods: { chordAnalyzer: string; tempoAnalyzer: string } | null | undefined,
+): string | null {
+  if (!analysisMethods) return null;
+  const chordAnalyzer = normalizeAnalyzerId(analysisMethods.chordAnalyzer, DEFAULT_CHORD_ANALYZER_ID);
+  const tempoAnalyzer = normalizeAnalyzerId(analysisMethods.tempoAnalyzer, DEFAULT_TEMPO_ANALYZER_ID);
+  return `${chordAnalyzer}|${tempoAnalyzer}`;
+}
+
+function resolveExpectedAnalysisMethodKey(): string {
+  const chordAnalyzer = normalizeAnalyzerId(process.env.CHORD_ANALYZER, DEFAULT_CHORD_ANALYZER_ID);
+  const tempoAnalyzer = normalizeAnalyzerId(process.env.TEMPO_ANALYZER, DEFAULT_TEMPO_ANALYZER_ID);
+  return `${chordAnalyzer}|${tempoAnalyzer}`;
+}
+
 function getWaveformAnalysisVersionHint(): string {
   const hint = process.env.WAVEFORM_ANALYSIS_VERSION?.trim();
   return hint && hint.length > 0 ? hint : 'waveform-v1';
@@ -655,13 +680,13 @@ async function resolveActiveResultContext(
     ? fromManifest
     : fallbackActiveId;
   const activeSet = resultSets.find((entry) => entry.id === activeResultId) ?? null;
+  const fallbackReason = !hasManifestActiveMatch
+    ? (!hasManifestActive ? 'manifest_active_missing' : 'manifest_active_invalid')
+    : null;
   if (!hasManifestActiveMatch) {
-    const reason = !hasManifestActive
-      ? 'manifest_active_missing'
-      : 'manifest_active_invalid';
     console.warn(
       `[REAL_CHAIN] handlers.resolveActiveResultContext fallback projectId="${project.id}" ` +
-      `fromManifest="${fromManifest || 'none'}" resolved="${activeResultId}" reason="${reason}" hasMain=${hasMainResultSet}`,
+      `fromManifest="${fromManifest || 'none'}" resolved="${activeResultId}" reason="${fallbackReason}" hasMain=${hasMainResultSet}`,
     );
   }
 
@@ -680,6 +705,8 @@ async function resolveActiveResultContext(
 
   return {
     activeResultId,
+    manifestActiveResultId: fromManifest || null,
+    fallbackReason,
     sourceSignature: activeSet?.sourceSignature ?? null,
     resultSets,
     modelId: activeSet?.modelId ?? null,
@@ -692,8 +719,9 @@ function buildChordAnalysisCacheKey(
   parentResultId: string,
   sourceSignature: string,
   analysisVersion: string,
+  analysisMethodKey: string,
 ): string {
-  return `${projectId}::${parentResultId}::${sourceSignature}::${analysisVersion}`;
+  return `${projectId}::${parentResultId}::${sourceSignature}::${analysisVersion}::${analysisMethodKey}`;
 }
 
 function buildWaveformCacheKey(
@@ -846,6 +874,7 @@ function normalizePersistedChordSegments(raw: unknown): CachedChordSegmentDTO[] 
 async function loadPersistedChordResult(
   project: Project,
   expectedAnalysisVersion: string,
+  expectedAnalysisMethodKey: string,
   parentResultId: string,
   sourceSignature: string | null,
 ): Promise<CachedChordAnalysisDTO | null> {
@@ -868,6 +897,10 @@ async function loadPersistedChordResult(
   if (persistedParentResultId && persistedParentResultId !== parentResultId) return null;
   if (!persistedParentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
 
+  if (chordRef.analysisMethodKey && chordRef.analysisMethodKey !== expectedAnalysisMethodKey) {
+    return null;
+  }
+
   const segments = normalizePersistedChordSegments(raw.segments);
   if (!Array.isArray(raw.segments)) return null;
 
@@ -887,6 +920,28 @@ async function loadPersistedChordResult(
   const rawTempo = isObjectLike(raw.tempo) ? raw.tempo : null;
   const rawAnalysisMethods = isObjectLike(raw.analysisMethods) ? raw.analysisMethods : null;
   const rawChordVocabulary = isObjectLike(raw.chordVocabulary) ? raw.chordVocabulary : null;
+  const rawAnalysisMethodsRecord = rawAnalysisMethods as Record<string, unknown> | null;
+  const persistedAnalysisMethodKey =
+    (typeof raw.analysisMethodKey === 'string' && raw.analysisMethodKey.trim().length > 0
+      ? raw.analysisMethodKey.trim()
+      : null)
+    ?? buildAnalysisMethodKey(
+      rawAnalysisMethodsRecord
+        ? {
+          chordAnalyzer:
+            typeof rawAnalysisMethodsRecord.chordAnalyzer === 'string'
+              ? rawAnalysisMethodsRecord.chordAnalyzer
+              : DEFAULT_CHORD_ANALYZER_ID,
+          tempoAnalyzer:
+            typeof rawAnalysisMethodsRecord.tempoAnalyzer === 'string'
+              ? rawAnalysisMethodsRecord.tempoAnalyzer
+              : DEFAULT_TEMPO_ANALYZER_ID,
+        }
+        : null,
+    );
+  if (!persistedAnalysisMethodKey || persistedAnalysisMethodKey !== expectedAnalysisMethodKey) {
+    return null;
+  }
 
   const tempo = rawTempo
     ? {
@@ -973,6 +1028,7 @@ async function persistChordResult(
   chordResult: CachedChordAnalysisDTO,
   parentResultId: string,
   sourceSignature: string | null,
+  analysisMethodKey: string,
 ): Promise<void> {
   const refs = await readManifestAnalysisRefs(project.cacheDir);
   const chordPath = refs?.chordAnalysis?.path ?? DEFAULT_CHORD_CACHE_PATH;
@@ -990,6 +1046,7 @@ async function persistChordResult(
     parentResultId,
     analysisVersion,
     vocabularyVersion,
+    analysisMethodKey,
     segmentCount: chordResult.segments.length,
     sourceSignature,
     generatedAt: chordResult.generatedAt ?? Date.now(),
@@ -999,6 +1056,7 @@ async function persistChordResult(
       path: chordPath,
       analysisVersion,
       vocabularyVersion,
+      analysisMethodKey,
       parentResultId,
       sourceSignature: sourceSignature ?? undefined,
     },
@@ -2181,7 +2239,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
     console.log(
-      `[REAL_CHAIN] handlers.project:getResult active_context projectId="${projectId}" resultSetCount=${activeResultContext.resultSets.length} activeFromManifest="${activeResultContext.activeResultId}" activeResolved="${activeResultContext.activeResultId}"`,
+      `[REAL_CHAIN] handlers.project:getResult active_context projectId="${projectId}" resultSetCount=${activeResultContext.resultSets.length} ` +
+      `activeFromManifest="${activeResultContext.manifestActiveResultId ?? 'none'}" ` +
+      `activeResolved="${activeResultContext.activeResultId}" fallbackReason="${activeResultContext.fallbackReason ?? 'none'}"`,
     );
 
     const isRealSeparation = project.status === ProjectStatus.Ready && stems.length > 0;
@@ -2239,7 +2299,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
     console.log(
-      `[REAL_CHAIN] handlers.project:getStems repo_result projectId="${projectId}" activeResultId="${activeResultContext.activeResultId}" allStemsCount=${allStems.length} filteredStemsCount=${stems.length}`,
+      `[REAL_CHAIN] handlers.project:getStems repo_result projectId="${projectId}" activeResultId="${activeResultContext.activeResultId}" ` +
+      `activeFromManifest="${activeResultContext.manifestActiveResultId ?? 'none'}" fallbackReason="${activeResultContext.fallbackReason ?? 'none'}" ` +
+      `allStemsCount=${allStems.length} filteredStemsCount=${stems.length}`,
     );
 
     if (stems.length > 0) {
@@ -2530,12 +2592,14 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     );
 
     const expectedAnalysisVersion = getChordAnalysisVersionHint();
+    const expectedAnalysisMethodKey = resolveExpectedAnalysisMethodKey();
     const cached = chordAnalysisResultCache.get(projectId);
     if (cached && sourceSignature) {
       const cacheHit =
         cached.parentResultId === parentResultId
         && cached.sourceSignature === sourceSignature
-        && cached.analysisVersion === expectedAnalysisVersion;
+        && cached.analysisVersion === expectedAnalysisVersion
+        && cached.analysisMethodKey === expectedAnalysisMethodKey;
       if (cacheHit) {
         const cachedResult = cached.result;
         console.log(
@@ -2548,7 +2612,8 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       }
       console.log(
         `[REAL_CHAIN] handlers.project:getChordAnalysis cache_miss projectId="${projectId}" ` +
-        `reason="signature_or_version_changed" cachedVersion="${cached.analysisVersion}" expectedVersion="${expectedAnalysisVersion}"`,
+        `reason="signature_or_version_or_method_changed" cachedVersion="${cached.analysisVersion}" expectedVersion="${expectedAnalysisVersion}" ` +
+        `cachedMethod="${cached.analysisMethodKey}" expectedMethod="${expectedAnalysisMethodKey}"`,
       );
     } else if (!sourceSignature) {
       console.log(
@@ -2560,17 +2625,25 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const persistedChord = await loadPersistedChordResult(
       project,
       expectedAnalysisVersion,
+      expectedAnalysisMethodKey,
       parentResultId,
       sourceSignature,
     );
     if (persistedChord) {
       if (sourceSignature) {
         chordAnalysisResultCache.set(projectId, {
-          cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, expectedAnalysisVersion),
+          cacheKey: buildChordAnalysisCacheKey(
+            projectId,
+            parentResultId,
+            sourceSignature,
+            expectedAnalysisVersion,
+            expectedAnalysisMethodKey,
+          ),
           parentResultId,
           sourceFilePath,
           sourceSignature,
           analysisVersion: expectedAnalysisVersion,
+          analysisMethodKey: expectedAnalysisMethodKey,
           cachedAt: Date.now(),
           result: persistedChord,
         });
@@ -2587,7 +2660,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         `[REAL_CHAIN] handlers.project:getChordAnalysis miss projectId="${projectId}" ` +
         'reason="worker_not_ready"',
       );
-      if (cached && cached.parentResultId === parentResultId) {
+      if (
+        cached
+        && cached.parentResultId === parentResultId
+        && cached.analysisMethodKey === expectedAnalysisMethodKey
+      ) {
         console.log(
           `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache projectId="${projectId}"`,
         );
@@ -2777,19 +2854,34 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       }
 
       const resolvedAnalysisVersion = chordResult.analysisVersion ?? expectedAnalysisVersion;
+      const resolvedAnalysisMethodKey =
+        buildAnalysisMethodKey(chordResult.analysisMethods) ?? expectedAnalysisMethodKey;
       if (sourceSignature) {
         chordAnalysisResultCache.set(projectId, {
-          cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, resolvedAnalysisVersion),
+          cacheKey: buildChordAnalysisCacheKey(
+            projectId,
+            parentResultId,
+            sourceSignature,
+            resolvedAnalysisVersion,
+            resolvedAnalysisMethodKey,
+          ),
           parentResultId,
           sourceFilePath,
           sourceSignature,
           analysisVersion: resolvedAnalysisVersion,
+          analysisMethodKey: resolvedAnalysisMethodKey,
           cachedAt: Date.now(),
           result: chordResult,
         });
       }
       try {
-        await persistChordResult(project, chordResult, parentResultId, sourceSignature);
+        await persistChordResult(
+          project,
+          chordResult,
+          parentResultId,
+          sourceSignature,
+          resolvedAnalysisMethodKey,
+        );
       } catch {
         // analysis cache write failure should not break chord query
       }
@@ -2805,7 +2897,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       console.warn(
         `[Analysis] getChordAnalysis unavailable. projectId=${projectId}, reason=${warning}`,
       );
-      if (cached && cached.parentResultId === parentResultId) {
+      if (
+        cached
+        && cached.parentResultId === parentResultId
+        && cached.analysisMethodKey === expectedAnalysisMethodKey
+      ) {
         console.log(
           `[REAL_CHAIN] handlers.project:getChordAnalysis return_stale_cache_on_error projectId="${projectId}"`,
         );

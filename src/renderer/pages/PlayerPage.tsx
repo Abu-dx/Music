@@ -118,6 +118,8 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
     (stem) => (stem.parentResultId?.trim() || 'main') === activeResultId,
   ) ?? projectSnap.stems[0];
   const activeResultModelLabel = activeStem?.modelId ?? activeStem?.runtimeProfileId ?? 'unknown';
+  const isActivePilotResult = activeResultId.startsWith('pilot_');
+  const activeResultKindLabel = isActivePilotResult ? '实验结果集' : '主线结果集';
   const isPlayable = pbSnap.status === PlaybackStatus.Playing
     || pbSnap.status === PlaybackStatus.Paused
     || pbSnap.status === PlaybackStatus.Ended;
@@ -208,7 +210,7 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
         <div style={styles.headerTitleBlock}>
           <h2 style={styles.title}>{projectName}</h2>
           <div style={styles.resultMeta}>
-            当前结果：{activeResultId} · 模型：{activeResultModelLabel}
+            当前结果：{activeResultId}（{activeResultKindLabel}） · 模型：{activeResultModelLabel}
           </div>
         </div>
         <div style={styles.headerActions}>
@@ -220,6 +222,11 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
           </button>
         </div>
       </div>
+      {isActivePilotResult && (
+        <div style={styles.resultScopeHint}>
+          当前正在播放 pilot 实验结果；main 主线结果仍保留，默认主线仍为 main。
+        </div>
+      )}
 
       {/* mock 数据提示 */}
       {analysisSnap.source === 'mock_stub' && (
@@ -734,6 +741,15 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: '4px',
     fontSize: '12px',
     color: '#6a6a6a',
+  },
+  resultScopeHint: {
+    marginBottom: '12px',
+    padding: '8px 10px',
+    fontSize: '12px',
+    color: '#5d4037',
+    backgroundColor: '#fff8e1',
+    border: '1px solid #ffe082',
+    borderRadius: '6px',
   },
   headerActions: {
     display: 'flex',

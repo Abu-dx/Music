@@ -12,6 +12,7 @@ export interface ManifestChordAnalysisRef {
   path: string;
   analysisVersion: string;
   vocabularyVersion: string;
+  analysisMethodKey?: string;
   parentResultId?: string;
   sourceSignature?: string;
 }
@@ -96,6 +97,10 @@ function readChordRef(manifest: Record<string, unknown>): ManifestChordAnalysisR
     typeof chordAnalysis.parentResultId === 'string' && chordAnalysis.parentResultId.trim().length > 0
       ? chordAnalysis.parentResultId.trim()
       : undefined;
+  const analysisMethodKey =
+    typeof chordAnalysis.analysisMethodKey === 'string' && chordAnalysis.analysisMethodKey.trim().length > 0
+      ? chordAnalysis.analysisMethodKey.trim()
+      : undefined;
   const sourceSignature =
     typeof chordAnalysis.sourceSignature === 'string' && chordAnalysis.sourceSignature.trim().length > 0
       ? chordAnalysis.sourceSignature.trim()
@@ -104,6 +109,7 @@ function readChordRef(manifest: Record<string, unknown>): ManifestChordAnalysisR
     path: chordAnalysis.path.trim(),
     analysisVersion: chordAnalysis.analysisVersion.trim(),
     vocabularyVersion: chordAnalysis.vocabularyVersion.trim(),
+    analysisMethodKey,
     parentResultId,
     sourceSignature,
   };

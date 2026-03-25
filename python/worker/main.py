@@ -54,9 +54,12 @@ ENV_ANALYSIS_RUNTIME_PROFILE = "ANALYSIS_RUNTIME_PROFILE"
 ENV_STEM_ROUTING_CONFIG_JSON = "STEM_ROUTING_CONFIG_JSON"
 ENV_CHORD_ANALYZER = "CHORD_ANALYZER"
 ENV_TEMPO_ANALYZER = "TEMPO_ANALYZER"
+ENV_ANALYZER_STRICT_MODE = "ANALYZER_STRICT_MODE"
 
 DEFAULT_CHORD_ANALYZER_ID = "chord_rule_chroma_v1"
-DEFAULT_TEMPO_ANALYZER_ID = "tempo_rule_onset_v1"
+LEGACY_TEMPO_ANALYZER_ID = "tempo_rule_onset_v1"
+PILOT_TEMPO_ANALYZER_ID = "tempo_rule_onset_v2_pilot"
+DEFAULT_TEMPO_ANALYZER_ID = PILOT_TEMPO_ANALYZER_ID
 DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID = "analysis_default"
 DEFAULT_DEMUCS_RUNTIME_PROFILE_ID = "demucs_env_override"
 PILOT_DEMUCS_RUNTIME_PROFILE_ID = "demucs_6s_pilot"
@@ -81,6 +84,24 @@ CHORD_MIN_SEGMENT_MS = 160
 CHORD_MERGE_THRESHOLD_MS = 220
 CHORD_DEJITTER_CONFIDENCE_MAX = 0.45
 CHORD_SHORT_SEGMENT_CONFIDENCE_MAX = 0.60
+
+
+class AnalyzerSelectionError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        analyzer_type: str,
+        requested_id: str,
+        available_ids: List[str],
+        strict_mode: bool,
+    ) -> None:
+        self.analyzer_type = analyzer_type
+        self.requested_id = requested_id
+        self.available_ids = available_ids
+        self.strict_mode = strict_mode
+        super().__init__(
+            f"{analyzer_type} analyzer not configured: requested={requested_id}, available={','.join(available_ids)}"
+        )
 
 
 def log(level: str, message: str) -> None:
@@ -110,6 +131,26 @@ def send_event(event_name: str, payload: dict) -> None:
         "payload": payload,
     }
     print(json.dumps(msg, ensure_ascii=False), flush=True)
+
+
+def _is_analyzer_strict_mode_enabled() -> bool:
+    raw = os.environ.get(ENV_ANALYZER_STRICT_MODE, "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _validate_tempo_analysis_result(payload: Any) -> Tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "tempo_result_not_dict"
+    tempo_payload = payload.get("tempo")
+    if not isinstance(tempo_payload, dict):
+        return False, "tempo_payload_missing"
+    method = tempo_payload.get("method")
+    if not isinstance(method, str) or not method.strip():
+        return False, "tempo_method_missing"
+    candidates = tempo_payload.get("candidates")
+    if candidates is None or not isinstance(candidates, list):
+        return False, "tempo_candidates_missing"
+    return True, "ok"
 
 
 def handle_health_check(request_id: str, payload: dict) -> None:
@@ -754,8 +795,8 @@ class DefaultChordAnalyzer:
         }
 
 
-class DefaultTempoAnalyzer:
-    analyzer_id = DEFAULT_TEMPO_ANALYZER_ID
+class LegacyTempoAnalyzer:
+    analyzer_id = LEGACY_TEMPO_ANALYZER_ID
     analyzer_type = "rule_based"
     runtime_profile_id = DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID
 
@@ -832,19 +873,127 @@ class DefaultTempoAnalyzer:
         }
 
 
+class PilotTempoAnalyzer:
+    analyzer_id = PILOT_TEMPO_ANALYZER_ID
+    analyzer_type = "rule_based"
+    runtime_profile_id = DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID
+
+    def analyze(
+        self,
+        *,
+        bpm_candidate: Optional[float],
+        bpm_stable: bool,
+        backend_method: str,
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+        candidates: List[Dict[str, Any]] = []
+        ambiguity = {
+            "isAmbiguous": False,
+            "halfTimeBpm": None,
+            "doubleTimeBpm": None,
+            "reason": "",
+        }
+
+        primary: Optional[float] = None
+        confidence: Optional[float] = None
+        if bpm_candidate is not None and 40.0 <= bpm_candidate <= 240.0:
+            candidate = float(bpm_candidate)
+            half_bpm = candidate / 2.0
+            double_bpm = candidate * 2.0
+
+            # Pilot heuristic:
+            # prefer 70~150 BPM window when confidence is unstable to reduce倍频误判.
+            if not bpm_stable and 70.0 <= half_bpm <= 150.0:
+                primary = half_bpm
+                ambiguity["isAmbiguous"] = True
+                ambiguity["reason"] = "pilot_half_time_preferred_for_unstable_tempo"
+                warnings.append("Pilot tempo analyzer: 不稳定节拍已优先选择 half-time 候选")
+            elif 70.0 <= candidate <= 150.0:
+                primary = candidate
+            elif 70.0 <= half_bpm <= 150.0:
+                primary = half_bpm
+                ambiguity["isAmbiguous"] = True
+                ambiguity["reason"] = "pilot_half_time_window_fit"
+            elif 70.0 <= double_bpm <= 150.0:
+                primary = double_bpm
+                ambiguity["isAmbiguous"] = True
+                ambiguity["reason"] = "pilot_double_time_window_fit"
+            else:
+                primary = candidate
+
+            confidence = 0.76 if bpm_stable else 0.40
+            candidates.append({
+                "bpm": candidate,
+                "confidence": 0.74 if bpm_stable else 0.38,
+                "relation": "detected",
+                "method": self.analyzer_id,
+            })
+            if 40.0 <= half_bpm <= 240.0:
+                ambiguity["halfTimeBpm"] = half_bpm
+                candidates.append({
+                    "bpm": half_bpm,
+                    "confidence": max(0.05, (confidence or 0.3) * 0.72),
+                    "relation": "half_time",
+                    "method": self.analyzer_id,
+                })
+            if 40.0 <= double_bpm <= 240.0:
+                ambiguity["doubleTimeBpm"] = double_bpm
+                candidates.append({
+                    "bpm": double_bpm,
+                    "confidence": max(0.05, (confidence or 0.3) * 0.66),
+                    "relation": "double_time",
+                    "method": self.analyzer_id,
+                })
+            if ambiguity["isAmbiguous"] and not ambiguity["reason"]:
+                ambiguity["reason"] = "tempo_instability_detected"
+        elif bpm_candidate is not None:
+            warnings.append("BPM 超出有效范围，已隐藏该字段")
+        else:
+            warnings.append("未检测到稳定 BPM，已隐藏该字段")
+
+        tempo_payload = {
+            "primaryBpm": primary,
+            "confidence": confidence,
+            "method": f"{self.analyzer_id}:{backend_method}",
+            "candidates": candidates,
+            "ambiguity": ambiguity,
+        }
+        return {
+            "tempo": tempo_payload,
+            "estimatedBpm": primary,
+            "warnings": warnings,
+        }
+
+
 CHORD_ANALYZER_REGISTRY: Dict[str, ChordAnalyzer] = {
     DEFAULT_CHORD_ANALYZER_ID: DefaultChordAnalyzer(),
 }
 
 TEMPO_ANALYZER_REGISTRY: Dict[str, TempoAnalyzer] = {
-    DEFAULT_TEMPO_ANALYZER_ID: DefaultTempoAnalyzer(),
+    LEGACY_TEMPO_ANALYZER_ID: LegacyTempoAnalyzer(),
+    PILOT_TEMPO_ANALYZER_ID: PilotTempoAnalyzer(),
 }
 
 
 def select_chord_analyzer(request_id: str) -> ChordAnalyzer:
-    requested = os.environ.get(ENV_CHORD_ANALYZER, DEFAULT_CHORD_ANALYZER_ID).strip().lower()
+    requested_raw = os.environ.get(ENV_CHORD_ANALYZER, "").strip().lower()
+    requested = requested_raw or DEFAULT_CHORD_ANALYZER_ID
     analyzer = CHORD_ANALYZER_REGISTRY.get(requested)
     if analyzer is None:
+        strict_mode = _is_analyzer_strict_mode_enabled()
+        available_ids = sorted(CHORD_ANALYZER_REGISTRY.keys())
+        if strict_mode:
+            log(
+                "ERROR",
+                f"[REAL_CHAIN] execute_chord_analysis invalid_chord_analyzer_strict request_id={request_id} "
+                f"requested={requested} available={','.join(available_ids)}",
+            )
+            raise AnalyzerSelectionError(
+                analyzer_type="chord",
+                requested_id=requested,
+                available_ids=available_ids,
+                strict_mode=True,
+            )
         log(
             "WARN",
             f"[REAL_CHAIN] execute_chord_analysis invalid_chord_analyzer request_id={request_id} "
@@ -855,9 +1004,24 @@ def select_chord_analyzer(request_id: str) -> ChordAnalyzer:
 
 
 def select_tempo_analyzer(request_id: str) -> TempoAnalyzer:
-    requested = os.environ.get(ENV_TEMPO_ANALYZER, DEFAULT_TEMPO_ANALYZER_ID).strip().lower()
+    requested_raw = os.environ.get(ENV_TEMPO_ANALYZER, "").strip().lower()
+    requested = requested_raw or DEFAULT_TEMPO_ANALYZER_ID
     analyzer = TEMPO_ANALYZER_REGISTRY.get(requested)
     if analyzer is None:
+        strict_mode = _is_analyzer_strict_mode_enabled()
+        available_ids = sorted(TEMPO_ANALYZER_REGISTRY.keys())
+        if strict_mode:
+            log(
+                "ERROR",
+                f"[REAL_CHAIN] execute_chord_analysis invalid_tempo_analyzer_strict request_id={request_id} "
+                f"requested={requested} available={','.join(available_ids)}",
+            )
+            raise AnalyzerSelectionError(
+                analyzer_type="tempo",
+                requested_id=requested,
+                available_ids=available_ids,
+                strict_mode=True,
+            )
         log(
             "WARN",
             f"[REAL_CHAIN] execute_chord_analysis invalid_tempo_analyzer request_id={request_id} "
@@ -1098,10 +1262,26 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
     try:
         warnings: List[str] = []
         hop_length = 512
-        chord_analyzer = select_chord_analyzer(request_id)
-        tempo_analyzer = select_tempo_analyzer(request_id)
-        tempo_backend_method = "unknown"
         analysis_runtime_override = os.environ.get(ENV_ANALYSIS_RUNTIME_PROFILE, "").strip()
+        try:
+            chord_analyzer = select_chord_analyzer(request_id)
+            tempo_analyzer = select_tempo_analyzer(request_id)
+        except AnalyzerSelectionError as selection_error:
+            runtime_hint = analysis_runtime_override or DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID
+            send_response(request_id, False, error={
+                "code": "ANALYZER_SELECTION_FAILED",
+                "message": (
+                    "Analyzer selection failed: "
+                    f"type={selection_error.analyzer_type}, "
+                    f"requested={selection_error.requested_id}, "
+                    f"strict_mode={str(selection_error.strict_mode).lower()}, "
+                    f"runtime_profile={runtime_hint}, "
+                    f"available={','.join(selection_error.available_ids)}"
+                ),
+            })
+            return
+
+        tempo_backend_method = "unknown"
         chord_runtime_requested = analysis_runtime_override or chord_analyzer.runtime_profile_id
         tempo_runtime_requested = analysis_runtime_override or tempo_analyzer.runtime_profile_id
         chord_runtime = _resolve_runtime_profile(
@@ -1219,6 +1399,16 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
             bpm_stable=bpm_stable,
             backend_method=tempo_backend_method,
         )
+        tempo_result_valid, tempo_result_reason = _validate_tempo_analysis_result(tempo_result)
+        if not tempo_result_valid:
+            send_response(request_id, False, error={
+                "code": "ANALYSIS_TEMPO_RESULT_EMPTY",
+                "message": (
+                    f"Tempo analyzer returned invalid/empty payload: analyzer={tempo_analyzer.analyzer_id}, "
+                    f"runtime_profile={tempo_runtime.actual_profile_id}, reason={tempo_result_reason}"
+                ),
+            })
+            return
         normalized_bpm = tempo_result.get("estimatedBpm")
         warnings.extend(tempo_result.get("warnings", []))
 

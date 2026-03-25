@@ -179,6 +179,20 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     ?? projectResultWithMeta?.activeResultRuntimeProfileId
     ?? activeStem?.runtimeProfileId
     ?? 'unknown';
+  const isActivePilotResult = activeResultId.startsWith('pilot_');
+  const activeResultKindLabel = isActivePilotResult ? '实验结果集' : '主线结果集';
+  const tempoAnalyzerId = analysisSnap.chordResult?.analysisMethods?.tempoAnalyzer ?? 'unknown';
+  const tempoMethod = analysisSnap.chordResult?.tempo?.method ?? null;
+  const tempoConfidence = analysisSnap.chordResult?.tempo?.confidence;
+  const tempoAmbiguity = analysisSnap.chordResult?.tempo?.ambiguity;
+  const tempoAmbiguityText = tempoAmbiguity
+    ? [
+      tempoAmbiguity.isAmbiguous ? 'ambiguous' : 'stable',
+      tempoAmbiguity.reason ? `reason=${tempoAmbiguity.reason}` : '',
+      typeof tempoAmbiguity.halfTimeBpm === 'number' ? `half=${Math.round(tempoAmbiguity.halfTimeBpm)}` : '',
+      typeof tempoAmbiguity.doubleTimeBpm === 'number' ? `double=${Math.round(tempoAmbiguity.doubleTimeBpm)}` : '',
+    ].filter((item) => item.length > 0).join(' | ')
+    : 'none';
 
   useEffect(() => {
     accessMarkedRef.current = false;
@@ -538,7 +552,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
                 {headerTrackCount} 轨 {' · '}
                 {formatSize(projectResult.totalSizeBytes)}
                 {' · '}
-                当前结果 {activeResultId} · 模型 {activeResultModelLabel}
+                当前结果 {activeResultId}（{activeResultKindLabel}）· 模型 {activeResultModelLabel}
                 {projectResult.durationMs != null && (
                   <> · {formatDuration(projectResult.durationMs)}</>
                 )}
@@ -591,6 +605,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
               {availableResultSets.map((entry) => (
                 <option key={entry.id} value={entry.id}>
                   {entry.id}
+                  {entry.id.startsWith('pilot_') ? '（实验）' : '（主线）'}
                 </option>
               ))}
             </select>
@@ -642,6 +657,11 @@ export const ResultPage: React.FC<ResultPageProps> = ({
       )}
       {pilotInfo && (
         <div style={styles.inlineInfo}>{pilotInfo}</div>
+      )}
+      {isActivePilotResult && (
+        <div style={styles.resultScopeHint}>
+          当前正在查看 pilot 实验结果；main 主线结果仍保留，默认主线仍为 main。
+        </div>
       )}
 
       {/* === 已生成轨道 === */}
@@ -764,6 +784,26 @@ export const ResultPage: React.FC<ResultPageProps> = ({
                 </span>
               </div>
             )}
+            <div style={styles.chordSummaryRow}>
+              <span style={styles.chordSummaryLabel}>Tempo Analyzer</span>
+              <span style={styles.chordSummaryValue}>{tempoAnalyzerId}</span>
+            </div>
+            {tempoMethod && (
+              <div style={styles.chordSummaryRow}>
+                <span style={styles.chordSummaryLabel}>Tempo Method</span>
+                <span style={styles.chordSummaryValue}>{tempoMethod}</span>
+              </div>
+            )}
+            {typeof tempoConfidence === 'number' && (
+              <div style={styles.chordSummaryRow}>
+                <span style={styles.chordSummaryLabel}>Tempo Confidence</span>
+                <span style={styles.chordSummaryValue}>{tempoConfidence.toFixed(2)}</span>
+              </div>
+            )}
+            <div style={styles.chordSummaryRow}>
+              <span style={styles.chordSummaryLabel}>Tempo Ambiguity</span>
+              <span style={styles.chordSummaryValue}>{tempoAmbiguityText}</span>
+            </div>
             {analysisSnap.source && (
               <div style={styles.chordSummaryRow}>
                 <span style={styles.chordSummaryLabel}>分析来源</span>
@@ -1176,6 +1216,15 @@ const styles: Record<string, React.CSSProperties> = {
   inlineInfo: {
     fontSize: '13px',
     color: '#2e7d32',
+    marginBottom: '12px',
+  },
+  resultScopeHint: {
+    fontSize: '12px',
+    color: '#5d4037',
+    backgroundColor: '#fff8e1',
+    border: '1px solid #ffe082',
+    borderRadius: '6px',
+    padding: '8px 10px',
     marginBottom: '12px',
   },
   experimentalHint: {
