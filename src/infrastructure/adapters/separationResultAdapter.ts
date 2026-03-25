@@ -70,6 +70,7 @@ export interface SeparationProvenanceContext {
  *
  * 鎵€鏈?stem 鐨?manifest relativePath 閮戒互姝や负鍓嶇紑銆? */
 const STEMS_RELATIVE_DIR = 'stems';
+const RESULT_ROOT_RELATIVE_DIR = 'results';
 
 // ============================================================================
 // 3. 閫傞厤缁撴灉绫诲瀷
@@ -198,7 +199,12 @@ export class SeparationResultAdapter implements ISeparationResultAdapter {
       detectedTypes.add(stemType);
 
       // 鐢熸垚 relativePath锛堢洰褰曠害瀹氶泦涓鐞嗭級
-      const relativePath = `${STEMS_RELATIVE_DIR}/${rawStem.filename}`;
+      const relativePath = path.posix.join(
+        RESULT_ROOT_RELATIVE_DIR,
+        parentResultId,
+        STEMS_RELATIVE_DIR,
+        rawStem.filename,
+      );
 
       // 鐢熸垚 filePath 缁濆璺緞锛圙PT R7 Decision #3锛氫娇鐢?path.join锛?
       const filePath = path.join(projectDir, relativePath);

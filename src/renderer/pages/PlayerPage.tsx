@@ -110,7 +110,14 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
   const [hasRequestedLoad, setHasRequestedLoad] = useState(false);
   const [projectMissing, setProjectMissing] = useState(false);
 
-  const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
+  const projectName = projectSnap.projectResult?.displayName
+    ?? projectSnap.currentProject?.displayName
+    ?? '未命名项目';
+  const activeResultId = projectSnap.projectResult?.activeResultId?.trim() || 'main';
+  const activeStem = projectSnap.stems.find(
+    (stem) => (stem.parentResultId?.trim() || 'main') === activeResultId,
+  ) ?? projectSnap.stems[0];
+  const activeResultModelLabel = activeStem?.modelId ?? activeStem?.runtimeProfileId ?? 'unknown';
   const isPlayable = pbSnap.status === PlaybackStatus.Playing
     || pbSnap.status === PlaybackStatus.Paused
     || pbSnap.status === PlaybackStatus.Ended;
@@ -198,7 +205,12 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
         <button style={styles.backButton} onClick={() => onNavigateToResult(projectId)}>
           &larr; 结果页
         </button>
-        <h2 style={styles.title}>{projectName}</h2>
+        <div style={styles.headerTitleBlock}>
+          <h2 style={styles.title}>{projectName}</h2>
+          <div style={styles.resultMeta}>
+            当前结果：{activeResultId} · 模型：{activeResultModelLabel}
+          </div>
+        </div>
         <div style={styles.headerActions}>
           <button style={styles.openFileButton} onClick={handleOpenFile} title="打开项目目录">
             {'\u{1F4C2}'}
@@ -388,7 +400,7 @@ export const PlayerPage: React.FC<PlayerPageProps> = ({
           />
         ))}
         {pbSnap.stemControls.length === 0 && (
-          <div style={styles.emptyTracks}>未加载轨道</div>
+          <div style={styles.emptyTracks}>当前结果集暂无可读轨道</div>
         )}
       </div>
     </div>
@@ -694,8 +706,13 @@ const styles: Record<string, React.CSSProperties> = {
   header: {
     display: 'flex',
     justifyContent: 'space-between',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     marginBottom: '20px',
+  },
+  headerTitleBlock: {
+    flex: 1,
+    minWidth: 0,
+    margin: '0 10px',
   },
   backButton: {
     padding: '6px 12px',
@@ -711,8 +728,12 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     margin: 0,
     color: '#1a1a1a',
-    flex: 1,
-    textAlign: 'center' as const,
+    textAlign: 'left' as const,
+  },
+  resultMeta: {
+    marginTop: '4px',
+    fontSize: '12px',
+    color: '#6a6a6a',
   },
   headerActions: {
     display: 'flex',

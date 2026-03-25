@@ -270,9 +270,11 @@ export class ParseJobService implements IParseJobService {
       const effectiveRuntimeProfileOverride = (params.runtimeProfileIdOverride?.trim().length ?? 0) > 0
         ? params.runtimeProfileIdOverride!.trim()
         : (isPilotResultSet ? PILOT_RUNTIME_PROFILE_ID : '');
+      const separationOutputDir = path.join(params.projectDir, 'results', resultSetId);
+      await fs.promises.mkdir(separationOutputDir, { recursive: true });
       const separationPayload = {
         filePath: params.sourceFilePath,
-        outputDir: params.projectDir,
+        outputDir: separationOutputDir,
         ...(effectiveWorkerModelOverride
           ? { modelName: effectiveWorkerModelOverride }
           : {}),
@@ -281,7 +283,7 @@ export class ParseJobService implements IParseJobService {
           : {}),
       };
       console.log(
-        `[REAL_CHAIN] parseJobService.startSeparation overrides jobId="${jobId}" projectId="${params.projectId}" resultSetId="${resultSetId}" modelOverride="${effectiveWorkerModelOverride || 'none'}" runtimeProfileOverride="${effectiveRuntimeProfileOverride || 'none'}"`,
+        `[REAL_CHAIN] parseJobService.startSeparation overrides jobId="${jobId}" projectId="${params.projectId}" resultSetId="${resultSetId}" modelOverride="${effectiveWorkerModelOverride || 'none'}" runtimeProfileOverride="${effectiveRuntimeProfileOverride || 'none'}" outputDir="${separationOutputDir}"`,
       );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation send_before jobId="${jobId}" projectId="${params.projectId}" payload=${JSON.stringify(separationPayload)}`);
       const response = await this.ipcBridge.send(

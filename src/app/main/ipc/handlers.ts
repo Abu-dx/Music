@@ -163,6 +163,9 @@ const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
 type ActiveResultContext = {
   activeResultId: string;
   sourceSignature: string | null;
+  resultSets: ProjectManifestResultSetEntry[];
+  modelId: string | null;
+  runtimeProfileId: string | null;
 };
 
 function normalizeParentResultId(value: string | null | undefined): string {
@@ -531,11 +534,23 @@ async function resolveActiveResultContext(
     ? normalizedSets
     : (fallbackSet ? [fallbackSet] : []);
 
-  const fallbackActiveId = resultSets[0]?.id ?? DEFAULT_ACTIVE_RESULT_ID;
-  const activeResultId = (fromManifest && resultSets.some((entry) => entry.id === fromManifest))
+  const hasMainResultSet = resultSets.some((entry) => entry.id === DEFAULT_ACTIVE_RESULT_ID);
+  const fallbackActiveId = DEFAULT_ACTIVE_RESULT_ID;
+  const hasManifestActive = fromManifest.length > 0;
+  const hasManifestActiveMatch = hasManifestActive && resultSets.some((entry) => entry.id === fromManifest);
+  const activeResultId = hasManifestActiveMatch
     ? fromManifest
     : fallbackActiveId;
   const activeSet = resultSets.find((entry) => entry.id === activeResultId) ?? null;
+  if (!hasManifestActiveMatch) {
+    const reason = !hasManifestActive
+      ? 'manifest_active_missing'
+      : 'manifest_active_invalid';
+    console.warn(
+      `[REAL_CHAIN] handlers.resolveActiveResultContext fallback projectId="${project.id}" ` +
+      `fromManifest="${fromManifest || 'none'}" resolved="${activeResultId}" reason="${reason}" hasMain=${hasMainResultSet}`,
+    );
+  }
 
   if ((normalizedSets.length === 0 || !fromManifest || fromManifest !== activeResultId) && resultSets.length > 0) {
     try {
@@ -553,6 +568,9 @@ async function resolveActiveResultContext(
   return {
     activeResultId,
     sourceSignature: activeSet?.sourceSignature ?? null,
+    resultSets,
+    modelId: activeSet?.modelId ?? null,
+    runtimeProfileId: activeSet?.runtimeProfileId ?? null,
   };
 }
 
@@ -1589,8 +1607,24 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       }
       return '';
     })();
-    if (!resolvedSourceFilePath || !fs.existsSync(resolvedSourceFilePath)) {
-      throw new Error('试点分离输入文件不存在，请传入有效音频路径');
+    if (!resolvedSourceFilePath) {
+      console.warn(
+        `[REAL_CHAIN] handlers.project:startPilotSeparation source_path_missing projectId="${projectId}" ` +
+        `hasInputPath=${typeof sourceFilePath === 'string' && sourceFilePath.trim().length > 0} ` +
+        `hasOriginalFilePath=${typeof project.originalFilePath === 'string' && project.originalFilePath.trim().length > 0}`,
+      );
+      throw new Error(
+        'PILOT_SOURCE_PATH_REQUIRED: 缺少可用的原始音频路径，请重新选择源文件后再试实验6轨分离',
+      );
+    }
+    if (!fs.existsSync(resolvedSourceFilePath)) {
+      console.warn(
+        `[REAL_CHAIN] handlers.project:startPilotSeparation source_path_unreadable projectId="${projectId}" ` +
+        `resolvedSourceFilePath="${resolvedSourceFilePath}"`,
+      );
+      throw new Error(
+        `PILOT_SOURCE_PATH_REQUIRED: 原始音频路径不可访问，请重新选择源文件后重试（path="${resolvedSourceFilePath}"）`,
+      );
     }
 
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -1780,6 +1814,45 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     return { projectId, lastAccessedAt };
   });
 
+  ipcMain.handle('project:setActiveResult', async (_event, projectId: string, resultSetId: string) => {
+    if (!workerInfra) {
+      throw new Error('结果集切换服务不可用，请重启应用后重试');
+    }
+    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('缺少项目 ID，无法切换结果集');
+    }
+    const normalizedResultSetId = typeof resultSetId === 'string' ? resultSetId.trim() : '';
+    if (!normalizedResultSetId) {
+      throw new Error('缺少 resultSetId，无法切换结果集');
+    }
+
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) {
+      throw new Error('项目不存在，无法切换结果集');
+    }
+
+    const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+    const resultSets = normalizeResultSetEntries(manifest?.resultSets);
+    if (resultSets.length === 0) {
+      throw new Error('当前项目没有可切换的结果集');
+    }
+    if (!resultSets.some((entry) => entry.id === normalizedResultSetId)) {
+      throw new Error(`目标结果集不存在：${normalizedResultSetId}`);
+    }
+
+    await patchProjectManifestMetadata(project.cacheDir, {
+      activeResultId: normalizedResultSetId,
+      resultSets,
+    });
+    console.log(
+      `[REAL_CHAIN] handlers.project:setActiveResult projectId="${projectId}" activeResultId="${normalizedResultSetId}" resultSetCount=${resultSets.length}`,
+    );
+    return {
+      projectId,
+      activeResultId: normalizedResultSetId,
+    };
+  });
+
   ipcMain.handle('project:getResult', async (_event, projectId: string) => {
     console.log(`[REAL_CHAIN] handlers.project:getResult query projectId="${projectId}"`);
     if (!workerInfra) return null;
@@ -1791,6 +1864,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const latestJob = await workerInfra.parseJobRepo.findLatestByProjectId(projectId);
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
+    console.log(
+      `[REAL_CHAIN] handlers.project:getResult active_context projectId="${projectId}" resultSetCount=${activeResultContext.resultSets.length} activeFromManifest="${activeResultContext.activeResultId}" activeResolved="${activeResultContext.activeResultId}"`,
+    );
 
     const isRealSeparation = project.status === ProjectStatus.Ready && stems.length > 0;
     const resolvedEngineVersion =
@@ -1829,6 +1905,10 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       cacheHitBannerText: null,
       sourceTypeLabel,
       activeResultId: activeResultContext.activeResultId,
+      resultSets: activeResultContext.resultSets,
+      sourceFilePath: project.originalFilePath ?? null,
+      activeResultModelId: activeResultContext.modelId,
+      activeResultRuntimeProfileId: activeResultContext.runtimeProfileId,
     };
   });
 
@@ -1842,7 +1922,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     if (!project) return [];
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
-    console.log(`[REAL_CHAIN] handlers.project:getStems repo_result projectId="${projectId}" activeResultId="${activeResultContext.activeResultId}" stemsLength=${stems.length}`);
+    console.log(
+      `[REAL_CHAIN] handlers.project:getStems repo_result projectId="${projectId}" activeResultId="${activeResultContext.activeResultId}" allStemsCount=${allStems.length} filteredStemsCount=${stems.length}`,
+    );
 
     if (stems.length > 0) {
       console.log(`[REAL_CHAIN] handlers.project:getStems fallbackHit=false projectId="${projectId}"`);
@@ -1870,9 +1952,13 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       }));
     }
 
-    // 鏃犵湡瀹?stems 鈥?mock honest fallback
-    console.log(`[REAL_CHAIN] handlers.project:getStems fallbackHit=true projectId="${projectId}"`);
-    return getMockHonestStems(project);
+    const fallbackReason = allStems.length > 0
+      ? 'active_result_set_empty'
+      : 'project_stems_empty';
+    console.warn(
+      `[REAL_CHAIN] handlers.project:getStems fallbackHit=false projectId="${projectId}" fallbackReason="${fallbackReason}" activeResultId="${activeResultContext.activeResultId}" allStemsCount=${allStems.length} filteredStemsCount=0`,
+    );
+    return [];
   });
 
   ipcMain.handle('project:openExisting', async () => {

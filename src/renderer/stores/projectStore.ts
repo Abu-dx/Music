@@ -39,6 +39,7 @@ export interface IProjectElectronAPI {
 
   /** 通过文件路径创建项目并启动分�?*/
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
+  startPilotSeparation?(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
 
   /** 取消分离任务 */
   cancelSeparation(jobId?: string): Promise<void>;
@@ -47,6 +48,7 @@ export interface IProjectElectronAPI {
   getProject(projectId: string): Promise<ProjectSummaryDTO | null>;
   renameProject(projectId: string, displayName: string): Promise<{ projectId: string; displayName: string } | null>;
   markProjectAccessed(projectId: string): Promise<{ projectId: string; lastAccessedAt: number } | null>;
+  setActiveResult?(projectId: string, resultSetId: string): Promise<{ projectId: string; activeResultId: string }>;
 
   /** 获取缓存占用摘要（GPT R7 Suggested #2�?*/
   getCacheStats?(): Promise<{ totalSizeBytes: number; projectCount: number } | null>;
@@ -111,10 +113,12 @@ export interface IProjectStore {
   getSnapshot(): ProjectStoreSnapshot;
   loadRecentProjects(limit?: number): Promise<void>;
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
+  startPilotSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
   cancelSeparation(jobId?: string): Promise<void>;
   loadProject(projectId: string): Promise<void>;
   renameProject(projectId: string, displayName: string): Promise<void>;
   markProjectAccessed(projectId: string): Promise<void>;
+  setActiveResult(projectId: string, resultSetId: string): Promise<void>;
   loadCacheStats(): Promise<void>;
   /** 加载结果摘要 + 分轨列表（GPT R8 Must Fix #1�?*/
   loadProjectResult(projectId: string): Promise<void>;
@@ -187,6 +191,13 @@ export class ProjectStore implements IProjectStore {
     }
   }
 
+  async startPilotSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO> {
+    if (!this.api.startPilotSeparation) {
+      throw new Error('当前环境不支持实验6轨分离');
+    }
+    return this.api.startPilotSeparation(projectId, sourceFilePath);
+  }
+
   async cancelSeparation(jobId?: string): Promise<void> {
     await this.api.cancelSeparation(jobId);
   }
@@ -209,6 +220,13 @@ export class ProjectStore implements IProjectStore {
 
   async markProjectAccessed(projectId: string): Promise<void> {
     await this.api.markProjectAccessed(projectId);
+  }
+
+  async setActiveResult(projectId: string, resultSetId: string): Promise<void> {
+    if (!this.api.setActiveResult) {
+      throw new Error('当前环境不支持结果集切换');
+    }
+    await this.api.setActiveResult(projectId, resultSetId);
   }
 
   async loadCacheStats(): Promise<void> {

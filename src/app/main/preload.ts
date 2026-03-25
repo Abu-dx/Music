@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('project:rename', projectId, displayName),
   markProjectAccessed: (projectId: string) =>
     ipcRenderer.invoke('project:markAccessed', projectId),
+  setActiveResult: (projectId: string, resultSetId: string) =>
+    ipcRenderer.invoke('project:setActiveResult', projectId, resultSetId),
   getProjectResult: (projectId: string) =>
     ipcRenderer.invoke('project:getResult', projectId),
   getStemsByProject: (projectId: string) =>

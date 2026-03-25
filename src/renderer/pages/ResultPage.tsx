@@ -26,6 +26,7 @@ import type {
   StemPresence,
   ExportRequestDTO,
   AnalysisErrorDTO,
+  ProjectResultSummaryDTO,
 } from '../../shared/contracts';
 
 // ============================================================================
@@ -131,6 +132,10 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const [renameValue, setRenameValue] = useState('');
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameBusy, setRenameBusy] = useState(false);
+  const [pilotBusy, setPilotBusy] = useState(false);
+  const [resultSetSwitchBusy, setResultSetSwitchBusy] = useState(false);
+  const [pilotInfo, setPilotInfo] = useState<string | null>(null);
+  const [pilotError, setPilotError] = useState<string | null>(null);
   const accessMarkedRef = useRef(false);
   const analysisLoadedForProjectRef = useRef<string | null>(null);
 
@@ -148,10 +153,36 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     projectStore.loadProjectResult(projectId);
   }, [projectStore, projectId]);
 
+  const { projectResult, stems, isLoading } = snapshot;
+  const projectResultWithMeta = projectResult as (ProjectResultSummaryDTO & {
+    resultSets?: Array<{ id?: string; modelId?: string; runtimeProfileId?: string }>;
+    sourceFilePath?: string | null;
+    activeResultModelId?: string | null;
+    activeResultRuntimeProfileId?: string | null;
+  }) | null;
+  const activeResultId = projectResultWithMeta?.activeResultId?.trim() || 'main';
+  const availableResultSets = (projectResultWithMeta?.resultSets ?? [])
+    .flatMap((entry) => {
+      const id = typeof entry?.id === 'string' ? entry.id.trim() : '';
+      if (!id) return [];
+      return [{
+        id,
+        modelId: typeof entry.modelId === 'string' ? entry.modelId.trim() : '',
+        runtimeProfileId: typeof entry.runtimeProfileId === 'string' ? entry.runtimeProfileId.trim() : '',
+      }];
+    });
+  const activeStem = stems.find((stem) => (stem.parentResultId?.trim() || 'main') === activeResultId) ?? stems[0];
+  const activeResultModelLabel =
+    projectResultWithMeta?.activeResultModelId
+    ?? activeStem?.modelId
+    ?? projectResultWithMeta?.activeResultRuntimeProfileId
+    ?? activeStem?.runtimeProfileId
+    ?? 'unknown';
+
   useEffect(() => {
     accessMarkedRef.current = false;
     analysisLoadedForProjectRef.current = null;
-  }, [projectId]);
+  }, [projectId, activeResultId]);
 
   // 定时刷新一次，避免“当前页项目已被删除”时继续展示旧状态
   useEffect(() => {
@@ -160,8 +191,6 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     }, 6000);
     return () => window.clearInterval(timer);
   }, [projectStore, projectId]);
-
-  const { projectResult, stems, isLoading } = snapshot;
 
   useEffect(() => {
     if (hasRequestedLoad && !isLoading && projectResult === null) {
@@ -192,16 +221,10 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   useEffect(() => {
     if (!hasRequestedLoad || isLoading || !projectResult) return;
     if (projectResult.id !== projectId) return;
-    if (
-      analysisSnap.projectId === projectId
-      && (analysisSnap.loadingState === 'loaded' || analysisSnap.loadingState === 'empty')
-    ) {
-      analysisLoadedForProjectRef.current = projectId;
-      return;
-    }
-    if (analysisLoadedForProjectRef.current === projectId) return;
+    const analysisLoadKey = `${projectId}::${activeResultId}`;
+    if (analysisLoadedForProjectRef.current === analysisLoadKey) return;
 
-    analysisLoadedForProjectRef.current = projectId;
+    analysisLoadedForProjectRef.current = analysisLoadKey;
     analysisStore.setLoading(projectId);
 
     projectStore.getChordAnalysis(projectId)
@@ -227,11 +250,29 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     isLoading,
     projectResult,
     projectId,
+    activeResultId,
     projectStore,
     analysisStore,
-    analysisSnap.projectId,
-    analysisSnap.loadingState,
   ]);
+
+  const handleSwitchActiveResult = useCallback(async (nextResultSetId: string) => {
+    if (!nextResultSetId || nextResultSetId === activeResultId) return;
+    try {
+      setResultSetSwitchBusy(true);
+      setPilotError(null);
+      setPilotInfo(null);
+      await projectStore.setActiveResult(projectId, nextResultSetId);
+      analysisLoadedForProjectRef.current = null;
+      await Promise.all([
+        projectStore.loadProjectResult(projectId),
+        projectStore.loadRecentProjects(20),
+      ]);
+    } catch (err) {
+      setPilotError(err instanceof Error ? err.message : '结果集切换失败');
+    } finally {
+      setResultSetSwitchBusy(false);
+    }
+  }, [activeResultId, projectStore, projectId]);
 
   // 打开项目目录
   const handleOpenDir = useCallback(async () => {
@@ -285,6 +326,43 @@ export const ResultPage: React.FC<ResultPageProps> = ({
       setRenameBusy(false);
     }
   }, [projectResult?.displayName, renameValue, projectStore, projectId]);
+
+  const handleStartPilotSeparation = useCallback(async () => {
+    const hasExistingPilotResultSet = (projectResultWithMeta?.resultSets ?? [])
+      .some((entry) => typeof entry.id === 'string' && entry.id.startsWith('pilot_6s_'));
+    if (hasExistingPilotResultSet) {
+      // TODO(Phase 2): 提供“清理旧实验结果集”入口，避免长期追加过多 pilot 结果集。
+      const confirmed = window.confirm(
+        '继续分离将新增一个实验结果集（pilot_6s_*），不会覆盖 main 主线结果。是否继续？',
+      );
+      if (!confirmed) return;
+    }
+
+    try {
+      setPilotBusy(true);
+      setPilotError(null);
+      setPilotInfo(null);
+      const preferredSourceFilePath =
+        (typeof projectResultWithMeta?.sourceFilePath === 'string' && projectResultWithMeta.sourceFilePath.trim().length > 0)
+          ? projectResultWithMeta.sourceFilePath.trim()
+          : undefined;
+      const result = await projectStore.startPilotSeparation(projectId, preferredSourceFilePath);
+      setPilotInfo(`实验6轨任务已启动（jobId: ${result.jobId}）`);
+      await Promise.all([
+        projectStore.loadProjectResult(projectId),
+        projectStore.loadRecentProjects(20),
+      ]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('PILOT_SOURCE_PATH_REQUIRED')) {
+        setPilotError('缺少可用的原始音频路径。请先重新选择源音频文件，再启动实验6轨分离。');
+      } else {
+        setPilotError(message || '实验6轨分离启动失败');
+      }
+    } finally {
+      setPilotBusy(false);
+    }
+  }, [projectResultWithMeta?.resultSets, projectResultWithMeta?.sourceFilePath, projectStore, projectId]);
 
   // 全部导出
   const handleExportAll = useCallback(async () => {
@@ -428,6 +506,8 @@ export const ResultPage: React.FC<ResultPageProps> = ({
                 {' · '}
                 {headerTrackCount} 轨 {' · '}
                 {formatSize(projectResult.totalSizeBytes)}
+                {' · '}
+                当前结果 {activeResultId} · 模型 {activeResultModelLabel}
                 {projectResult.durationMs != null && (
                   <> · {formatDuration(projectResult.durationMs)}</>
                 )}
@@ -447,6 +527,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           </button>
         </div>
       </div>
+      <div style={styles.experimentalHint}>实验功能：新增 pilot 结果集，不覆盖 main 主线结果。</div>
 
       {/* === mock 鏁版嵁鎻愮ず === */}
       {projectResult?.sourceTypeLabel?.includes('模拟') && (
@@ -465,6 +546,25 @@ export const ResultPage: React.FC<ResultPageProps> = ({
 
       {/* === 操作栏 === */}
       <div style={styles.actionBar}>
+        {availableResultSets.length > 1 && (
+          <label style={styles.resultSetSelector}>
+            结果集
+            <select
+              value={activeResultId}
+              disabled={resultSetSwitchBusy}
+              style={styles.resultSetSelect}
+              onChange={(e) => {
+                void handleSwitchActiveResult(e.target.value);
+              }}
+            >
+              {availableResultSets.map((entry) => (
+                <option key={entry.id} value={entry.id}>
+                  {entry.id}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         <button style={styles.actionButton} onClick={handleOpenDir}>
           打开结果目录
         </button>
@@ -480,9 +580,26 @@ export const ResultPage: React.FC<ResultPageProps> = ({
         >
           进入播放器
         </button>
+        <button
+          style={{
+            ...styles.actionButton,
+            ...(pilotBusy ? styles.playerButtonDisabled : {}),
+          }}
+          onClick={handleStartPilotSeparation}
+          disabled={pilotBusy}
+          title="实验功能：新增 pilot_6s_* 结果集，不覆盖 main"
+        >
+          {pilotBusy ? '实验6轨启动中...' : '实验6轨分离'}
+        </button>
       </div>
       {openDirError && (
         <div style={styles.inlineError}>{openDirError}</div>
+      )}
+      {pilotError && (
+        <div style={styles.inlineError}>{pilotError}</div>
+      )}
+      {pilotInfo && (
+        <div style={styles.inlineInfo}>{pilotInfo}</div>
       )}
 
       {/* === 已生成轨道 === */}
@@ -538,7 +655,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
 
       {/* === 空结果 === */}
       {stems.length === 0 && !isLoading && (
-        <div style={styles.emptyState}>未找到分轨结果</div>
+        <div style={styles.emptyState}>当前结果集暂无可读轨道</div>
       )}
 
       {/* === 鍜屽鸡鍒嗘瀽鎽樿锛圧12锛氭寮忛泦鎴?analysisStore锛?=== */}
@@ -761,6 +878,11 @@ const StemTrackCard: React.FC<{
             合并来源: {stem.mergedFrom.join(', ')}
           </div>
         )}
+        {(stem.parentResultId || stem.modelId || stem.runtimeProfileId) && (
+          <div style={styles.stemSourceText}>
+            来源: {stem.parentResultId ?? 'main'} · {stem.modelId ?? stem.runtimeProfileId ?? 'unknown'}
+          </div>
+        )}
       </div>
       <div style={styles.trackActions}>
         {/* GPT R8 Must Fix #5锛氬崟杞ㄥ鍑?disabled + reason */}
@@ -950,6 +1072,23 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     gap: '8px',
     marginBottom: '8px',
+    alignItems: 'center',
+    flexWrap: 'wrap' as const,
+  },
+  resultSetSelector: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontSize: '12px',
+    color: '#666',
+  },
+  resultSetSelect: {
+    border: '1px solid #d5d5d5',
+    borderRadius: '6px',
+    padding: '6px 8px',
+    fontSize: '12px',
+    backgroundColor: '#fff',
+    color: '#333',
   },
   actionButton: {
     padding: '8px 16px',
@@ -979,6 +1118,12 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: '13px',
     color: '#2e7d32',
     marginBottom: '12px',
+  },
+  experimentalHint: {
+    marginTop: '-4px',
+    marginBottom: '10px',
+    fontSize: '12px',
+    color: '#666',
   },
   section: {
     marginBottom: '24px',
@@ -1046,6 +1191,11 @@ const styles: Record<string, React.CSSProperties> = {
   mergedFromText: {
     fontSize: '12px',
     color: '#2196F3',
+    marginTop: '4px',
+  },
+  stemSourceText: {
+    fontSize: '12px',
+    color: '#6a6a6a',
     marginTop: '4px',
   },
   trackActions: {
