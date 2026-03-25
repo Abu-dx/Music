@@ -53,6 +53,10 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
     (cb) => jobStore.subscribe(cb),
     () => jobStore.getSnapshot(),
   );
+  const isDevMode =
+    typeof window !== 'undefined'
+    && typeof window.electronAPI?.isDevMode === 'function'
+    && window.electronAPI.isDevMode();
 
   const resultLoadedProjectRef = useRef<string | null>(null);
 
@@ -65,10 +69,36 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
       return;
     }
     resultLoadedProjectRef.current = projectId;
+    console.log(
+      `[REAL_CHAIN] progressPage.loadProjectResult_start projectId="${projectId}" isComplete=${jobSnap.isComplete} stage="${jobSnap.stage ?? 'null'}" progress=${jobSnap.progress}`,
+    );
     projectStore.loadProjectResult(projectId).catch(() => {
+      console.warn(
+        `[REAL_CHAIN] progressPage.loadProjectResult_failed projectId="${projectId}"`,
+      );
       resultLoadedProjectRef.current = null;
+    }).finally(() => {
+      console.log(
+        `[REAL_CHAIN] progressPage.loadProjectResult_end projectId="${projectId}" resultLoadedProjectRef="${resultLoadedProjectRef.current ?? 'null'}"`,
+      );
     });
   }, [jobSnap.isComplete, projectId, projectStore]);
+
+  useEffect(() => {
+    if (!isDevMode) return;
+    console.log(
+      `[REAL_CHAIN] progressPage.render_state projectId="${projectId}" currentJobId="${jobSnap.currentJobId ?? 'none'}" stage="${jobSnap.stage ?? 'null'}" progress=${jobSnap.progress} isRunning=${jobSnap.isRunning} isComplete=${jobSnap.isComplete} isFailed=${jobSnap.isFailed}`,
+    );
+  }, [
+    isDevMode,
+    jobSnap.currentJobId,
+    jobSnap.isComplete,
+    jobSnap.isFailed,
+    jobSnap.isRunning,
+    jobSnap.progress,
+    jobSnap.stage,
+    projectId,
+  ]);
 
   const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
   const successTrackCount =
@@ -126,6 +156,11 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
             <span style={styles.currentStage}>{stageDisplayName}</span>
           )}
           <span style={styles.elapsed}>{formatElapsed(elapsedMs)}</span>
+        </div>
+      )}
+      {isDevMode && (
+        <div style={styles.devTraceBox}>
+          <strong>Dev Trace</strong> · stage: {jobSnap.stage ?? 'null'} · elapsedMs: {jobSnap.elapsedMs} · jobId: {jobSnap.currentJobId ?? 'none'} · isRunning: {String(jobSnap.isRunning)} · isComplete: {String(jobSnap.isComplete)} · isFailed: {String(jobSnap.isFailed)} · canNavigateResult: {String(jobSnap.isComplete && !jobSnap.isFailed)}
         </div>
       )}
 
@@ -330,6 +365,16 @@ const styles: Record<string, React.CSSProperties> = {
   elapsed: {
     fontSize: '13px',
     color: '#888',
+    fontFamily: 'monospace',
+  },
+  devTraceBox: {
+    marginBottom: '12px',
+    padding: '8px 10px',
+    border: '1px dashed #c7c7c7',
+    borderRadius: '6px',
+    backgroundColor: '#fafafa',
+    fontSize: '12px',
+    color: '#444',
     fontFamily: 'monospace',
   },
   timeline: {

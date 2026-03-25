@@ -17,10 +17,11 @@ import subprocess
 import threading
 import traceback
 import time
+import tempfile
 import wave
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional, Protocol, Set
+from typing import Any, Callable, Dict, List, Tuple, Optional, Protocol, Set
 from stem_routing import build_stem_routing_plan
 from runtime_profiles import (
     ExecutionRequest,
@@ -32,6 +33,11 @@ from runtime_profiles import (
     RuntimeResolution,
     RuntimeResolver,
 )
+
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None  # type: ignore
 
 # Phase 2 defaults to stable 4-stem htdemucs.
 # Phase 2.5 can switch by env DEMUCS_MODEL=htdemucs_6s without protocol changes.
@@ -102,6 +108,14 @@ def send_response(request_id: str, success: bool, data: dict = None, error: dict
         msg["data"] = data
     if error is not None:
         msg["error"] = error
+    data_keys = sorted(list(data.keys())) if isinstance(data, dict) else []
+    stems_count = len(data.get("stems", [])) if isinstance(data, dict) and isinstance(data.get("stems"), list) else 0
+    error_code = error.get("code", "") if isinstance(error, dict) else ""
+    log(
+        "INFO",
+        f"[REAL_CHAIN] ipc_sending_response requestId={request_id} success={success} "
+        f"data_keys={data_keys} stems_count={stems_count} error_code={error_code}",
+    )
     print(json.dumps(msg, ensure_ascii=False), flush=True)
 
 
@@ -158,6 +172,35 @@ def get_audio_duration_ms(file_path: str) -> int:
     except Exception:
         return 0
 
+    return 0
+
+
+def resolve_source_duration_ms(engine_result: dict) -> int:
+    """
+    Resolve source duration without probing original input again.
+    Priority:
+    1) engine_result.sourceDurationMs
+    2) max(stem.durationMs)
+    3) 0
+    """
+    try:
+        direct = engine_result.get("sourceDurationMs")
+        if isinstance(direct, (int, float)) and direct > 0:
+            return int(direct)
+    except Exception:
+        pass
+
+    stems = engine_result.get("stems", [])
+    if isinstance(stems, list):
+        max_duration = 0
+        for stem in stems:
+            if not isinstance(stem, dict):
+                continue
+            duration = stem.get("durationMs")
+            if isinstance(duration, (int, float)) and duration > max_duration:
+                max_duration = int(duration)
+        if max_duration > 0:
+            return max_duration
     return 0
 
 
@@ -879,6 +922,7 @@ _ACTIVE_TASK_REQUEST_ID: Optional[str] = None
 _ACTIVE_TASK_COMMAND: Optional[str] = None
 _ACTIVE_TASK_CANCEL_REQUESTED = False
 _ACTIVE_SEPARATION_PROCESS: Optional[subprocess.Popen[str]] = None
+_TASK_TRACE_START_MS: Dict[str, float] = {}
 
 
 class TaskCancelledError(RuntimeError):
@@ -906,6 +950,212 @@ def _clear_active_task_context(request_id: str) -> None:
             _ACTIVE_TASK_COMMAND = None
             _ACTIVE_TASK_CANCEL_REQUESTED = False
             _ACTIVE_SEPARATION_PROCESS = None
+    _TASK_TRACE_START_MS.pop(request_id, None)
+
+
+def _trace_elapsed_ms(request_id: str) -> int:
+    started = _TASK_TRACE_START_MS.get(request_id)
+    if started is None:
+        return 0
+    return max(0, int((time.time() - started) * 1000))
+
+
+def _log_demucs_stage(
+    *,
+    request_id: str,
+    stage: str,
+    status: str,
+    output_dir: Optional[str] = None,
+    stems_dir: Optional[str] = None,
+    runtime_profile_id: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> None:
+    parts = [
+        f"[REAL_CHAIN] {stage}",
+        f"request_id={request_id}",
+        f"status={status}",
+        f"elapsed_ms={_trace_elapsed_ms(request_id)}",
+    ]
+    if runtime_profile_id:
+        parts.append(f"runtime_profile_id={runtime_profile_id}")
+    if output_dir:
+        parts.append(f"output_dir={output_dir}")
+    if stems_dir:
+        parts.append(f"stems_dir={stems_dir}")
+    if detail:
+        parts.append(f"detail={detail}")
+    log("INFO" if status not in {"failed", "timeout", "suspicious_stall"} else "WARN", " ".join(parts))
+
+
+def _truncate_for_log(text: str, max_len: int = 280) -> str:
+    if len(text) <= max_len:
+        return text
+    return f"{text[:max_len]}...(+{len(text) - max_len} chars)"
+
+
+def _read_text_file(path: str, *, max_bytes: int = 300_000) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            size = fp.tell()
+            if size > max_bytes:
+                fp.seek(-max_bytes, os.SEEK_END)
+            else:
+                fp.seek(0, os.SEEK_SET)
+            data = fp.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _read_text_file_head(path: str, *, max_bytes: int = 512) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as fp:
+            data = fp.read(max_bytes)
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _scan_files_snapshot(root_dir: str, *, max_preview: int = 8) -> Tuple[int, List[str]]:
+    if not root_dir or not os.path.isdir(root_dir):
+        return 0, []
+    count = 0
+    preview: List[str] = []
+    for base, _dirs, files in os.walk(root_dir):
+        for filename in files:
+            count += 1
+            if len(preview) < max_preview:
+                abs_path = os.path.join(base, filename)
+                try:
+                    rel_path = os.path.relpath(abs_path, root_dir)
+                except Exception:
+                    rel_path = filename
+                preview.append(rel_path.replace("\\", "/"))
+    return count, preview
+
+
+DEMUCS_SILENT_STALL_THRESHOLD_MS = 60_000
+DEMUCS_SILENT_STALL_LOG_INTERVAL_MS = 30_000
+DEMUCS_LOW_CPU_DELTA_THRESHOLD_MS = 100
+
+
+def _get_process_runtime_snapshot_with_psutil(
+    proc_ps: Any,
+    previous_cpu_total_ms: Optional[int],
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[str]]:
+    cpu_total_ms = None
+    cpu_delta_ms = None
+    rss_kb = None
+    error = None
+    try:
+        cpu_times = proc_ps.cpu_times()
+        cpu_total_ms = int((float(cpu_times.user) + float(cpu_times.system)) * 1000)
+        if previous_cpu_total_ms is not None:
+            cpu_delta_ms = max(0, cpu_total_ms - previous_cpu_total_ms)
+    except Exception as exc:
+        error = f"psutil_cpu_error={exc}"
+    try:
+        mem_info = proc_ps.memory_info()
+        rss_kb = int(getattr(mem_info, "rss", 0) / 1024)
+    except Exception as exc:
+        mem_err = f"psutil_mem_error={exc}"
+        error = f"{error};{mem_err}" if error else mem_err
+    return cpu_total_ms, cpu_delta_ms, rss_kb, error
+
+
+def _get_process_runtime_snapshot_windows(
+    pid: int,
+    previous_cpu_total_ms: Optional[int],
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[str]]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        PROCESS_VM_READ = 0x0010
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, int(pid))
+        if not handle:
+            return None, None, None, "winapi_open_process_failed"
+        try:
+            creation = FILETIME()
+            exit_ft = FILETIME()
+            kernel_ft = FILETIME()
+            user_ft = FILETIME()
+            ok_times = kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_ft),
+                ctypes.byref(kernel_ft),
+                ctypes.byref(user_ft),
+            )
+            cpu_total_ms = None
+            cpu_delta_ms = None
+            if ok_times:
+                kernel_100ns = (int(kernel_ft.dwHighDateTime) << 32) + int(kernel_ft.dwLowDateTime)
+                user_100ns = (int(user_ft.dwHighDateTime) << 32) + int(user_ft.dwLowDateTime)
+                cpu_total_ms = int((kernel_100ns + user_100ns) / 10_000)
+                if previous_cpu_total_ms is not None:
+                    cpu_delta_ms = max(0, cpu_total_ms - previous_cpu_total_ms)
+
+            pmc = PROCESS_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            rss_kb = None
+            mem_ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb)
+            if mem_ok:
+                rss_kb = int(int(pmc.WorkingSetSize) / 1024)
+            if not ok_times and not mem_ok:
+                return None, None, None, "winapi_times_and_mem_unavailable"
+            return cpu_total_ms, cpu_delta_ms, rss_kb, None
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as exc:
+        return None, None, None, f"winapi_probe_error={exc}"
+
+
+def _get_process_runtime_snapshot(
+    *,
+    pid: int,
+    proc_ps: Any,
+    previous_cpu_total_ms: Optional[int],
+) -> Tuple[Optional[int], Optional[int], Optional[int], str, Optional[str]]:
+    if proc_ps is not None:
+        cpu_total_ms, cpu_delta_ms, rss_kb, error = _get_process_runtime_snapshot_with_psutil(proc_ps, previous_cpu_total_ms)
+        if cpu_total_ms is not None or rss_kb is not None:
+            return cpu_total_ms, cpu_delta_ms, rss_kb, "psutil", error
+        if os.name != "nt":
+            return cpu_total_ms, cpu_delta_ms, rss_kb, "psutil", error
+
+    if os.name == "nt":
+        cpu_total_ms, cpu_delta_ms, rss_kb, error = _get_process_runtime_snapshot_windows(pid, previous_cpu_total_ms)
+        if cpu_total_ms is not None or rss_kb is not None:
+            return cpu_total_ms, cpu_delta_ms, rss_kb, "winapi", error
+        return cpu_total_ms, cpu_delta_ms, rss_kb, "winapi", error
+
+    return None, None, None, "unavailable", "process_runtime_probe_unavailable"
 
 
 def _is_cancel_requested() -> bool:
@@ -959,34 +1209,308 @@ def _run_subprocess_cancellable(
     cwd: Optional[str],
     env: Dict[str, str],
     timeout_sec: Optional[int],
+    stdio_mode: str = "pipe_line_reader",
+    on_spawn: Optional[Callable[[int], None]] = None,
+    on_first_stdout: Optional[Callable[[str], None]] = None,
+    on_first_stderr: Optional[Callable[[str], None]] = None,
+    on_first_output: Optional[Callable[[str, str], None]] = None,
+    on_heartbeat: Optional[Callable[[int, int, int, int, int, Optional[int], Optional[int], Optional[int], str, Optional[str]], None]] = None,
+    heartbeat_interval_sec: Optional[float] = None,
+    on_exit: Optional[Callable[[int, int, Optional[int], Optional[int], str, Optional[str]], None]] = None,
+    on_launch_config: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> subprocess.CompletedProcess[str]:
     started = time.time()
+    normalized_stdio_mode = (stdio_mode or "").strip().lower() or "pipe_line_reader"
+    use_pipe_reader = normalized_stdio_mode == "pipe_line_reader"
+    spool_mode = normalized_stdio_mode == "spool_files"
+    inherit_stdio_mode = normalized_stdio_mode == "inherit_stdio"
+    if normalized_stdio_mode not in {"pipe_line_reader", "spool_files", "inherit_stdio"}:
+        normalized_stdio_mode = "pipe_line_reader"
+        use_pipe_reader = True
+        spool_mode = False
+        inherit_stdio_mode = False
+
+    stdout_spool_dir: Optional[str] = None
+    stdout_spool_path: Optional[str] = None
+    stderr_spool_path: Optional[str] = None
+    stdout_spool_fp = None
+    stderr_spool_fp = None
+    if spool_mode:
+        stdout_spool_dir = tempfile.mkdtemp(prefix=f"demucs_stdio_{request_id[:8]}_")
+        stdout_spool_path = os.path.join(stdout_spool_dir, "stdout.log")
+        stderr_spool_path = os.path.join(stdout_spool_dir, "stderr.log")
+        stdout_spool_fp = open(stdout_spool_path, "wb")
+        stderr_spool_fp = open(stderr_spool_path, "wb")
+
+    popen_stdin = subprocess.DEVNULL if (use_pipe_reader or spool_mode) else None
+    popen_stdout = subprocess.PIPE if use_pipe_reader else (stdout_spool_fp if spool_mode else None)
+    popen_stderr = subprocess.PIPE if use_pipe_reader else (stderr_spool_fp if spool_mode else None)
+    popen_text = use_pipe_reader
+    popen_close_fds = False if inherit_stdio_mode else True
+    popen_creationflags = 0
+    popen_startupinfo = None
+
+    if on_launch_config is not None:
+        try:
+            inherits_parent_stdio = popen_stdin is None and popen_stdout is None and popen_stderr is None
+            on_launch_config({
+                "stdio_mode": normalized_stdio_mode,
+                "stdin": "DEVNULL" if popen_stdin is subprocess.DEVNULL else "inherit",
+                "stdout": "PIPE" if use_pipe_reader else ("spool_file" if spool_mode else "inherit"),
+                "stderr": "PIPE" if use_pipe_reader else ("spool_file" if spool_mode else "inherit"),
+                "text": popen_text,
+                "shell": shell,
+                "cwd": cwd or "",
+                "close_fds": popen_close_fds,
+                "creationflags": popen_creationflags,
+                "startupinfo": "none",
+                "inherits_parent_stdio": inherits_parent_stdio,
+                "likely_ipc_pipe_inherited": inherits_parent_stdio,
+                "handle_inheritance_mode": ("minimal" if popen_close_fds else "inherited"),
+                "cancel_monitor_attached_after_spawn": True,
+            })
+        except Exception:
+            pass
+
     proc = subprocess.Popen(
         command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        stdin=popen_stdin,
+        stdout=popen_stdout,
+        stderr=popen_stderr,
+        text=popen_text,
         shell=shell,
         cwd=cwd,
         env=env,
+        creationflags=popen_creationflags,
+        startupinfo=popen_startupinfo,
+        close_fds=popen_close_fds,
     )
+    if on_spawn is not None:
+        try:
+            on_spawn(proc.pid)
+        except Exception:
+            pass
+
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    output_state_lock = threading.Lock()
+    first_output_sent = False
+    first_stdout_sent = False
+    first_stderr_sent = False
+    stdout_lines = 0
+    stderr_lines = 0
+    last_output_at = started
+
+    def stream_reader(stream, chunks: List[str], source: str) -> None:
+        nonlocal first_output_sent, first_stdout_sent, first_stderr_sent
+        nonlocal stdout_lines, stderr_lines, last_output_at
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                if line == "":
+                    break
+                chunks.append(line)
+                with output_state_lock:
+                    last_output_at = time.time()
+                    if source == "stdout":
+                        stdout_lines += 1
+                        if on_first_stdout is not None and not first_stdout_sent:
+                            first_stdout_sent = True
+                            try:
+                                on_first_stdout(line.strip())
+                            except Exception:
+                                pass
+                    else:
+                        stderr_lines += 1
+                        if on_first_stderr is not None and not first_stderr_sent:
+                            first_stderr_sent = True
+                            try:
+                                on_first_stderr(line.strip())
+                            except Exception:
+                                pass
+                    if on_first_output is not None and not first_output_sent:
+                        first_output_sent = True
+                        try:
+                            on_first_output(source, line.strip())
+                        except Exception:
+                            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    stdout_thread: Optional[threading.Thread] = None
+    stderr_thread: Optional[threading.Thread] = None
+    if use_pipe_reader:
+        stdout_thread = threading.Thread(
+            target=stream_reader,
+            args=(proc.stdout, stdout_chunks, "stdout"),
+            daemon=True,
+            name=f"sep-stdout-{request_id}",
+        )
+        stderr_thread = threading.Thread(
+            target=stream_reader,
+            args=(proc.stderr, stderr_chunks, "stderr"),
+            daemon=True,
+            name=f"sep-stderr-{request_id}",
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+    last_stdout_spool_size = 0
+    last_stderr_spool_size = 0
+
     _set_active_separation_process(proc)
+    proc_ps = None
+    last_cpu_total_ms: Optional[int] = None
+    if psutil is not None:
+        try:
+            proc_ps = psutil.Process(proc.pid)  # type: ignore[attr-defined]
+        except Exception:
+            proc_ps = None
+
+    last_heartbeat_at = started
+    heartbeat_interval = heartbeat_interval_sec if heartbeat_interval_sec and heartbeat_interval_sec > 0 else None
     try:
         while True:
             _raise_if_cancel_requested(request_id, "engine_wait")
-            if proc.poll() is not None:
+            now = time.time()
+            rc = proc.poll()
+            if rc is not None:
+                cpu_total_ms, _cpu_delta_ms, rss_kb, stats_source, stats_error = _get_process_runtime_snapshot(
+                    pid=proc.pid,
+                    proc_ps=proc_ps,
+                    previous_cpu_total_ms=last_cpu_total_ms,
+                )
+                if on_exit is not None:
+                    try:
+                        on_exit(
+                            rc,
+                            max(0, int((now - started) * 1000)),
+                            cpu_total_ms,
+                            rss_kb,
+                            stats_source,
+                            stats_error,
+                        )
+                    except Exception:
+                        pass
                 break
+            if heartbeat_interval and on_heartbeat is not None and (now - last_heartbeat_at) >= heartbeat_interval:
+                with output_state_lock:
+                    no_output_ms = max(0, int((now - last_output_at) * 1000))
+                    out_lines = stdout_lines
+                    err_lines = stderr_lines
+                if spool_mode and stdout_spool_path and stderr_spool_path:
+                    stdout_size = 0
+                    stderr_size = 0
+                    try:
+                        stdout_size = os.path.getsize(stdout_spool_path)
+                    except Exception:
+                        stdout_size = 0
+                    try:
+                        stderr_size = os.path.getsize(stderr_spool_path)
+                    except Exception:
+                        stderr_size = 0
+
+                    with output_state_lock:
+                        if stdout_size > last_stdout_spool_size:
+                            last_output_at = now
+                            if on_first_stdout is not None and not first_stdout_sent:
+                                first_stdout_sent = True
+                                try:
+                                    on_first_stdout(_truncate_for_log(_read_text_file_head(stdout_spool_path), max_len=180))
+                                except Exception:
+                                    pass
+                            if on_first_output is not None and not first_output_sent:
+                                first_output_sent = True
+                                try:
+                                    on_first_output("stdout", _truncate_for_log(_read_text_file_head(stdout_spool_path), max_len=180))
+                                except Exception:
+                                    pass
+                        if stderr_size > last_stderr_spool_size:
+                            last_output_at = now
+                            if on_first_stderr is not None and not first_stderr_sent:
+                                first_stderr_sent = True
+                                try:
+                                    on_first_stderr(_truncate_for_log(_read_text_file_head(stderr_spool_path), max_len=180))
+                                except Exception:
+                                    pass
+                            if on_first_output is not None and not first_output_sent:
+                                first_output_sent = True
+                                try:
+                                    on_first_output("stderr", _truncate_for_log(_read_text_file_head(stderr_spool_path), max_len=180))
+                                except Exception:
+                                    pass
+                        no_output_ms = max(0, int((now - last_output_at) * 1000))
+                        out_lines = 1 if stdout_size > 0 else 0
+                        err_lines = 1 if stderr_size > 0 else 0
+                    last_stdout_spool_size = stdout_size
+                    last_stderr_spool_size = stderr_size
+                cpu_total_ms, cpu_delta_ms, rss_kb, stats_source, stats_error = _get_process_runtime_snapshot(
+                    pid=proc.pid,
+                    proc_ps=proc_ps,
+                    previous_cpu_total_ms=last_cpu_total_ms,
+                )
+                if cpu_total_ms is not None:
+                    last_cpu_total_ms = cpu_total_ms
+                try:
+                    on_heartbeat(
+                        proc.pid,
+                        max(0, int((now - started) * 1000)),
+                        no_output_ms,
+                        out_lines,
+                        err_lines,
+                        cpu_total_ms,
+                        cpu_delta_ms,
+                        rss_kb,
+                        stats_source,
+                        stats_error,
+                    )
+                except Exception:
+                    pass
+                last_heartbeat_at = now
             if timeout_sec and timeout_sec > 0 and (time.time() - started) > timeout_sec:
                 _terminate_process(proc, request_id, "timeout")
                 raise subprocess.TimeoutExpired(command, timeout_sec)
             time.sleep(0.1)
 
-        stdout, stderr = proc.communicate()
-        return subprocess.CompletedProcess(command, proc.returncode, stdout or "", stderr or "")
+        if stdout_thread is not None:
+            stdout_thread.join(timeout=1.5)
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1.5)
+        if spool_mode and stdout_spool_fp is not None and stderr_spool_fp is not None:
+            try:
+                stdout_spool_fp.flush()
+                stderr_spool_fp.flush()
+            except Exception:
+                pass
+            stdout = _read_text_file(stdout_spool_path or "")
+            stderr = _read_text_file(stderr_spool_path or "")
+        else:
+            stdout = "".join(stdout_chunks)
+            stderr = "".join(stderr_chunks)
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
     except TaskCancelledError:
         _terminate_process(proc, request_id, "cancel_requested")
         raise
     finally:
+        try:
+            if stdout_spool_fp is not None:
+                stdout_spool_fp.close()
+        except Exception:
+            pass
+        try:
+            if stderr_spool_fp is not None:
+                stderr_spool_fp.close()
+        except Exception:
+            pass
+        if stdout_spool_dir:
+            try:
+                shutil.rmtree(stdout_spool_dir, ignore_errors=True)
+            except Exception:
+                pass
         _set_active_separation_process(None)
 
 
@@ -995,12 +1519,22 @@ def _launch_profile_command_cancellable(
     request: ExecutionRequest,
     *,
     request_id: str,
+    stdio_mode: str = "pipe_line_reader",
+    on_spawn: Optional[Callable[[int], None]] = None,
+    on_first_stdout: Optional[Callable[[str], None]] = None,
+    on_first_stderr: Optional[Callable[[str], None]] = None,
+    on_first_output: Optional[Callable[[str, str], None]] = None,
+    on_heartbeat: Optional[Callable[[int, int, int, int, int, Optional[int], Optional[int], Optional[int], str, Optional[str]], None]] = None,
+    heartbeat_interval_sec: Optional[float] = None,
+    on_exit: Optional[Callable[[int, int, Optional[int], Optional[int], str, Optional[str]], None]] = None,
+    on_command_prepared: Optional[Callable[[str, List[str], Optional[str]], None]] = None,
+    on_launch_config: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> "ExecutionResult":
     env = dict(os.environ)
     env.update(profile.env)
     env.update(request.extra_env)
 
-    command = list(request.args)
+    command = [str(arg) for arg in request.args]
     if request.prepend_executable and not request.shell:
         command = [profile.executable] + command
     if request.shell:
@@ -1009,6 +1543,12 @@ def _launch_profile_command_cancellable(
         cmd_obj = command
 
     display = cmd_obj if isinstance(cmd_obj, str) else " ".join(shlex.quote(x) for x in cmd_obj)
+    if on_command_prepared is not None:
+        try:
+            argv_for_log = [str(x) for x in command]
+            on_command_prepared(display, argv_for_log, profile.working_directory or None)
+        except Exception:
+            pass
     started = time.time()
     timeout_sec = request.timeout_sec if request.timeout_sec and request.timeout_sec > 0 else profile.default_timeout_sec
     completed = _run_subprocess_cancellable(
@@ -1018,6 +1558,15 @@ def _launch_profile_command_cancellable(
         cwd=profile.working_directory or None,
         env=env,
         timeout_sec=timeout_sec,
+        stdio_mode=stdio_mode,
+        on_spawn=on_spawn,
+        on_first_stdout=on_first_stdout,
+        on_first_stderr=on_first_stderr,
+        on_first_output=on_first_output,
+        on_heartbeat=on_heartbeat,
+        heartbeat_interval_sec=heartbeat_interval_sec,
+        on_exit=on_exit,
+        on_launch_config=on_launch_config,
     )
     elapsed_ms = int((time.time() - started) * 1000)
     return ExecutionResult(
@@ -1188,12 +1737,35 @@ def _resolve_runtime_profile(
     command_name: str,
     allowed_model_ids: Set[str],
 ) -> RuntimeResolution:
+    skip_required_modules_probe = command_name == "start_separation"
+    skip_import_probe = command_name == "start_separation"
+
+    def health_trace(stage: str, runtime_profile_id: str, status: str, detail: str) -> None:
+        log(
+            "INFO",
+            f"[REAL_CHAIN] {stage} request_id={request_id} runtime_profile_id={runtime_profile_id} "
+            f"status={status} detail={detail} elapsed_ms={_trace_elapsed_ms(request_id)}",
+        )
+
+    log(
+        "INFO",
+        f"[REAL_CHAIN] runtime_profile_resolve_start context={context} request_id={request_id} "
+        f"requested={requested_profile_id or 'none'} default={default_profile_id} "
+        f"skip_required_modules_probe={str(skip_required_modules_probe).lower()} "
+        f"skip_import_probe={str(skip_import_probe).lower()} "
+        f"elapsed_ms={_trace_elapsed_ms(request_id)}",
+    )
+    resolve_started_at = time.time()
     registry = _build_runtime_profile_registry()
     resolver = RuntimeResolver(registry=registry, health_checker=RuntimeHealthChecker())
     resolution = resolver.resolve(
         requested_profile_id=requested_profile_id,
         default_profile_id=default_profile_id,
+        trace_cb=health_trace,
+        skip_required_modules_probe=skip_required_modules_probe,
+        skip_import_probe=skip_import_probe,
     )
+    resolve_elapsed_ms = max(0, int((time.time() - resolve_started_at) * 1000))
     registry.validate_for_command(
         resolution.profile,
         command_name=command_name,
@@ -1212,7 +1784,14 @@ def _resolve_runtime_profile(
         f"[REAL_CHAIN] runtime_resolution context={context} request_id={request_id} "
         f"requested={resolution.requested_profile_id} actual={resolution.actual_profile_id} "
         f"fallback_reason={fallback} checks={health} "
-        f"allow_fallback={str(resolution.profile.allow_fallback).lower()} outcome={outcome}",
+        f"allow_fallback={str(resolution.profile.allow_fallback).lower()} outcome={outcome} "
+        f"resolve_elapsed_ms={resolve_elapsed_ms} elapsed_ms={_trace_elapsed_ms(request_id)}",
+    )
+    log(
+        "INFO",
+        f"[REAL_CHAIN] runtime_profile_resolve_end context={context} request_id={request_id} "
+        f"actual={resolution.actual_profile_id} healthy={str(resolution.health.healthy).lower()} "
+        f"resolve_elapsed_ms={resolve_elapsed_ms} elapsed_ms={_trace_elapsed_ms(request_id)}",
     )
     if not resolution.health.healthy:
         raise RuntimeError(
@@ -1475,8 +2054,26 @@ def _run_demucs_engine(
         model_name = DEFAULT_DEMUCS_MODEL
     expected_stems = MODEL_OUTPUT_FILENAMES.get(model_name, MODEL_OUTPUT_FILENAMES[DEFAULT_DEMUCS_MODEL])
     supported_stem_types = MODEL_SUPPORTED_STEM_TYPES.get(model_name, MODEL_SUPPORTED_STEM_TYPES[DEFAULT_DEMUCS_MODEL])
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="demucs_run_start",
+        status="success",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        detail=f"model={model_name}",
+    )
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="demucs_function_enter",
+        status="skipped",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        detail="mode=subprocess",
+    )
 
-    source_basename = Path(file_path).stem
+    source_audio_path = os.path.abspath(str(file_path))
+    output_root_path = os.path.abspath(str(output_dir))
+    source_basename = Path(source_audio_path).stem
     requested_runtime_profile = (
         (runtime_profile_override or os.environ.get(ENV_DEMUCS_RUNTIME_PROFILE, "")).strip()
         or DEFAULT_DEMUCS_RUNTIME_PROFILE_ID
@@ -1499,23 +2096,384 @@ def _run_demucs_engine(
         f"[REAL_CHAIN] start_separation demucs_selection request_id={request_id} "
         f"model={model_name} requested_profile={requested_runtime_profile} actual_profile={demucs_runtime.actual_profile_id}",
     )
+    send_event("stage_progress", {
+        "stage": "PREPROCESS",
+        "progress": 0.08,
+    })
 
     cmd = [
         "-m", "demucs",
         "-n", model_name,
-        "-o", output_dir,
-        file_path,
+        "-o", output_root_path,
+        source_audio_path,
     ]
-    _raise_if_cancel_requested(request_id, "before_demucs_launch")
-    execution = _launch_profile_command_cancellable(
-        demucs_runtime.profile,
-        ExecutionRequest(
-            args=cmd,
-            timeout_sec=1800,
-            prepend_executable=True,
-        ),
+    requested_stdio_mode = (os.environ.get("DEMUCS_SUBPROCESS_STDIO_MODE", "spool_files").strip().lower() or "spool_files")
+    allow_experimental_stdio = os.environ.get("DEMUCS_ALLOW_EXPERIMENTAL_STDIO", "").strip().lower() in {"1", "true", "yes", "on"}
+    demucs_stdio_mode = requested_stdio_mode
+    if demucs_stdio_mode not in {"inherit_stdio", "spool_files", "pipe_line_reader"}:
+        demucs_stdio_mode = "spool_files"
+    if demucs_stdio_mode != "spool_files" and not allow_experimental_stdio:
+        log(
+            "WARN",
+            f"[REAL_CHAIN] start_separation stdio_mode_forced_stable request_id={request_id} "
+            f"requested={requested_stdio_mode} effective=spool_files",
+        )
+        demucs_stdio_mode = "spool_files"
+    env_snapshot = {
+        "DEMUCS_DEVICE": (demucs_runtime.profile.env.get("DEMUCS_DEVICE") or os.environ.get("DEMUCS_DEVICE") or ""),
+        "DEMUCS_MODEL_DIR": os.environ.get("DEMUCS_MODEL_DIR", ""),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "PYTORCH_ENABLE_MPS_FALLBACK": os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", ""),
+        "DEMUCS_ALLOW_EXPERIMENTAL_STDIO": "true" if allow_experimental_stdio else "false",
+        "DEMUCS_SUBPROCESS_STDIO_MODE": demucs_stdio_mode,
+    }
+    env_overlay_keys = sorted(demucs_runtime.profile.env.keys())
+    _log_demucs_stage(
         request_id=request_id,
+        stage="demucs_subprocess_spawn_start",
+        status="pending",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        runtime_profile_id=demucs_runtime.actual_profile_id,
+        detail=f"stdio_mode={demucs_stdio_mode}",
     )
+    _raise_if_cancel_requested(request_id, "before_demucs_launch")
+    first_output_seen = False
+    first_stdout_seen = False
+    first_stderr_seen = False
+    last_output_file_count = 0
+    last_stems_file_count = 0
+    first_observed_file: Optional[str] = None
+    last_suspicious_stall_logged_no_output_ms = 0
+    demucs_cli_output_hint_logged = False
+
+    def on_spawn(pid: int) -> None:
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_spawn_end",
+            status="success",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=f"pid={pid}",
+        )
+        send_event("stage_progress", {
+            "stage": "INFER",
+            "progress": 0.2,
+        })
+
+    def on_first_stdout(sample: str) -> None:
+        nonlocal first_output_seen, first_stdout_seen
+        first_output_seen = True
+        first_stdout_seen = True
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_first_stdout",
+            status="success",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=f"sample={sample[:180]}",
+        )
+
+    def on_first_stderr(sample: str) -> None:
+        nonlocal first_output_seen, first_stderr_seen
+        first_output_seen = True
+        first_stderr_seen = True
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_first_stderr",
+            status="success",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=f"sample={sample[:180]}",
+        )
+
+    def on_first_output(source: str, sample: str) -> None:
+        nonlocal first_output_seen
+        first_output_seen = True
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_first_output",
+            status="success",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=f"source={source} sample={sample[:180]}",
+        )
+
+    def on_heartbeat(
+        pid: int,
+        subprocess_elapsed_ms: int,
+        no_output_ms: int,
+        stdout_lines: int,
+        stderr_lines: int,
+        cpu_total_ms: Optional[int],
+        cpu_delta_ms: Optional[int],
+        rss_kb: Optional[int],
+        stats_source: str,
+        stats_error: Optional[str],
+    ) -> None:
+        nonlocal last_output_file_count, last_stems_file_count, first_observed_file
+        nonlocal last_suspicious_stall_logged_no_output_ms, demucs_cli_output_hint_logged
+        output_file_count, output_preview = _scan_files_snapshot(output_dir, max_preview=1)
+        stems_file_count, stems_preview = _scan_files_snapshot(stems_dir, max_preview=1)
+        last_output_file_count = output_file_count
+        last_stems_file_count = stems_file_count
+
+        detected_file = None
+        if stems_preview:
+            detected_file = stems_preview[0]
+        elif output_preview:
+            detected_file = output_preview[0]
+        if detected_file and first_observed_file is None:
+            first_observed_file = detected_file
+            _log_demucs_stage(
+                request_id=request_id,
+                stage="demucs_subprocess_first_output_file",
+                status="success",
+                output_dir=output_dir,
+                stems_dir=stems_dir,
+                runtime_profile_id=demucs_runtime.actual_profile_id,
+                detail=f"file={_truncate_for_log(detected_file, max_len=220)}",
+            )
+
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_heartbeat",
+            status="running",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=(
+                f"pid={pid} subprocess_elapsed_ms={subprocess_elapsed_ms} "
+                f"no_output_ms={no_output_ms} still_running=true stdout_lines={stdout_lines} stderr_lines={stderr_lines} "
+                f"output_files={output_file_count} stems_files={stems_file_count} "
+                f"cpu_total_ms={cpu_total_ms if cpu_total_ms is not None else 'na'} "
+                f"cpu_delta_ms={cpu_delta_ms if cpu_delta_ms is not None else 'na'} "
+                f"rss_kb={rss_kb if rss_kb is not None else 'na'} "
+                f"stats_source={stats_source}"
+                + (f" stats_error={_truncate_for_log(stats_error, max_len=160)}" if stats_error else "")
+            ),
+        )
+
+        if (
+            no_output_ms >= DEMUCS_SILENT_STALL_THRESHOLD_MS
+            and output_file_count == 0
+            and stems_file_count == 0
+            and (no_output_ms - last_suspicious_stall_logged_no_output_ms) >= DEMUCS_SILENT_STALL_LOG_INTERVAL_MS
+        ):
+            cpu_low = cpu_delta_ms is not None and cpu_delta_ms <= DEMUCS_LOW_CPU_DELTA_THRESHOLD_MS
+            stall_status = "suspicious_stall" if cpu_low else "silent_watch"
+            _log_demucs_stage(
+                request_id=request_id,
+                stage="demucs_subprocess_suspicious_stall",
+                status=stall_status,
+                output_dir=output_dir,
+                stems_dir=stems_dir,
+                runtime_profile_id=demucs_runtime.actual_profile_id,
+                detail=(
+                    f"pid={pid} no_output_ms={no_output_ms} output_files=0 stems_files=0 "
+                    f"cpu_delta_ms={cpu_delta_ms if cpu_delta_ms is not None else 'na'} "
+                    f"cpu_total_ms={cpu_total_ms if cpu_total_ms is not None else 'na'} "
+                    f"rss_kb={rss_kb if rss_kb is not None else 'na'} "
+                    f"stats_source={stats_source}"
+                    + (f" stats_error={_truncate_for_log(stats_error, max_len=160)}" if stats_error else "")
+                ),
+            )
+            last_suspicious_stall_logged_no_output_ms = no_output_ms
+
+        if (
+            not demucs_cli_output_hint_logged
+            and stdout_lines == 0
+            and stderr_lines == 0
+            and no_output_ms >= 30_000
+        ):
+            demucs_cli_output_hint_logged = True
+            _log_demucs_stage(
+                request_id=request_id,
+                stage="demucs_cli_output_hint",
+                status="info",
+                output_dir=output_dir,
+                stems_dir=stems_dir,
+                runtime_profile_id=demucs_runtime.actual_profile_id,
+                detail=(
+                    "demucs_cli_may_be_quiet_in_non_tty_or_progress_bar_suppressed; "
+                    f"current_stream_capture_mode={demucs_stdio_mode}"
+                ),
+            )
+
+    def on_exit(
+        returncode: int,
+        subprocess_elapsed_ms: int,
+        cpu_total_ms: Optional[int],
+        rss_kb: Optional[int],
+        stats_source: str,
+        stats_error: Optional[str],
+    ) -> None:
+        signal_name = "none"
+        if returncode < 0:
+            signal_name = str(-returncode)
+        output_file_count, _output_preview = _scan_files_snapshot(output_dir, max_preview=1)
+        stems_file_count, _stems_preview = _scan_files_snapshot(stems_dir, max_preview=1)
+        final_output_files = max(last_output_file_count, output_file_count)
+        final_stems_files = max(last_stems_file_count, stems_file_count)
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_exit",
+            status="success" if returncode == 0 else "failed",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=(
+                f"exit_code={returncode} signal={signal_name} subprocess_elapsed_ms={subprocess_elapsed_ms} "
+                f"final_output_files={final_output_files} final_stems_files={final_stems_files} "
+                f"cpu_total_ms={cpu_total_ms if cpu_total_ms is not None else 'na'} "
+                f"rss_kb={rss_kb if rss_kb is not None else 'na'} "
+                f"stats_source={stats_source}"
+                + (f" stats_error={_truncate_for_log(stats_error, max_len=160)}" if stats_error else "")
+            ),
+        )
+
+    def on_command_prepared(display: str, argv: List[str], cwd: Optional[str]) -> None:
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_command",
+            status="success",
+            output_dir=output_root_path,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=json.dumps(
+                {
+                    "pythonExecutable": demucs_runtime.profile.executable,
+                    "entry": "-m demucs",
+                    "command": _truncate_for_log(display, max_len=1000),
+                    "args": [_truncate_for_log(x, max_len=220) for x in argv],
+                    "actualInputFileArg": argv[-1] if len(argv) > 0 else "",
+                    "workingDirectory": cwd or os.getcwd(),
+                    "env": env_snapshot,
+                    "expectedInputFileArg": source_audio_path,
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    def on_launch_config(config: Dict[str, Any]) -> None:
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_launch_config",
+            status="success",
+            output_dir=output_root_path,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=json.dumps(
+                {
+                    "stdin": config.get("stdin"),
+                    "stdout": config.get("stdout"),
+                    "stderr": config.get("stderr"),
+                    "stdioMode": config.get("stdio_mode"),
+                    "shell": bool(config.get("shell")),
+                    "cwd": config.get("cwd") or os.getcwd(),
+                    "closeFds": bool(config.get("close_fds")),
+                    "creationFlags": int(config.get("creationflags", 0)),
+                    "startupInfo": config.get("startupinfo", "none"),
+                    "inheritsParentStdio": bool(config.get("inherits_parent_stdio")),
+                    "likelyIpcPipeInherited": bool(config.get("likely_ipc_pipe_inherited")),
+                    "handleInheritanceMode": config.get("handle_inheritance_mode", "unknown"),
+                    "envStrategy": "inherit_then_overlay",
+                    "envOverlayKeys": env_overlay_keys,
+                    "cancelMonitorAttachedAfterSpawn": bool(config.get("cancel_monitor_attached_after_spawn")),
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    try:
+        execution = _launch_profile_command_cancellable(
+            demucs_runtime.profile,
+            ExecutionRequest(
+                args=cmd,
+                timeout_sec=1800,
+                prepend_executable=True,
+            ),
+            request_id=request_id,
+            stdio_mode=demucs_stdio_mode,
+            on_spawn=on_spawn,
+            on_first_stdout=on_first_stdout,
+            on_first_stderr=on_first_stderr,
+            on_first_output=on_first_output,
+            on_heartbeat=on_heartbeat,
+            heartbeat_interval_sec=15.0,
+            on_exit=on_exit,
+            on_command_prepared=on_command_prepared,
+            on_launch_config=on_launch_config,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_output_files, _timeout_output_preview = _scan_files_snapshot(output_dir, max_preview=1)
+        timeout_stems_files, _timeout_stems_preview = _scan_files_snapshot(stems_dir, max_preview=1)
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_exit",
+            status="timeout",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=(
+                f"exit_code=timeout signal=none subprocess_elapsed_ms={_trace_elapsed_ms(request_id)} "
+                f"final_output_files={timeout_output_files} final_stems_files={timeout_stems_files} "
+                f"timeout_sec={getattr(exc, 'timeout', 'unknown')}"
+            ),
+        )
+        raise
+    except Exception as exc:
+        failure_output_files, _failure_output_preview = _scan_files_snapshot(output_dir, max_preview=1)
+        failure_stems_files, _failure_stems_preview = _scan_files_snapshot(stems_dir, max_preview=1)
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_exit",
+            status="failed",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=(
+                f"exit_code=exception signal=none subprocess_elapsed_ms={_trace_elapsed_ms(request_id)} "
+                f"final_output_files={failure_output_files} final_stems_files={failure_stems_files} "
+                f"error={exc}"
+            ),
+        )
+        raise
+
+    if not first_stdout_seen:
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_first_stdout",
+            status="missing",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail="no_stdout_captured",
+        )
+    if not first_stderr_seen:
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_first_stderr",
+            status="missing",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail="no_stderr_captured",
+        )
+    if not first_output_seen:
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_subprocess_first_output",
+            status="missing",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail="no_stdout_or_stderr_captured",
+        )
     log(
         "INFO",
         f"[REAL_CHAIN] start_separation demucs_cmd request_id={request_id} "
@@ -1537,6 +2495,15 @@ def _run_demucs_engine(
     _raise_if_cancel_requested(request_id, "after_demucs_return")
 
     demucs_output_dir = os.path.join(output_dir, model_name, source_basename)
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="demucs_outputs_scan_start",
+        status="pending",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        runtime_profile_id=demucs_runtime.actual_profile_id,
+        detail=f"demucs_output_dir={demucs_output_dir}",
+    )
     if not os.path.isdir(demucs_output_dir):
         model_dir = os.path.join(output_dir, model_name)
         if os.path.isdir(model_dir):
@@ -1545,6 +2512,15 @@ def _run_demucs_engine(
                 demucs_output_dir = os.path.join(model_dir, subdirs[0])
 
     if not os.path.isdir(demucs_output_dir):
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_outputs_scan_end",
+            status="failed",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail=f"output_not_found={demucs_output_dir}",
+        )
         raise RuntimeError(f"Demucs output directory not found: {demucs_output_dir}")
 
     stems = []
@@ -1568,7 +2544,84 @@ def _run_demucs_engine(
             log("WARN", f"[REAL_CHAIN] start_separation demucs_expected_stem_missing request_id={request_id} path={src}")
 
     if len(stems) == 0:
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="demucs_outputs_scan_end",
+            status="failed",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail="produced_files_count=0",
+        )
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="produced_filenames",
+            status="success",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail="[]",
+        )
+        _log_demucs_stage(
+            request_id=request_id,
+            stage="stems_validation_result",
+            status="failed",
+            output_dir=output_dir,
+            stems_dir=stems_dir,
+            runtime_profile_id=demucs_runtime.actual_profile_id,
+            detail="reason=no_stem_files",
+        )
         raise RuntimeError("No stem files produced by Demucs")
+
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="produced_files_count",
+        status="success",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        runtime_profile_id=demucs_runtime.actual_profile_id,
+        detail=str(len(stems)),
+    )
+    produced_filenames = [stem.get("filename", "") for stem in stems if stem.get("filename", "")]
+    if len(produced_filenames) > 12:
+        preview = produced_filenames[:12] + [f"...(+{len(produced_filenames) - 12} more)"]
+    else:
+        preview = produced_filenames
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="produced_filenames",
+        status="success",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        runtime_profile_id=demucs_runtime.actual_profile_id,
+        detail=json.dumps(preview, ensure_ascii=False),
+    )
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="demucs_outputs_scan_end",
+        status="success",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        runtime_profile_id=demucs_runtime.actual_profile_id,
+        detail=f"demucs_output_dir={demucs_output_dir}",
+    )
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="stems_validation_result",
+        status="success",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        runtime_profile_id=demucs_runtime.actual_profile_id,
+        detail=f"validated={len(stems)}",
+    )
+    _log_demucs_stage(
+        request_id=request_id,
+        stage="demucs_function_return",
+        status="skipped",
+        output_dir=output_dir,
+        stems_dir=stems_dir,
+        detail="mode=subprocess",
+    )
 
     # cleanup temp demucs tree
     try:
@@ -1756,6 +2809,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
     output_dir = payload.get("outputDir", "")
     model_override = str(payload.get("modelName", "") or "").strip() or None
     runtime_profile_override = str(payload.get("runtimeProfileId", "") or "").strip() or None
+    _TASK_TRACE_START_MS[request_id] = time.time()
     _raise_if_cancel_requested(request_id, "before_validate_inputs")
 
     if not file_path or not os.path.isfile(file_path):
@@ -1781,25 +2835,14 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
         "INFO",
         f"[REAL_CHAIN] start_separation begin request_id={request_id} "
         f"file_path={file_path} output_dir={output_dir} stems_dir={stems_dir} "
-        f"model_override={model_override or 'none'} runtime_profile_override={runtime_profile_override or 'none'}",
+        f"model_override={model_override or 'none'} runtime_profile_override={runtime_profile_override or 'none'} "
+        f"elapsed_ms={_trace_elapsed_ms(request_id)}",
     )
-
-    # 鍙戦€?progress: preprocessing
-    send_event("stage_progress", {
-        "stage": "PREPROCESS",
-        "progress": 0.1,
-    })
 
     try:
         _raise_if_cancel_requested(request_id, "before_engine_select")
         selected_engine = _resolve_separation_engine(request_id)
         log("INFO", f"[REAL_CHAIN] start_separation engine_selected request_id={request_id} engine={selected_engine}")
-
-        # 鍙戦€?progress: infer starting
-        send_event("stage_progress", {
-            "stage": "INFER",
-            "progress": 0.2,
-        })
 
         used_fallback = False
         engine_result: Optional[dict] = None
@@ -1881,24 +2924,36 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
             "progress": 1.0,
         })
 
-        # 鍙戦€佹垚鍔?response 鈥?缁撴瀯鍖归厤 RawSeparationResult
-        response_data = {
-            "engineVersion": engine_result.get("engineVersion", "demucs-htdemucs-v4"),
-            "modelName": engine_result.get("modelName", "htdemucs"),
-            "supportedStemTypes": engine_result.get("supportedStemTypes", MODEL_SUPPORTED_STEM_TYPES[DEFAULT_DEMUCS_MODEL]),
-            "sourceDurationMs": get_audio_duration_ms(file_path),
-            "stems": engine_result.get("stems", []),
-            "stemRoutingVersion": routing_plan.get("version", "stem-routing-v1"),
-            "routingMode": routing_plan.get("routingMode", "base_only"),
-            "stemRoutingAssignments": routing_plan.get("assignments", []),
-        }
-        if used_fallback:
-            response_data["fallbackFromEngine"] = "bs_roformer_sw"
-            response_data["fallbackToEngine"] = "demucs"
+        # Build final response payload. Avoid re-probing original file duration here,
+        # because it can block in some environments and prevent response emission.
+        try:
+            source_duration_ms = resolve_source_duration_ms(engine_result)
+            response_data = {
+                "engineVersion": engine_result.get("engineVersion", "demucs-htdemucs-v4"),
+                "modelName": engine_result.get("modelName", "htdemucs"),
+                "supportedStemTypes": engine_result.get("supportedStemTypes", MODEL_SUPPORTED_STEM_TYPES[DEFAULT_DEMUCS_MODEL]),
+                "sourceDurationMs": source_duration_ms,
+                "stems": engine_result.get("stems", []),
+                "stemRoutingVersion": routing_plan.get("version", "stem-routing-v1"),
+                "routingMode": routing_plan.get("routingMode", "base_only"),
+                "stemRoutingAssignments": routing_plan.get("assignments", []),
+            }
+            if used_fallback:
+                response_data["fallbackFromEngine"] = "bs_roformer_sw"
+                response_data["fallbackToEngine"] = "demucs"
+        except Exception as response_build_exc:
+            log(
+                "ERROR",
+                f"[REAL_CHAIN] start_separation response_build_failed request_id={request_id} "
+                f"error={response_build_exc} traceback={traceback.format_exc()}",
+            )
+            send_response(request_id, False, error={
+                "code": "ENGINE_OUTPUT_INVALID",
+                "message": f"Failed to build separation response payload: {response_build_exc}",
+            })
+            return
 
-        send_response(request_id, True, data={
-            **response_data,
-        })
+        send_response(request_id, True, data={**response_data})
 
         log(
             "INFO",

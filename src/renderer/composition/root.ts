@@ -41,6 +41,7 @@ import type { ICacheElectronAPI } from '../pages/CacheManagementPage';
  * preload.ts 通过 contextBridge 暴露到 window.electronAPI 的全部方法
  */
 interface ElectronAPI extends IProjectElectronAPI, IJobElectronAPI, IExportElectronAPI {
+  isDevMode: () => boolean;
   // ICacheElectronAPI 方法也在此对象上
   getCacheStats: ICacheElectronAPI['getCacheStats'];
   clearProjectCache: ICacheElectronAPI['clearProjectCache'];

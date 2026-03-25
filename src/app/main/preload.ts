@@ -8,6 +8,9 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  isDevMode: () =>
+    process.env.NODE_ENV === 'development',
+
   // ── IProjectElectronAPI subset ──
   getRecentProjects: (limit: number) =>
     ipcRenderer.invoke('project:getRecent', limit),

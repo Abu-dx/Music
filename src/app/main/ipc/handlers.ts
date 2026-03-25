@@ -73,7 +73,10 @@ type CachedChordSegmentDTO = {
   sourceFlags?: string[];
   symbol?: string;
   chordType?: string;
+  quality?: string;
   bassNote?: string;
+  adds?: string[];
+  suspensions?: string[];
   extensions?: string[];
   alterations?: string[];
   omissions?: string[];
@@ -101,16 +104,35 @@ type CachedTempoAnalysisDTO = {
     halfTimeBpm?: number;
     doubleTimeBpm?: number;
     reason?: string;
+    explanation?: string;
+    confidenceGap?: number;
+  };
+  methodMetadata?: {
+    backend?: string;
+    sampleRate?: number;
+    hopLength?: number;
+    beatCount?: number;
+    stability?: {
+      isStable?: boolean;
+      cv?: number;
+      confidenceRatio?: number;
+    };
+    [key: string]: unknown;
   };
 };
 
 type CachedChordAnalysisDTO = {
   projectId: string;
+  parentResultId?: string;
+  sourceSignature?: string;
   source: string;
   analyzerType: string;
   analysisMethods?: {
     chordAnalyzer: string;
     tempoAnalyzer: string;
+    chordAnalyzerVersion?: string;
+    tempoAnalyzerVersion?: string;
+    vocabularyTag?: string;
   };
   segments: CachedChordSegmentDTO[];
   elapsedMs: number;
@@ -119,8 +141,10 @@ type CachedChordAnalysisDTO = {
   estimatedKey?: string;
   estimatedBpm?: number;
   tempo?: CachedTempoAnalysisDTO;
+  tempoAnalysisVersion?: string;
   analysisVersion?: string;
   vocabularyVersion?: string;
+  analyzerFingerprint?: string;
   chordVocabulary?: {
     selected: string;
     supportsExtendedChords: boolean;
@@ -155,6 +179,10 @@ const chordAnalysisResultCache = new Map<string, CachedChordAnalysisEntry>();
 const DEFAULT_WAVEFORM_CACHE_PATH = 'waveform/master-waveform.json';
 const DEFAULT_CHORD_CACHE_PATH = 'chord/chord-analysis.json';
 const DEFAULT_ACTIVE_RESULT_ID = 'main';
+const DEFAULT_CHORD_ANALYZER_ID = 'chord_rule_chroma_v1';
+const DEFAULT_TEMPO_ANALYZER_ID = 'tempo_rule_onset_v1';
+const DEFAULT_TEMPO_ANALYSIS_VERSION = 'tempo-v1';
+const DEFAULT_CHORD_VOCABULARY_VERSION = 'triad-v1';
 const DEFAULT_RESULT_MODEL_ID = 'demucs';
 const DEFAULT_RESULT_RUNTIME_PROFILE_ID = 'demucs_env_override';
 const PILOT_MODEL_ID = 'htdemucs_6s';
@@ -197,10 +225,26 @@ function getChordCacheEntry(
   parentResultId: string,
   sourceSignature: string | null,
   analysisVersion: string,
+  analyzerFingerprint: string,
 ): CachedChordAnalysisEntry | null {
   if (!sourceSignature) return null;
-  const cacheKey = buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, analysisVersion);
-  return chordAnalysisResultCache.get(cacheKey) ?? null;
+  const cacheKey = buildChordAnalysisCacheKey(
+    projectId,
+    parentResultId,
+    sourceSignature,
+    analysisVersion,
+    analyzerFingerprint,
+  );
+  const strict = chordAnalysisResultCache.get(cacheKey);
+  if (strict) return strict;
+
+  // Legacy fallback: old in-memory entries were keyed without analyzer fingerprint.
+  const legacyKey = buildLegacyChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, analysisVersion);
+  const legacy = chordAnalysisResultCache.get(legacyKey);
+  if (!legacy) return null;
+  const legacyFingerprint = legacy.result.analyzerFingerprint
+    ?? deriveAnalyzerFingerprintFromResult(legacy.result);
+  return legacyFingerprint === analyzerFingerprint ? legacy : null;
 }
 
 function setChordCacheEntry(entry: CachedChordAnalysisEntry): void {
@@ -348,6 +392,9 @@ function toSeparationFailureMessage(err: unknown): string {
   if (raw.includes('manifest') || raw.includes('MANIFEST')) {
     return '分离结果已生成，但项目元数据写入失败，请查看日志并重试';
   }
+  if (raw.includes('SEPARATION_STEMS_NOT_PERSISTED')) {
+    return '分离完成但轨道写入失败，请重试';
+  }
   if (raw.includes('WORKER_NOT_RUNNING') || raw.includes('worker_not_available')) {
     return 'Worker 不可用，请重启应用后重试';
   }
@@ -463,23 +510,68 @@ async function resolveAnalysisSourceFilePath(
   infra: WorkerInfra,
   stemsOverride?: Array<{ stemType: StemType; exists: boolean; filePath: string }>,
 ): Promise<string | null> {
-  if (project.originalFilePath && fs.existsSync(project.originalFilePath)) {
+  const originalFilePath =
+    typeof project.originalFilePath === 'string' && project.originalFilePath.trim().length > 0
+      ? project.originalFilePath
+      : null;
+  if (originalFilePath && fs.existsSync(originalFilePath)) {
+    console.log(
+      `[REAL_CHAIN] handlers.resolveAnalysisSourceFilePath projectId="${project.id}" ` +
+      'fallbackReason="none" sourceKind="original"',
+    );
     return project.originalFilePath;
+  }
+  if (originalFilePath) {
+    console.log(
+      `[REAL_CHAIN] handlers.resolveAnalysisSourceFilePath projectId="${project.id}" ` +
+      'fallbackReason="original_missing -> stem_fallback" sourceKind="stem"',
+    );
   }
 
   const stems = stemsOverride ?? await infra.stemFileRepo.findByProjectId(project.id);
-  if (stems.length === 0) return null;
+  if (stems.length === 0) {
+    console.log(
+      `[REAL_CHAIN] handlers.resolveAnalysisSourceFilePath projectId="${project.id}" ` +
+      'fallbackReason="no_candidate_stems" sourceKind="none"',
+    );
+    return null;
+  }
 
   const existing = stems.filter((s) => s.exists && typeof s.filePath === 'string' && s.filePath.trim().length > 0);
-  if (existing.length === 0) return null;
+  if (existing.length === 0) {
+    console.log(
+      `[REAL_CHAIN] handlers.resolveAnalysisSourceFilePath projectId="${project.id}" ` +
+      'fallbackReason="candidate_stems_not_playable" sourceKind="none"',
+    );
+    return null;
+  }
 
   for (const preferredType of ANALYSIS_SOURCE_STEM_PRIORITY) {
     const matched = existing.find((s) => s.stemType === preferredType && fs.existsSync(s.filePath));
-    if (matched) return matched.filePath;
+    if (matched) {
+      console.log(
+        `[REAL_CHAIN] handlers.resolveAnalysisSourceFilePath projectId="${project.id}" ` +
+        `fallbackReason="${originalFilePath ? 'original_missing -> stem_fallback' : 'original_absent -> stem_fallback'}" ` +
+        `sourceKind="stem" selectedStemType="${matched.stemType}"`,
+      );
+      return matched.filePath;
+    }
   }
 
   const firstExisting = existing.find((s) => fs.existsSync(s.filePath));
-  return firstExisting?.filePath ?? null;
+  if (firstExisting) {
+    console.log(
+      `[REAL_CHAIN] handlers.resolveAnalysisSourceFilePath projectId="${project.id}" ` +
+      `fallbackReason="${originalFilePath ? 'original_missing -> stem_fallback' : 'original_absent -> stem_fallback'}" ` +
+      `sourceKind="stem" selectedStemType="${firstExisting.stemType}"`,
+    );
+    return firstExisting.filePath;
+  }
+  console.log(
+    `[REAL_CHAIN] handlers.resolveAnalysisSourceFilePath projectId="${project.id}" ` +
+    'fallbackReason="stem_candidates_missing_on_disk" sourceKind="none"',
+  );
+  return null;
 }
 
 function ensureWorkerAcceptingRequests(infra: WorkerInfra): boolean {
@@ -499,9 +591,88 @@ function getChordAnalysisVersionHint(): string {
   return hint && hint.length > 0 ? hint : 'chord-v1';
 }
 
+function getTempoAnalysisVersionHint(): string {
+  const hint = process.env.TEMPO_ANALYSIS_VERSION?.trim();
+  return hint && hint.length > 0 ? hint : DEFAULT_TEMPO_ANALYSIS_VERSION;
+}
+
+function getChordVocabularyVersionHint(): string {
+  const hint = process.env.CHORD_VOCABULARY_VERSION?.trim();
+  return hint && hint.length > 0 ? hint : DEFAULT_CHORD_VOCABULARY_VERSION;
+}
+
+function getChordAnalyzerSelectionHint(): string {
+  const hint = process.env.CHORD_ANALYZER?.trim();
+  return hint && hint.length > 0 ? hint : DEFAULT_CHORD_ANALYZER_ID;
+}
+
+function getTempoAnalyzerSelectionHint(): string {
+  const hint = process.env.TEMPO_ANALYZER?.trim();
+  return hint && hint.length > 0 ? hint : DEFAULT_TEMPO_ANALYZER_ID;
+}
+
 function getWaveformAnalysisVersionHint(): string {
   const hint = process.env.WAVEFORM_ANALYSIS_VERSION?.trim();
   return hint && hint.length > 0 ? hint : 'waveform-v1';
+}
+
+function normalizeAnalyzerFingerprintToken(value: unknown, fallback: string): string {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (normalized.length > 0) return normalized;
+  return fallback.trim().toLowerCase();
+}
+
+function buildAnalyzerFingerprint(input: {
+  chordAnalyzer?: string;
+  tempoAnalyzer?: string;
+  chordAnalysisVersion?: string;
+  tempoAnalysisVersion?: string;
+  vocabularyVersion?: string;
+  vocabularyTag?: string;
+}): string {
+  const chordAnalyzer = normalizeAnalyzerFingerprintToken(input.chordAnalyzer, DEFAULT_CHORD_ANALYZER_ID);
+  const tempoAnalyzer = normalizeAnalyzerFingerprintToken(input.tempoAnalyzer, DEFAULT_TEMPO_ANALYZER_ID);
+  const chordAnalysisVersion = normalizeAnalyzerFingerprintToken(input.chordAnalysisVersion, getChordAnalysisVersionHint());
+  const tempoAnalysisVersion = normalizeAnalyzerFingerprintToken(input.tempoAnalysisVersion, getTempoAnalysisVersionHint());
+  const vocabularyVersion = normalizeAnalyzerFingerprintToken(input.vocabularyVersion, getChordVocabularyVersionHint());
+  const vocabularyTag = normalizeAnalyzerFingerprintToken(input.vocabularyTag, 'triad');
+  return `ca=${chordAnalyzer}|ta=${tempoAnalyzer}|cv=${chordAnalysisVersion}|tv=${tempoAnalysisVersion}|vv=${vocabularyVersion}|vt=${vocabularyTag}`;
+}
+
+function deriveAnalyzerFingerprintFromResult(result: CachedChordAnalysisDTO): string {
+  const vocabularyTag =
+    (typeof result.chordVocabulary?.selected === 'string' && result.chordVocabulary.selected.trim().length > 0)
+      ? result.chordVocabulary.selected
+      : (result.segments.find((segment) => typeof segment.vocabularyTag === 'string' && segment.vocabularyTag.trim().length > 0)?.vocabularyTag ?? 'triad');
+  return buildAnalyzerFingerprint({
+    chordAnalyzer: result.analysisMethods?.chordAnalyzer,
+    tempoAnalyzer: result.analysisMethods?.tempoAnalyzer,
+    chordAnalysisVersion: result.analysisVersion,
+    tempoAnalysisVersion: result.tempoAnalysisVersion,
+    vocabularyVersion: result.vocabularyVersion,
+    vocabularyTag,
+  });
+}
+
+function normalizeResultSetCachePathSegment(parentResultId: string): string {
+  const normalized = normalizeParentResultId(parentResultId);
+  if (normalized === DEFAULT_ACTIVE_RESULT_ID) return DEFAULT_ACTIVE_RESULT_ID;
+  const safe = normalized.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return safe.length > 0 ? safe : DEFAULT_ACTIVE_RESULT_ID;
+}
+
+function getResultSetWaveformCachePath(parentResultId: string): string {
+  const segment = normalizeResultSetCachePathSegment(parentResultId);
+  return segment === DEFAULT_ACTIVE_RESULT_ID
+    ? DEFAULT_WAVEFORM_CACHE_PATH
+    : `waveform/${segment}/master-waveform.json`;
+}
+
+function getResultSetChordCachePath(parentResultId: string): string {
+  const segment = normalizeResultSetCachePathSegment(parentResultId);
+  return segment === DEFAULT_ACTIVE_RESULT_ID
+    ? DEFAULT_CHORD_CACHE_PATH
+    : `chord/${segment}/chord-analysis.json`;
 }
 
 function normalizePathForCacheKey(filePath: string): string {
@@ -736,6 +907,16 @@ function buildChordAnalysisCacheKey(
   parentResultId: string,
   sourceSignature: string,
   analysisVersion: string,
+  analyzerFingerprint: string,
+): string {
+  return `${projectId}::${parentResultId}::${sourceSignature}::${analysisVersion}::${analyzerFingerprint}`;
+}
+
+function buildLegacyChordAnalysisCacheKey(
+  projectId: string,
+  parentResultId: string,
+  sourceSignature: string,
+  analysisVersion: string,
 ): string {
   return `${projectId}::${parentResultId}::${sourceSignature}::${analysisVersion}`;
 }
@@ -764,23 +945,12 @@ function sanitizeChordWarnings(rawWarnings: unknown): string[] {
     .filter((item, index, array) => array.indexOf(item) === index);
 }
 
-async function loadPersistedWaveformResult(
-  project: Project,
-  expectedAnalysisVersion: string,
+function normalizePersistedWaveformPayload(
+  raw: Record<string, unknown>,
+  fallbackAnalysisVersion: string,
   parentResultId: string,
   sourceSignature: string | null,
-): Promise<CachedWaveformDTO | null> {
-  const refs = await readManifestAnalysisRefs(project.cacheDir);
-  const waveformRef = refs?.waveform;
-  if (!waveformRef) return null;
-  if (waveformRef.version !== expectedAnalysisVersion) return null;
-  if (waveformRef.parentResultId && waveformRef.parentResultId !== parentResultId) return null;
-  if (!waveformRef.parentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
-  if (sourceSignature && waveformRef.sourceSignature && waveformRef.sourceSignature !== sourceSignature) return null;
-
-  const raw = await readProjectJsonRecord(project.cacheDir, waveformRef.path);
-  if (!raw) return null;
-
+): CachedWaveformDTO | null {
   const persistedSignature = typeof raw.sourceSignature === 'string' ? raw.sourceSignature : null;
   if (sourceSignature && persistedSignature && persistedSignature !== sourceSignature) {
     return null;
@@ -818,8 +988,45 @@ async function loadPersistedWaveformResult(
     analysisVersion:
       typeof raw.analysisVersion === 'string' && raw.analysisVersion.trim().length > 0
         ? raw.analysisVersion.trim()
-        : waveformRef.version,
+        : fallbackAnalysisVersion,
   };
+}
+
+async function loadPersistedWaveformResult(
+  project: Project,
+  expectedAnalysisVersion: string,
+  parentResultId: string,
+  sourceSignature: string | null,
+): Promise<CachedWaveformDTO | null> {
+  const scopedWaveformPath = getResultSetWaveformCachePath(parentResultId);
+  const scopedRaw = await readProjectJsonRecord(project.cacheDir, scopedWaveformPath);
+  if (scopedRaw) {
+    const scopedParsed = normalizePersistedWaveformPayload(
+      scopedRaw,
+      expectedAnalysisVersion,
+      parentResultId,
+      sourceSignature,
+    );
+    if (scopedParsed && scopedParsed.analysisVersion === expectedAnalysisVersion) {
+      return scopedParsed;
+    }
+  }
+
+  // Legacy fallback: manifest single-slot waveform ref.
+  const refs = await readManifestAnalysisRefs(project.cacheDir);
+  const waveformRef = refs?.waveform;
+  if (!waveformRef) return null;
+  if (waveformRef.version !== expectedAnalysisVersion) return null;
+  if (waveformRef.parentResultId && waveformRef.parentResultId !== parentResultId) return null;
+  if (!waveformRef.parentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
+  if (sourceSignature && waveformRef.sourceSignature && waveformRef.sourceSignature !== sourceSignature) return null;
+
+  const raw = await readProjectJsonRecord(project.cacheDir, waveformRef.path);
+  if (!raw) return null;
+  const parsed = normalizePersistedWaveformPayload(raw, waveformRef.version, parentResultId, sourceSignature);
+  if (!parsed) return null;
+  if (parsed.analysisVersion !== expectedAnalysisVersion) return null;
+  return parsed;
 }
 
 async function persistWaveformResult(
@@ -832,8 +1039,7 @@ async function persistWaveformResult(
     typeof waveform.analysisVersion === 'string' && waveform.analysisVersion.trim().length > 0
       ? waveform.analysisVersion.trim()
       : getWaveformAnalysisVersionHint();
-  const refs = await readManifestAnalysisRefs(project.cacheDir);
-  const waveformPath = refs?.waveform?.path ?? DEFAULT_WAVEFORM_CACHE_PATH;
+  const waveformPath = getResultSetWaveformCachePath(parentResultId);
 
   await writeProjectJsonRecord(project.cacheDir, waveformPath, {
     ...waveform,
@@ -866,7 +1072,10 @@ function normalizePersistedChordSegments(raw: unknown): CachedChordSegmentDTO[] 
       sourceFlags: Array.isArray(seg.sourceFlags) ? seg.sourceFlags.filter((f): f is string => typeof f === 'string') : undefined,
       symbol: typeof seg.symbol === 'string' ? seg.symbol : undefined,
       chordType: typeof seg.chordType === 'string' ? seg.chordType : undefined,
+      quality: typeof seg.quality === 'string' ? seg.quality : undefined,
       bassNote: typeof seg.bassNote === 'string' ? seg.bassNote : undefined,
+      adds: Array.isArray(seg.adds) ? seg.adds.filter((v): v is string => typeof v === 'string') : undefined,
+      suspensions: Array.isArray(seg.suspensions) ? seg.suspensions.filter((v): v is string => typeof v === 'string') : undefined,
       extensions: Array.isArray(seg.extensions) ? seg.extensions.filter((v): v is string => typeof v === 'string') : undefined,
       alterations: Array.isArray(seg.alterations) ? seg.alterations.filter((v): v is string => typeof v === 'string') : undefined,
       omissions: Array.isArray(seg.omissions) ? seg.omissions.filter((v): v is string => typeof v === 'string') : undefined,
@@ -892,7 +1101,181 @@ async function loadPersistedChordResult(
   expectedAnalysisVersion: string,
   parentResultId: string,
   sourceSignature: string | null,
+  expectedAnalyzerFingerprint: string,
 ): Promise<CachedChordAnalysisDTO | null> {
+  const normalizePersistedChordPayload = (
+    raw: Record<string, unknown>,
+    fallbackAnalysisVersion: string,
+    fallbackVocabularyVersion: string,
+  ): CachedChordAnalysisDTO | null => {
+    const persistedSignature = typeof raw.sourceSignature === 'string' ? raw.sourceSignature : null;
+    if (sourceSignature && persistedSignature && persistedSignature !== sourceSignature) {
+      return null;
+    }
+    const persistedParentResultId = typeof raw.parentResultId === 'string' ? raw.parentResultId.trim() : '';
+    if (persistedParentResultId && persistedParentResultId !== parentResultId) return null;
+    if (!persistedParentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
+
+    const segments = normalizePersistedChordSegments(raw.segments);
+    if (!Array.isArray(raw.segments)) return null;
+
+    const elapsedMs = typeof raw.elapsedMs === 'number' && Number.isFinite(raw.elapsedMs)
+      ? Math.max(0, Math.floor(raw.elapsedMs))
+      : 0;
+    const analyzedAt = typeof raw.analyzedAt === 'number' && Number.isFinite(raw.analyzedAt)
+      ? Math.floor(raw.analyzedAt)
+      : Date.now();
+    const audioDurationMs = typeof raw.audioDurationMs === 'number' && Number.isFinite(raw.audioDurationMs)
+      ? Math.max(0, Math.floor(raw.audioDurationMs))
+      : (project.durationMs ?? 0);
+    const estimatedBpm = typeof raw.estimatedBpm === 'number' && Number.isFinite(raw.estimatedBpm)
+      ? raw.estimatedBpm
+      : undefined;
+    const warnings = sanitizeChordWarnings(raw.warnings);
+    const rawTempo = isObjectLike(raw.tempo) ? raw.tempo : null;
+    const rawAnalysisMethods = isObjectLike(raw.analysisMethods) ? raw.analysisMethods : null;
+    const rawChordVocabulary = isObjectLike(raw.chordVocabulary) ? raw.chordVocabulary : null;
+
+    const tempo = rawTempo
+      ? {
+        primaryBpm: typeof rawTempo.primaryBpm === 'number' ? rawTempo.primaryBpm : undefined,
+        confidence: typeof rawTempo.confidence === 'number' ? rawTempo.confidence : undefined,
+        method: typeof rawTempo.method === 'string' ? rawTempo.method : 'tempo_default',
+        candidates: Array.isArray(rawTempo.candidates)
+          ? rawTempo.candidates
+            .filter(isObjectLike)
+            .filter((item) => typeof item.bpm === 'number' && Number.isFinite(item.bpm))
+            .map((item) => ({
+              bpm: item.bpm as number,
+              confidence: typeof item.confidence === 'number' ? item.confidence : undefined,
+              relation: typeof item.relation === 'string' ? item.relation : undefined,
+              method: typeof item.method === 'string' ? item.method : undefined,
+            }))
+          : [],
+        ambiguity: isObjectLike(rawTempo.ambiguity)
+          ? {
+            isAmbiguous: Boolean(rawTempo.ambiguity.isAmbiguous),
+            halfTimeBpm: typeof rawTempo.ambiguity.halfTimeBpm === 'number'
+              ? rawTempo.ambiguity.halfTimeBpm
+              : undefined,
+            doubleTimeBpm: typeof rawTempo.ambiguity.doubleTimeBpm === 'number'
+              ? rawTempo.ambiguity.doubleTimeBpm
+              : undefined,
+            reason: typeof rawTempo.ambiguity.reason === 'string'
+              ? rawTempo.ambiguity.reason
+              : undefined,
+            explanation: typeof rawTempo.ambiguity.explanation === 'string'
+              ? rawTempo.ambiguity.explanation
+              : undefined,
+            confidenceGap: typeof rawTempo.ambiguity.confidenceGap === 'number'
+              ? rawTempo.ambiguity.confidenceGap
+              : undefined,
+          }
+          : undefined,
+        methodMetadata: isObjectLike(rawTempo.methodMetadata)
+          ? { ...rawTempo.methodMetadata }
+          : undefined,
+      }
+      : undefined;
+
+    const analysisMethods = rawAnalysisMethods
+      ? {
+        chordAnalyzer: typeof rawAnalysisMethods.chordAnalyzer === 'string'
+          ? rawAnalysisMethods.chordAnalyzer
+          : DEFAULT_CHORD_ANALYZER_ID,
+        tempoAnalyzer: typeof rawAnalysisMethods.tempoAnalyzer === 'string'
+          ? rawAnalysisMethods.tempoAnalyzer
+          : DEFAULT_TEMPO_ANALYZER_ID,
+        chordAnalyzerVersion: typeof rawAnalysisMethods.chordAnalyzerVersion === 'string'
+          ? rawAnalysisMethods.chordAnalyzerVersion
+          : undefined,
+        tempoAnalyzerVersion: typeof rawAnalysisMethods.tempoAnalyzerVersion === 'string'
+          ? rawAnalysisMethods.tempoAnalyzerVersion
+          : undefined,
+        vocabularyTag: typeof rawAnalysisMethods.vocabularyTag === 'string'
+          ? rawAnalysisMethods.vocabularyTag
+          : undefined,
+      }
+      : undefined;
+    const analysisVersion =
+      typeof raw.analysisVersion === 'string' && raw.analysisVersion.trim().length > 0
+        ? raw.analysisVersion.trim()
+        : fallbackAnalysisVersion;
+    const vocabularyVersion =
+      typeof raw.vocabularyVersion === 'string' && raw.vocabularyVersion.trim().length > 0
+        ? raw.vocabularyVersion.trim()
+        : fallbackVocabularyVersion;
+    const tempoAnalysisVersion =
+      typeof raw.tempoAnalysisVersion === 'string' && raw.tempoAnalysisVersion.trim().length > 0
+        ? raw.tempoAnalysisVersion.trim()
+        : getTempoAnalysisVersionHint();
+    const chordVocabulary = rawChordVocabulary
+      ? {
+        selected: typeof rawChordVocabulary.selected === 'string' ? rawChordVocabulary.selected : 'triad',
+        supportsExtendedChords: Boolean(rawChordVocabulary.supportsExtendedChords),
+        supportedDescriptors: Array.isArray(rawChordVocabulary.supportedDescriptors)
+          ? rawChordVocabulary.supportedDescriptors.filter((item): item is string => typeof item === 'string')
+          : [],
+      }
+      : undefined;
+    const analyzerFingerprintFromPayload = typeof raw.analyzerFingerprint === 'string' && raw.analyzerFingerprint.trim().length > 0
+      ? raw.analyzerFingerprint.trim()
+      : buildAnalyzerFingerprint({
+        chordAnalyzer: analysisMethods?.chordAnalyzer,
+        tempoAnalyzer: analysisMethods?.tempoAnalyzer,
+        chordAnalysisVersion: analysisVersion,
+        tempoAnalysisVersion,
+        vocabularyVersion,
+        vocabularyTag: analysisMethods?.vocabularyTag
+          ?? chordVocabulary?.selected
+          ?? segments.find((segment) => typeof segment.vocabularyTag === 'string' && segment.vocabularyTag.trim().length > 0)?.vocabularyTag,
+      });
+    if (analyzerFingerprintFromPayload !== expectedAnalyzerFingerprint) {
+      return null;
+    }
+
+    return {
+      projectId: typeof raw.projectId === 'string' && raw.projectId.trim().length > 0
+        ? raw.projectId
+        : project.id,
+      parentResultId: persistedParentResultId || parentResultId,
+      sourceSignature: persistedSignature ?? sourceSignature ?? undefined,
+      source: typeof raw.source === 'string' ? raw.source : 'mixed',
+      analyzerType: typeof raw.analyzerType === 'string' ? raw.analyzerType : 'rule_based',
+      analysisMethods,
+      segments,
+      elapsedMs,
+      analyzedAt,
+      audioDurationMs,
+      estimatedKey: typeof raw.estimatedKey === 'string' ? raw.estimatedKey : undefined,
+      estimatedBpm,
+      tempo,
+      tempoAnalysisVersion,
+      analysisVersion,
+      vocabularyVersion,
+      analyzerFingerprint: analyzerFingerprintFromPayload,
+      chordVocabulary,
+      warnings,
+      generatedAt: typeof raw.generatedAt === 'number' && Number.isFinite(raw.generatedAt)
+        ? Math.floor(raw.generatedAt)
+        : Date.now(),
+    };
+  };
+
+  const scopedChordPath = getResultSetChordCachePath(parentResultId);
+  const scopedRaw = await readProjectJsonRecord(project.cacheDir, scopedChordPath);
+  if (scopedRaw) {
+    const scopedParsed = normalizePersistedChordPayload(
+      scopedRaw,
+      expectedAnalysisVersion,
+      getChordVocabularyVersionHint(),
+    );
+    if (scopedParsed && scopedParsed.analysisVersion === expectedAnalysisVersion) {
+      return scopedParsed;
+    }
+  }
+
+  // Legacy fallback: manifest single-slot chordAnalysis ref.
   const refs = await readManifestAnalysisRefs(project.cacheDir);
   const chordRef = refs?.chordAnalysis;
   if (!chordRef) return null;
@@ -903,113 +1286,10 @@ async function loadPersistedChordResult(
 
   const raw = await readProjectJsonRecord(project.cacheDir, chordRef.path);
   if (!raw) return null;
-
-  const persistedSignature = typeof raw.sourceSignature === 'string' ? raw.sourceSignature : null;
-  if (sourceSignature && persistedSignature && persistedSignature !== sourceSignature) {
-    return null;
-  }
-  const persistedParentResultId = typeof raw.parentResultId === 'string' ? raw.parentResultId.trim() : '';
-  if (persistedParentResultId && persistedParentResultId !== parentResultId) return null;
-  if (!persistedParentResultId && parentResultId !== DEFAULT_ACTIVE_RESULT_ID) return null;
-
-  const segments = normalizePersistedChordSegments(raw.segments);
-  if (!Array.isArray(raw.segments)) return null;
-
-  const elapsedMs = typeof raw.elapsedMs === 'number' && Number.isFinite(raw.elapsedMs)
-    ? Math.max(0, Math.floor(raw.elapsedMs))
-    : 0;
-  const analyzedAt = typeof raw.analyzedAt === 'number' && Number.isFinite(raw.analyzedAt)
-    ? Math.floor(raw.analyzedAt)
-    : Date.now();
-  const audioDurationMs = typeof raw.audioDurationMs === 'number' && Number.isFinite(raw.audioDurationMs)
-    ? Math.max(0, Math.floor(raw.audioDurationMs))
-    : (project.durationMs ?? 0);
-  const estimatedBpm = typeof raw.estimatedBpm === 'number' && Number.isFinite(raw.estimatedBpm)
-    ? raw.estimatedBpm
-    : undefined;
-  const warnings = sanitizeChordWarnings(raw.warnings);
-  const rawTempo = isObjectLike(raw.tempo) ? raw.tempo : null;
-  const rawAnalysisMethods = isObjectLike(raw.analysisMethods) ? raw.analysisMethods : null;
-  const rawChordVocabulary = isObjectLike(raw.chordVocabulary) ? raw.chordVocabulary : null;
-
-  const tempo = rawTempo
-    ? {
-      primaryBpm: typeof rawTempo.primaryBpm === 'number' ? rawTempo.primaryBpm : undefined,
-      confidence: typeof rawTempo.confidence === 'number' ? rawTempo.confidence : undefined,
-      method: typeof rawTempo.method === 'string' ? rawTempo.method : 'tempo_default',
-      candidates: Array.isArray(rawTempo.candidates)
-        ? rawTempo.candidates
-          .filter(isObjectLike)
-          .filter((item) => typeof item.bpm === 'number' && Number.isFinite(item.bpm))
-          .map((item) => ({
-            bpm: item.bpm as number,
-            confidence: typeof item.confidence === 'number' ? item.confidence : undefined,
-            relation: typeof item.relation === 'string' ? item.relation : undefined,
-            method: typeof item.method === 'string' ? item.method : undefined,
-          }))
-        : [],
-      ambiguity: isObjectLike(rawTempo.ambiguity)
-        ? {
-          isAmbiguous: Boolean(rawTempo.ambiguity.isAmbiguous),
-          halfTimeBpm: typeof rawTempo.ambiguity.halfTimeBpm === 'number'
-            ? rawTempo.ambiguity.halfTimeBpm
-            : undefined,
-          doubleTimeBpm: typeof rawTempo.ambiguity.doubleTimeBpm === 'number'
-            ? rawTempo.ambiguity.doubleTimeBpm
-            : undefined,
-          reason: typeof rawTempo.ambiguity.reason === 'string'
-            ? rawTempo.ambiguity.reason
-            : undefined,
-        }
-        : undefined,
-    }
-    : undefined;
-
-  return {
-    projectId: typeof raw.projectId === 'string' && raw.projectId.trim().length > 0
-      ? raw.projectId
-      : project.id,
-    source: typeof raw.source === 'string' ? raw.source : 'mixed',
-    analyzerType: typeof raw.analyzerType === 'string' ? raw.analyzerType : 'rule_based',
-    analysisMethods: rawAnalysisMethods
-      ? {
-        chordAnalyzer: typeof rawAnalysisMethods.chordAnalyzer === 'string'
-          ? rawAnalysisMethods.chordAnalyzer
-          : 'chord_default',
-        tempoAnalyzer: typeof rawAnalysisMethods.tempoAnalyzer === 'string'
-          ? rawAnalysisMethods.tempoAnalyzer
-          : 'tempo_default',
-      }
-      : undefined,
-    segments,
-    elapsedMs,
-    analyzedAt,
-    audioDurationMs,
-    estimatedKey: typeof raw.estimatedKey === 'string' ? raw.estimatedKey : undefined,
-    estimatedBpm,
-    tempo,
-    analysisVersion:
-      typeof raw.analysisVersion === 'string' && raw.analysisVersion.trim().length > 0
-        ? raw.analysisVersion
-        : chordRef.analysisVersion,
-    vocabularyVersion:
-      typeof raw.vocabularyVersion === 'string' && raw.vocabularyVersion.trim().length > 0
-        ? raw.vocabularyVersion
-        : chordRef.vocabularyVersion,
-    chordVocabulary: rawChordVocabulary
-      ? {
-        selected: typeof rawChordVocabulary.selected === 'string' ? rawChordVocabulary.selected : 'triad',
-        supportsExtendedChords: Boolean(rawChordVocabulary.supportsExtendedChords),
-        supportedDescriptors: Array.isArray(rawChordVocabulary.supportedDescriptors)
-          ? rawChordVocabulary.supportedDescriptors.filter((item): item is string => typeof item === 'string')
-          : [],
-      }
-      : undefined,
-    warnings,
-    generatedAt: typeof raw.generatedAt === 'number' && Number.isFinite(raw.generatedAt)
-      ? Math.floor(raw.generatedAt)
-      : Date.now(),
-  };
+  const parsed = normalizePersistedChordPayload(raw, chordRef.analysisVersion, chordRef.vocabularyVersion);
+  if (!parsed) return null;
+  if (parsed.analysisVersion !== expectedAnalysisVersion) return null;
+  return parsed;
 }
 
 async function persistChordResult(
@@ -1018,8 +1298,7 @@ async function persistChordResult(
   parentResultId: string,
   sourceSignature: string | null,
 ): Promise<void> {
-  const refs = await readManifestAnalysisRefs(project.cacheDir);
-  const chordPath = refs?.chordAnalysis?.path ?? DEFAULT_CHORD_CACHE_PATH;
+  const chordPath = getResultSetChordCachePath(parentResultId);
   const analysisVersion =
     typeof chordResult.analysisVersion === 'string' && chordResult.analysisVersion.trim().length > 0
       ? chordResult.analysisVersion.trim()
@@ -1027,13 +1306,27 @@ async function persistChordResult(
   const vocabularyVersion =
     typeof chordResult.vocabularyVersion === 'string' && chordResult.vocabularyVersion.trim().length > 0
       ? chordResult.vocabularyVersion.trim()
-      : 'triad-v1';
+      : getChordVocabularyVersionHint();
+  const tempoAnalysisVersion =
+    typeof chordResult.tempoAnalysisVersion === 'string' && chordResult.tempoAnalysisVersion.trim().length > 0
+      ? chordResult.tempoAnalysisVersion.trim()
+      : getTempoAnalysisVersionHint();
+  const analyzerFingerprint = (typeof chordResult.analyzerFingerprint === 'string' && chordResult.analyzerFingerprint.trim().length > 0)
+    ? chordResult.analyzerFingerprint.trim()
+    : deriveAnalyzerFingerprintFromResult({
+      ...chordResult,
+      analysisVersion,
+      vocabularyVersion,
+      tempoAnalysisVersion,
+    });
 
   await writeProjectJsonRecord(project.cacheDir, chordPath, {
     ...chordResult,
     parentResultId,
     analysisVersion,
+    tempoAnalysisVersion,
     vocabularyVersion,
+    analyzerFingerprint,
     segmentCount: chordResult.segments.length,
     sourceSignature,
     generatedAt: chordResult.generatedAt ?? Date.now(),
@@ -1642,6 +1935,38 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
     // 濡傛灉 Worker 鍩虹璁炬柦鍙敤涓?Worker 姝ｅ湪杩愯锛屼娇鐢ㄧ湡瀹炲垎绂?
     if (useRealPath && workerInfra) {
+      const emitSeparationComplete = (
+        payload: {
+          success: boolean;
+          errorMessage?: string;
+          warnings?: string[];
+          cacheHit?: boolean;
+        },
+        reason: string,
+      ): boolean => {
+        if (!win || win.isDestroyed()) {
+          console.warn(
+            `[REAL_CHAIN] handlers.project:startSeparation completion_emit_skipped projectId="${projectId}" jobId="${jobId}" reason="${reason}" winAvailable=${!!win} winDestroyed=${win ? win.isDestroyed() : true}`,
+          );
+          return false;
+        }
+        console.log(
+          `[REAL_CHAIN] handlers.project:startSeparation completion_emit_attempt projectId="${projectId}" jobId="${jobId}" reason="${reason}" success=${payload.success} warningsCount=${payload.warnings?.length ?? 0} hasErrorMessage=${typeof payload.errorMessage === 'string' && payload.errorMessage.trim().length > 0}`,
+        );
+        win.webContents.send('separation:complete', {
+          jobId,
+          projectId,
+          success: payload.success,
+          errorMessage: payload.errorMessage,
+          warnings: payload.warnings ?? [],
+          cacheHit: payload.cacheHit ?? false,
+        });
+        console.log(
+          `[REAL_CHAIN] handlers.project:startSeparation completion_emit_sent projectId="${projectId}" jobId="${jobId}" reason="${reason}"`,
+        );
+        return true;
+      };
+
       // 娉ㄥ唽杩涘害浜嬩欢鐩戝惉 鈫?杞彂鍒?renderer
       const unsubProgress = workerInfra.ipcBridge.on(
         WorkerEventName.StageProgress,
@@ -1663,6 +1988,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       // 寮傛鎵ц鐪熷疄鍒嗙锛堜笉闃诲 IPC 杩斿洖锛?
       const infraRef = workerInfra;
       (async () => {
+        let completionEventSent = false;
         try {
           console.log(`[REAL_CHAIN] handlers.project:startSeparation real_path_enter projectId="${projectId}" jobId="${jobId}"`);
           const result = await infraRef.parseJobService.startSeparation({
@@ -1679,16 +2005,12 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
               `[REAL_CHAIN] handlers.project:startSeparation cancelled_cleanup projectId="${projectId}" jobId="${jobId}"`,
             );
             await runCancelledNewProjectCleanup(infraRef, projectId);
-            if (win && !win.isDestroyed()) {
-              win.webContents.send('separation:complete', {
-                jobId,
-                projectId,
-                success: false,
-                errorMessage: '分离已取消，项目未保存',
-                warnings: ['分离已取消，项目未保存'],
-                cacheHit: false,
-              });
-            }
+            completionEventSent = emitSeparationComplete({
+              success: false,
+              errorMessage: '分离已取消，项目未保存',
+              warnings: ['分离已取消，项目未保存'],
+              cacheHit: false,
+            }, 'cancelled_cleanup');
             return;
           }
           if (result.projectStatusAfter !== ProjectStatus.Ready) {
@@ -1704,24 +2026,33 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             console.warn(
               `[REAL_CHAIN] handlers.project:startSeparation non_ready_short_circuit projectId="${projectId}" jobId="${jobId}" projectStatusAfter="${result.projectStatusAfter}" jobStatus="${result.job.status}" error="${explicitError}"`,
             );
-            if (win && !win.isDestroyed()) {
-              win.webContents.send('separation:complete', {
-                jobId,
-                projectId,
-                success: false,
-                errorMessage: explicitError,
-                warnings: [explicitError],
-                cacheHit: false,
-              });
-            }
+            completionEventSent = emitSeparationComplete({
+              success: false,
+              errorMessage: explicitError,
+              warnings: [explicitError],
+              cacheHit: false,
+            }, 'non_ready_short_circuit');
             return;
           }
 
           // 鍒嗙瀹屾垚鍚庢洿鏂?project 鐨?metadata
-          const stemFiles = await infraRef.stemFileRepo.findByProjectId(projectId);
+          let stemFiles = await infraRef.stemFileRepo.findByProjectId(projectId);
           console.log(
             `[REAL_CHAIN] handlers.project:startSeparation metadata_postprocess_begin projectId="${projectId}" jobId="${jobId}" projectStatusAfter="${result.projectStatusAfter}" stemFilesCount=${stemFiles.length}`,
           );
+          if (stemFiles.length === 0) {
+            console.warn(
+              `[REAL_CHAIN] handlers.project:startSeparation stem_repo_empty_first_read projectId="${projectId}" jobId="${jobId}" retry="immediate"`,
+            );
+            await Promise.resolve();
+            stemFiles = await infraRef.stemFileRepo.findByProjectId(projectId);
+            console.log(
+              `[REAL_CHAIN] handlers.project:startSeparation stem_repo_retry_read projectId="${projectId}" jobId="${jobId}" stemFilesCount=${stemFiles.length}`,
+            );
+          }
+          if (stemFiles.length === 0) {
+            throw new Error(`SEPARATION_STEMS_NOT_PERSISTED projectId="${projectId}" jobId="${jobId}"`);
+          }
           console.log(`[REAL_CHAIN] handlers.project:startSeparation real_path_after_service projectId="${projectId}" jobId="${jobId}" stemFiles=${stemFiles.length} projectStatusAfter="${result.projectStatusAfter}"`);
           const missingProvenance = stemFiles.some((stem) => (
             !stem.modelId
@@ -1773,30 +2104,22 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             `[REAL_CHAIN] handlers.project:startSeparation manifest_patched projectId="${projectId}" manifestPath="${metadataPatchResult.manifestPath}" activeResultId="${DEFAULT_ACTIVE_RESULT_ID}" resultSetCount=${resultSets.length}`,
           );
 
-          if (win && !win.isDestroyed()) {
-            win.webContents.send('separation:complete', {
-              jobId,
-              projectId,
-              success: result.projectStatusAfter === ProjectStatus.Ready,
-              warnings: result.warnings,
-              cacheHit: false,
-            });
-          }
+          completionEventSent = emitSeparationComplete({
+            success: result.projectStatusAfter === ProjectStatus.Ready,
+            warnings: result.warnings,
+            cacheHit: false,
+          }, 'real_path_success');
         } catch (err) {
           const originalError = normalizeErrorMessage(err, 'unknown_error');
           console.error(`[REAL_CHAIN] handlers.project:startSeparation real_path_error projectId="${projectId}" jobId="${jobId}" error="${originalError}"`);
           if (isSeparationCancelledError(err)) {
             await runCancelledNewProjectCleanup(infraRef, projectId);
-            if (win && !win.isDestroyed()) {
-              win.webContents.send('separation:complete', {
-                jobId,
-                projectId,
-                success: false,
-                errorMessage: '分离已取消，项目未保存',
-                warnings: ['分离已取消，项目未保存'],
-                cacheHit: false,
-              });
-            }
+            completionEventSent = emitSeparationComplete({
+              success: false,
+              errorMessage: '分离已取消，项目未保存',
+              warnings: ['分离已取消，项目未保存'],
+              cacheHit: false,
+            }, 'error_cancelled');
             return;
           }
           const normalizedError = toSeparationFailureMessage(err);
@@ -1806,19 +2129,15 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
               `[REAL_CHAIN] handlers.project:startSeparation failed_cleanup projectId="${projectId}" jobId="${jobId}" stemCount=${cleanupDecision.stemCount} resultSetCount=${cleanupDecision.resultSetCount}`,
             );
             await runCancelledNewProjectCleanup(infraRef, projectId);
-            if (win && !win.isDestroyed()) {
-              console.error(
-                `[REAL_CHAIN] handlers.project:startSeparation real_path_error_mapped projectId="${projectId}" jobId="${jobId}" errorOriginal="${originalError}" mappedError="${normalizedError}"`,
-              );
-              win.webContents.send('separation:complete', {
-                jobId,
-                projectId,
-                success: false,
-                errorMessage: normalizedError,
-                warnings: [normalizedError],
-                cacheHit: false,
-              });
-            }
+            console.error(
+              `[REAL_CHAIN] handlers.project:startSeparation real_path_error_mapped projectId="${projectId}" jobId="${jobId}" errorOriginal="${originalError}" mappedError="${normalizedError}"`,
+            );
+            completionEventSent = emitSeparationComplete({
+              success: false,
+              errorMessage: normalizedError,
+              warnings: [normalizedError],
+              cacheHit: false,
+            }, 'error_cleanup_path');
             return;
           }
 
@@ -1827,20 +2146,19 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             await infraRef.projectRepo.updateStatus(projectId, ProjectStatus.Failed);
           } catch { /* ignore */ }
 
-          if (win && !win.isDestroyed()) {
-            console.error(
-              `[REAL_CHAIN] handlers.project:startSeparation real_path_error_mapped projectId="${projectId}" jobId="${jobId}" errorOriginal="${originalError}" mappedError="${normalizedError}"`,
-            );
-            win.webContents.send('separation:complete', {
-              jobId,
-              projectId,
-              success: false,
-              errorMessage: normalizedError,
-              warnings: [normalizedError],
-              cacheHit: false,
-            });
-          }
+          console.error(
+            `[REAL_CHAIN] handlers.project:startSeparation real_path_error_mapped projectId="${projectId}" jobId="${jobId}" errorOriginal="${originalError}" mappedError="${normalizedError}"`,
+          );
+          completionEventSent = emitSeparationComplete({
+            success: false,
+            errorMessage: normalizedError,
+            warnings: [normalizedError],
+            cacheHit: false,
+          }, 'error_no_cleanup_path');
         } finally {
+          console.log(
+            `[REAL_CHAIN] handlers.project:startSeparation completion_emit_summary projectId="${projectId}" jobId="${jobId}" completionEventSent=${completionEventSent}`,
+          );
           unsubProgress();
         }
       })();
@@ -2146,6 +2464,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
     const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+    const activeFromManifest = manifest && typeof manifest.activeResultId === 'string'
+      ? manifest.activeResultId.trim()
+      : '';
     const manifestResultSets = normalizeResultSetEntries(manifest?.resultSets);
     const fallbackResultSet = buildDefaultResultSetEntry(project, allStems, activeResultContext.activeResultId);
     const resultSets = manifestResultSets.length > 0
@@ -2172,6 +2493,11 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           ? project.separationElapsedMs
           : 0));
     console.log(`[REAL_CHAIN] handlers.project:getResult decision projectId="${projectId}" projectStatus="${project.status}" stemCount=${stems.length} elapsedMs=${elapsedMs} isRealSeparation=${isRealSeparation} sourceTypeLabel="${sourceTypeLabel}"`);
+    console.log(
+      `[REAL_CHAIN] handlers.project:getResult context projectId="${projectId}" ` +
+      `resultSetCount=${resultSets.length} activeFromManifest="${activeFromManifest || 'none'}" ` +
+      `activeResolved="${activeResultContext.activeResultId}"`,
+    );
 
     return {
       id: project.id,
@@ -2202,12 +2528,19 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const allStems = await workerInfra.stemFileRepo.findByProjectId(projectId);
     const project = await workerInfra.projectRepo.findById(projectId);
     if (!project) return [];
+    const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+    const manifestResultSets = normalizeResultSetEntries(manifest?.resultSets);
+    const activeFromManifest = manifest && typeof manifest.activeResultId === 'string'
+      ? manifest.activeResultId.trim()
+      : '';
     const activeResultContext = await resolveActiveResultContext(project, allStems);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
     console.log(
       `[REAL_CHAIN] handlers.project:getStems context projectId="${projectId}" ` +
       `activeResultId="${activeResultContext.activeResultId}" allStemsCount=${allStems.length} ` +
-      `filteredStemsCount=${stems.length} resolvedSourceSignature="${activeResultContext.sourceSignature ?? ''}"`,
+      `filteredStemsCount=${stems.length} resolvedSourceSignature="${activeResultContext.sourceSignature ?? ''}" ` +
+      `resultSetCount=${manifestResultSets.length} activeFromManifest="${activeFromManifest || 'none'}" ` +
+      `activeResolved="${activeResultContext.activeResultId}"`,
     );
 
     if (stems.length > 0) {
@@ -2337,21 +2670,33 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const expectedAnalysisVersion = getWaveformAnalysisVersionHint();
     const sourceSignature = activeResultContext.sourceSignature ?? await getFileSourceSignature(sourceFilePath);
     const parentResultId = activeResultContext.activeResultId;
+    const sourceKind = project.originalFilePath
+      && fs.existsSync(project.originalFilePath)
+      && path.resolve(project.originalFilePath) === path.resolve(sourceFilePath)
+      ? 'original'
+      : 'stem';
     const cached = getWaveformCacheEntry(projectId, parentResultId, sourceSignature, expectedAnalysisVersion);
     if (cached) {
-      console.log(`[REAL_CHAIN] handlers.project:getWaveform cache_hit projectId="${projectId}" analysisVersion="${cached.analysisVersion}"`);
+      console.log(
+        `[REAL_CHAIN] handlers.project:getWaveform cache_hit projectId="${projectId}" ` +
+        `analysisVersion="${cached.analysisVersion}" parentResultId="${parentResultId}" ` +
+        `sourceSignatureAvailable=${sourceSignature != null} sourceKind="${sourceKind}"`,
+      );
       return cached.result;
     }
     if (!sourceSignature) {
       // Signature unavailable: never trust old cache, but still try to generate fresh waveform.
       console.log(
         `[REAL_CHAIN] handlers.project:getWaveform cache_bypass projectId="${projectId}" ` +
-        `reason="source_signature_unavailable"`,
+        `reason="source_signature_unavailable" parentResultId="${parentResultId}" ` +
+        `sourceSignatureAvailable=${sourceSignature != null} sourceKind="${sourceKind}"`,
       );
     } else {
       console.log(
         `[REAL_CHAIN] handlers.project:getWaveform cache_miss projectId="${projectId}" ` +
-        `reason="cache_key_not_found" analysisVersion="${expectedAnalysisVersion}"`,
+        `reason="cache_key_not_found" analysisVersion="${expectedAnalysisVersion}" ` +
+        `parentResultId="${parentResultId}" sourceSignatureAvailable=${sourceSignature != null} ` +
+        `sourceKind="${sourceKind}"`,
       );
     }
 
@@ -2490,13 +2835,37 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
 
     const sourceSignature = activeResultContext.sourceSignature ?? await getFileSourceSignature(sourceFilePath);
     const parentResultId = activeResultContext.activeResultId;
+    const activeSourceStem = activeStems.find((stem) =>
+      (typeof stem.modelId === 'string' && stem.modelId.trim().length > 0)
+      || (typeof stem.runtimeProfileId === 'string' && stem.runtimeProfileId.trim().length > 0),
+    );
+    const activeModelId = activeSourceStem?.modelId?.trim() ?? 'unknown';
+    const activeRuntimeProfileId = activeSourceStem?.runtimeProfileId?.trim() ?? 'unknown';
     console.log(
       `[REAL_CHAIN] handlers.project:getChordAnalysis source_resolved projectId="${projectId}" ` +
-      `source_kind="${sourceKind}" source_signature_available=${sourceSignature != null}`,
+      `source_kind="${sourceKind}" source_signature_available=${sourceSignature != null} ` +
+      `activeResultId="${activeResultContext.activeResultId}" modelId="${activeModelId}" ` +
+      `runtimeProfileId="${activeRuntimeProfileId}"`,
     );
 
     const expectedAnalysisVersion = getChordAnalysisVersionHint();
-    const cached = getChordCacheEntry(projectId, parentResultId, sourceSignature, expectedAnalysisVersion);
+    const expectedTempoAnalysisVersion = getTempoAnalysisVersionHint();
+    const expectedVocabularyVersion = getChordVocabularyVersionHint();
+    const expectedAnalyzerFingerprint = buildAnalyzerFingerprint({
+      chordAnalyzer: getChordAnalyzerSelectionHint(),
+      tempoAnalyzer: getTempoAnalyzerSelectionHint(),
+      chordAnalysisVersion: expectedAnalysisVersion,
+      tempoAnalysisVersion: expectedTempoAnalysisVersion,
+      vocabularyVersion: expectedVocabularyVersion,
+      vocabularyTag: 'triad',
+    });
+    const cached = getChordCacheEntry(
+      projectId,
+      parentResultId,
+      sourceSignature,
+      expectedAnalysisVersion,
+      expectedAnalyzerFingerprint,
+    );
     if (cached) {
       const cachedResult = cached.result;
       console.log(
@@ -2524,11 +2893,19 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       expectedAnalysisVersion,
       parentResultId,
       sourceSignature,
+      expectedAnalyzerFingerprint,
     );
     if (persistedChord) {
       if (sourceSignature) {
+        const persistedFingerprint = persistedChord.analyzerFingerprint ?? expectedAnalyzerFingerprint;
         setChordCacheEntry({
-          cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, expectedAnalysisVersion),
+          cacheKey: buildChordAnalysisCacheKey(
+            projectId,
+            parentResultId,
+            sourceSignature,
+            expectedAnalysisVersion,
+            persistedFingerprint,
+          ),
           parentResultId,
           sourceFilePath,
           sourceSignature,
@@ -2595,8 +2972,17 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           chordType: typeof (seg as { chordType?: unknown }).chordType === 'string'
             ? (seg as { chordType: string }).chordType
             : undefined,
+          quality: typeof (seg as { quality?: unknown }).quality === 'string'
+            ? (seg as { quality: string }).quality
+            : undefined,
           bassNote: typeof (seg as { bassNote?: unknown }).bassNote === 'string'
             ? (seg as { bassNote: string }).bassNote
+            : undefined,
+          adds: Array.isArray((seg as { adds?: unknown }).adds)
+            ? ((seg as { adds: unknown[] }).adds.filter((v) => typeof v === 'string') as string[])
+            : undefined,
+          suspensions: Array.isArray((seg as { suspensions?: unknown }).suspensions)
+            ? ((seg as { suspensions: unknown[] }).suspensions.filter((v) => typeof v === 'string') as string[])
             : undefined,
           extensions: Array.isArray((seg as { extensions?: unknown }).extensions)
             ? ((seg as { extensions: unknown[] }).extensions.filter((v) => typeof v === 'string') as string[])
@@ -2668,7 +3054,16 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
               reason: typeof rawTempo.ambiguity.reason === 'string'
                 ? rawTempo.ambiguity.reason
                 : undefined,
+              explanation: typeof rawTempo.ambiguity.explanation === 'string'
+                ? rawTempo.ambiguity.explanation
+                : undefined,
+              confidenceGap: typeof rawTempo.ambiguity.confidenceGap === 'number'
+                ? rawTempo.ambiguity.confidenceGap
+                : undefined,
             }
+            : undefined,
+          methodMetadata: isObjectLike(rawTempo.methodMetadata)
+            ? { ...rawTempo.methodMetadata }
             : undefined,
         }
         : undefined;
@@ -2677,20 +3072,61 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         warnings.push('BPM 估计值不稳定，已隐藏该字段');
       }
 
+      const analysisMethods = isObjectLike((raw as { analysisMethods?: unknown }).analysisMethods)
+        ? {
+          chordAnalyzer: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzer) === 'string'
+            ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzer as string)
+            : DEFAULT_CHORD_ANALYZER_ID,
+          tempoAnalyzer: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzer) === 'string'
+            ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzer as string)
+            : DEFAULT_TEMPO_ANALYZER_ID,
+          chordAnalyzerVersion: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzerVersion) === 'string'
+            ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzerVersion as string)
+            : undefined,
+          tempoAnalyzerVersion: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzerVersion) === 'string'
+            ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzerVersion as string)
+            : undefined,
+          vocabularyTag: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.vocabularyTag) === 'string'
+            ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.vocabularyTag as string)
+            : undefined,
+        }
+        : undefined;
+      const resolvedAnalysisVersion =
+        typeof raw.analysisVersion === 'string' && raw.analysisVersion.trim().length > 0
+          ? raw.analysisVersion.trim()
+          : expectedAnalysisVersion;
+      const resolvedTempoAnalysisVersion =
+        typeof (raw as { tempoAnalysisVersion?: unknown }).tempoAnalysisVersion === 'string'
+        && (raw as { tempoAnalysisVersion: string }).tempoAnalysisVersion.trim().length > 0
+          ? (raw as { tempoAnalysisVersion: string }).tempoAnalysisVersion.trim()
+          : expectedTempoAnalysisVersion;
+      const resolvedVocabularyVersion =
+        typeof raw.vocabularyVersion === 'string' && raw.vocabularyVersion.trim().length > 0
+          ? raw.vocabularyVersion.trim()
+          : expectedVocabularyVersion;
+      const resolvedVocabularyTag = analysisMethods?.vocabularyTag
+        ?? (isObjectLike((raw as { chordVocabulary?: unknown }).chordVocabulary)
+          && typeof ((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.selected) === 'string'
+          ? ((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.selected as string)
+          : undefined)
+        ?? segments.find((segment) => typeof segment.vocabularyTag === 'string' && segment.vocabularyTag.trim().length > 0)?.vocabularyTag
+        ?? 'triad';
+      const resolvedAnalyzerFingerprint = buildAnalyzerFingerprint({
+        chordAnalyzer: analysisMethods?.chordAnalyzer,
+        tempoAnalyzer: analysisMethods?.tempoAnalyzer,
+        chordAnalysisVersion: resolvedAnalysisVersion,
+        tempoAnalysisVersion: resolvedTempoAnalysisVersion,
+        vocabularyVersion: resolvedVocabularyVersion,
+        vocabularyTag: resolvedVocabularyTag,
+      });
+
       const chordResult: CachedChordAnalysisDTO = {
         projectId,
+        parentResultId,
+        sourceSignature: sourceSignature ?? undefined,
         source: typeof raw.source === 'string' ? raw.source : 'mixed',
         analyzerType: typeof raw.analyzerType === 'string' ? raw.analyzerType : 'rule_based',
-        analysisMethods: isObjectLike((raw as { analysisMethods?: unknown }).analysisMethods)
-          ? {
-            chordAnalyzer: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzer) === 'string'
-              ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.chordAnalyzer as string)
-              : 'chord_default',
-            tempoAnalyzer: typeof ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzer) === 'string'
-              ? ((raw as { analysisMethods: Record<string, unknown> }).analysisMethods.tempoAnalyzer as string)
-              : 'tempo_default',
-          }
-          : undefined,
+        analysisMethods,
         segments,
         elapsedMs: typeof raw.elapsedMs === 'number' ? Math.max(0, Math.floor(raw.elapsedMs)) : 0,
         analyzedAt: typeof raw.analyzedAt === 'number' ? raw.analyzedAt : Date.now(),
@@ -2698,8 +3134,10 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         estimatedKey: typeof raw.estimatedKey === 'string' ? raw.estimatedKey : undefined,
         estimatedBpm: normalizedEstimatedBpm,
         tempo,
-        analysisVersion: typeof raw.analysisVersion === 'string' ? raw.analysisVersion : expectedAnalysisVersion,
-        vocabularyVersion: typeof raw.vocabularyVersion === 'string' ? raw.vocabularyVersion : 'triad-v1',
+        tempoAnalysisVersion: resolvedTempoAnalysisVersion,
+        analysisVersion: resolvedAnalysisVersion,
+        vocabularyVersion: resolvedVocabularyVersion,
+        analyzerFingerprint: resolvedAnalyzerFingerprint,
         chordVocabulary: isObjectLike((raw as { chordVocabulary?: unknown }).chordVocabulary)
           ? {
             selected: typeof ((raw as { chordVocabulary: Record<string, unknown> }).chordVocabulary.selected) === 'string'
@@ -2732,10 +3170,16 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         }
       }
 
-      const resolvedAnalysisVersion = chordResult.analysisVersion ?? expectedAnalysisVersion;
       if (sourceSignature) {
+        const resolvedAnalyzerFingerprint = chordResult.analyzerFingerprint ?? deriveAnalyzerFingerprintFromResult(chordResult);
         setChordCacheEntry({
-          cacheKey: buildChordAnalysisCacheKey(projectId, parentResultId, sourceSignature, resolvedAnalysisVersion),
+          cacheKey: buildChordAnalysisCacheKey(
+            projectId,
+            parentResultId,
+            sourceSignature,
+            resolvedAnalysisVersion,
+            resolvedAnalyzerFingerprint,
+          ),
           parentResultId,
           sourceFilePath,
           sourceSignature,

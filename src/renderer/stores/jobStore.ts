@@ -134,31 +134,46 @@ export class JobStore implements IJobStore {
 
   constructor(api: IJobElectronAPI) {
     this.unsubProgress = api.onSeparationProgress((data) => {
-      if (data.jobId === this.currentJobId) {
-        this.stage = data.stage;
-        this.progress = data.progress;
-        this.notify();
+      const matched = data.jobId === this.currentJobId;
+      if (!matched) {
+        return;
       }
+      this.stage = data.stage;
+      this.progress = data.progress;
+      if (data.stage === 'DONE') {
+        console.log(
+          `[REAL_CHAIN] jobStore.progress_done_received jobId="${data.jobId}" currentJobId="${this.currentJobId}" progress=${data.progress}`,
+        );
+      }
+      this.notify();
     });
 
     this.unsubComplete = api.onSeparationComplete((data) => {
-      if (data.jobId === this.currentJobId) {
-        this.isComplete = true;
-        this.progress = data.success ? 100 : this.progress;
-        this.warnings = data.warnings ?? [];
-        this.cacheHit = data.cacheHit ?? false;
-
-        if (!data.success) {
-          this.errorCode = 'SEPARATION_FAILED';
-          this.errorMessage = data.errorMessage ?? '分离失败';
-        } else {
-          this.errorCode = null;
-          this.errorMessage = null;
-          this.stage = 'DONE';
-        }
-
-        this.notify();
+      const matched = data.jobId === this.currentJobId;
+      console.log(
+        `[REAL_CHAIN] jobStore.complete_received eventJobId="${data.jobId}" currentJobId="${this.currentJobId ?? 'none'}" matched=${matched} success=${data.success} warningsCount=${data.warnings?.length ?? 0} hasErrorMessage=${typeof data.errorMessage === 'string' && data.errorMessage.trim().length > 0}`,
+      );
+      if (!matched) {
+        return;
       }
+      this.isComplete = true;
+      this.progress = data.success ? 100 : this.progress;
+      this.warnings = data.warnings ?? [];
+      this.cacheHit = data.cacheHit ?? false;
+
+      if (!data.success) {
+        this.errorCode = 'SEPARATION_FAILED';
+        this.errorMessage = data.errorMessage ?? '分离失败';
+      } else {
+        this.errorCode = null;
+        this.errorMessage = null;
+        this.stage = 'DONE';
+      }
+
+      console.log(
+        `[REAL_CHAIN] jobStore.complete_applied currentJobId="${this.currentJobId}" isComplete=${this.isComplete} isFailed=${!data.success} stage="${this.stage ?? 'null'}" progress=${this.progress}`,
+      );
+      this.notify();
     });
   }
 

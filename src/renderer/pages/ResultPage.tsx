@@ -77,6 +77,47 @@ const SOURCE_TYPE_LABELS: Record<string, string> = {
   cache_hit: '缓存命中',
 };
 
+type DebugChordResultExtras = {
+  parentResultId?: string;
+  sourceSignature?: string;
+  tempoAnalysisVersion?: string;
+  analyzerFingerprint?: string;
+};
+
+const DEBUG_MOCK_SEGMENT_SAMPLE = {
+  label: 'Cmaj9/E',
+  quality: 'maj',
+  adds: ['9'],
+  suspensions: ['sus4'],
+  bassNote: 'E',
+  symbol: 'Cmaj9/E',
+};
+
+const DEBUG_MOCK_TEMPO_SAMPLE = {
+  primaryBpm: 124,
+  candidates: [
+    { bpm: 124, confidence: 0.82, relation: 'primary', method: 'mock' },
+    { bpm: 62, confidence: 0.44, relation: 'half_time', method: 'mock' },
+  ],
+  confidence: 0.82,
+  ambiguity: {
+    isAmbiguous: true,
+    reason: 'half_time_or_double_time',
+    explanation: 'Mock injection for renderer DTO flow check only.',
+    confidenceGap: 0.12,
+  },
+  methodMetadata: {
+    backend: 'mock-debug',
+    sampleRate: 44100,
+    hopLength: 512,
+    stability: {
+      isStable: true,
+      cv: 0.08,
+      confidenceRatio: 1.9,
+    },
+  },
+};
+
 /**
  * 杞ㄩ亾瀛樺湪鐘舵€佹樉绀烘枃妗? *
  * 缁熶竴璇箟锛堜笌 PlayerPage 涓€鑷达級锛? * - exists锛氬凡鐢熸垚 鈥?鏈夊彲鎾斁鏂囦欢
@@ -136,8 +177,13 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const [pilotError, setPilotError] = useState<string | null>(null);
   const [activeSwitchBusy, setActiveSwitchBusy] = useState(false);
   const [activeSwitchError, setActiveSwitchError] = useState<string | null>(null);
+  const [debugMockEnabled, setDebugMockEnabled] = useState(false);
   const accessMarkedRef = useRef(false);
   const analysisLoadedForProjectRef = useRef<string | null>(null);
+  const isDevMode =
+    typeof window !== 'undefined'
+    && typeof window.electronAPI?.isDevMode === 'function'
+    && window.electronAPI.isDevMode();
 
   const getExportWarnings = (result: unknown): string[] => {
     if (!result || typeof result !== 'object') return [];
@@ -448,6 +494,29 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const showAnalysisLoadingHint =
     analysisSnap.projectId === projectId
     && (analysisSnap.loadingState === 'loading' || activeSwitchBusy);
+  const debugChordResultExtras = (analysisSnap.chordResult as (DebugChordResultExtras | null)) ?? null;
+  const debugAnalysisMethods = analysisSnap.chordResult?.analysisMethods;
+  const debugChordSampleBase = analysisSnap.currentSegment ?? analysisSnap.chordResult?.segments[0] ?? null;
+  const debugTempoBase = analysisSnap.chordResult?.tempo ?? null;
+  const debugChordSample = debugMockEnabled
+    ? {
+      label: debugChordSampleBase?.label ?? DEBUG_MOCK_SEGMENT_SAMPLE.label,
+      quality: debugChordSampleBase?.quality ?? DEBUG_MOCK_SEGMENT_SAMPLE.quality,
+      adds: debugChordSampleBase?.adds ?? DEBUG_MOCK_SEGMENT_SAMPLE.adds,
+      suspensions: debugChordSampleBase?.suspensions ?? DEBUG_MOCK_SEGMENT_SAMPLE.suspensions,
+      bassNote: debugChordSampleBase?.bassNote ?? DEBUG_MOCK_SEGMENT_SAMPLE.bassNote,
+      symbol: debugChordSampleBase?.symbol ?? DEBUG_MOCK_SEGMENT_SAMPLE.symbol,
+    }
+    : debugChordSampleBase;
+  const debugTempo = debugMockEnabled
+    ? {
+      primaryBpm: debugTempoBase?.primaryBpm ?? DEBUG_MOCK_TEMPO_SAMPLE.primaryBpm,
+      candidates: debugTempoBase?.candidates ?? DEBUG_MOCK_TEMPO_SAMPLE.candidates,
+      confidence: debugTempoBase?.confidence ?? DEBUG_MOCK_TEMPO_SAMPLE.confidence,
+      ambiguity: debugTempoBase?.ambiguity ?? DEBUG_MOCK_TEMPO_SAMPLE.ambiguity,
+      methodMetadata: debugTempoBase?.methodMetadata ?? DEBUG_MOCK_TEMPO_SAMPLE.methodMetadata,
+    }
+    : debugTempoBase;
   // Header track count must be derived from the same grouped lists used by the UI sections.
   const headerTrackCount = [existingStems, mergedStems, missingStems]
     .reduce((sum, group) => sum + group.length, 0);
@@ -738,6 +807,58 @@ export const ResultPage: React.FC<ResultPageProps> = ({
         {analysisSnap.loadingState === 'idle' && (
           <div style={styles.chordPlaceholder}>尚未加载和弦分析</div>
         )}
+        {isDevMode && (
+          <details style={styles.debugPanel}>
+            <summary style={styles.debugSummary}>开发态验收面板（第三优先）</summary>
+            <div style={styles.debugToggleRow}>
+              <label style={styles.debugCheckboxLabel}>
+                <input
+                  type="checkbox"
+                  checked={debugMockEnabled}
+                  onChange={(e) => setDebugMockEnabled(e.target.checked)}
+                />
+                仅面板显示 DTO mock 注入（默认关闭）
+              </label>
+            </div>
+            {debugMockEnabled && (
+              <div style={styles.debugMockHint}>
+                已启用 mock 注入，仅影响本面板显示，不改分析结果与主链行为。
+              </div>
+            )}
+
+            <div style={styles.debugSectionTitle}>结果归属与缓存</div>
+            <div style={styles.debugRow}><span>parentResultId</span><code>{formatDebugValue(debugChordResultExtras?.parentResultId ?? projectResult?.activeResultId ?? null)}</code></div>
+            <div style={styles.debugRow}><span>sourceSignature</span><code>{formatDebugValue(debugChordResultExtras?.sourceSignature)}</code></div>
+            <div style={styles.debugRow}><span>analysisVersion</span><code>{formatDebugValue(analysisSnap.analysisVersion)}</code></div>
+            <div style={styles.debugRow}><span>tempoAnalysisVersion</span><code>{formatDebugValue(debugChordResultExtras?.tempoAnalysisVersion)}</code></div>
+            <div style={styles.debugRow}><span>analyzerFingerprint</span><code>{formatDebugValue(debugChordResultExtras?.analyzerFingerprint)}</code></div>
+
+            <div style={styles.debugSectionTitle}>Analyzer</div>
+            <div style={styles.debugRow}><span>analysisMethods.chordAnalyzer</span><code>{formatDebugValue(debugAnalysisMethods?.chordAnalyzer)}</code></div>
+            <div style={styles.debugRow}><span>analysisMethods.tempoAnalyzer</span><code>{formatDebugValue(debugAnalysisMethods?.tempoAnalyzer)}</code></div>
+            <div style={styles.debugRow}><span>analysisMethods.chordAnalyzerVersion</span><code>{formatDebugValue(debugAnalysisMethods?.chordAnalyzerVersion)}</code></div>
+            <div style={styles.debugRow}><span>analysisMethods.tempoAnalyzerVersion</span><code>{formatDebugValue(debugAnalysisMethods?.tempoAnalyzerVersion)}</code></div>
+            <div style={styles.debugRow}><span>analysisMethods.vocabularyTag</span><code>{formatDebugValue(debugAnalysisMethods?.vocabularyTag)}</code></div>
+            <div style={styles.debugRow}><span>vocabularyVersion</span><code>{formatDebugValue(analysisSnap.vocabularyVersion)}</code></div>
+
+            <div style={styles.debugSectionTitle}>Chord Segment 样例</div>
+            <div style={styles.debugRow}><span>label</span><code>{formatDebugValue(debugChordSample?.label)}</code></div>
+            <div style={styles.debugRow}><span>quality</span><code>{formatDebugValue(debugChordSample?.quality)}</code></div>
+            <div style={styles.debugRow}><span>adds</span><code>{formatDebugValue(debugChordSample?.adds ?? [])}</code></div>
+            <div style={styles.debugRow}><span>suspensions</span><code>{formatDebugValue(debugChordSample?.suspensions ?? [])}</code></div>
+            <div style={styles.debugRow}><span>bassNote</span><code>{formatDebugValue(debugChordSample?.bassNote)}</code></div>
+            <div style={styles.debugRow}><span>symbol/slash</span><code>{formatDebugValue(debugChordSample?.symbol)}</code></div>
+
+            <div style={styles.debugSectionTitle}>Tempo 样例</div>
+            <div style={styles.debugRow}><span>primary</span><code>{formatDebugValue(debugTempo?.primaryBpm)}</code></div>
+            <div style={styles.debugRow}><span>candidates</span><code>{formatDebugValue(debugTempo?.candidates ?? [])}</code></div>
+            <div style={styles.debugRow}><span>confidence</span><code>{formatDebugValue(debugTempo?.confidence)}</code></div>
+            <div style={styles.debugRow}><span>ambiguity</span><code>{formatDebugValue(debugTempo?.ambiguity)}</code></div>
+            <div style={styles.debugRow}><span>ambiguity.explanation</span><code>{formatDebugValue(debugTempo?.ambiguity?.explanation)}</code></div>
+            <div style={styles.debugRow}><span>ambiguity.confidenceGap</span><code>{formatDebugValue(debugTempo?.ambiguity?.confidenceGap)}</code></div>
+            <div style={styles.debugRow}><span>methodMetadata</span><code>{formatDebugValue(debugTempo?.methodMetadata)}</code></div>
+          </details>
+        )}
       </div>
 
       {/* R12锛氬鍑洪敊璇彁绀?*/}
@@ -923,6 +1044,18 @@ function formatElapsed(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainSec = seconds % 60;
   return `${minutes}:${String(remainSec).padStart(2, '0')}`;
+}
+
+function formatDebugValue(value: unknown): string {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  if (typeof value === 'string') return value.length > 0 ? value : '""';
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '[unserializable]';
+  }
 }
 
 // ============================================================================
@@ -1278,6 +1411,54 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: '12px',
     color: '#f57f17',
     lineHeight: '1.6',
+  },
+  debugPanel: {
+    marginTop: '10px',
+    padding: '10px 12px',
+    border: '1px dashed #bdbdbd',
+    borderRadius: '8px',
+    backgroundColor: '#fcfcfc',
+  },
+  debugSummary: {
+    cursor: 'pointer',
+    fontSize: '12px',
+    color: '#333',
+    fontWeight: 600,
+  },
+  debugToggleRow: {
+    marginTop: '8px',
+    marginBottom: '8px',
+  },
+  debugCheckboxLabel: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontSize: '12px',
+    color: '#444',
+  },
+  debugMockHint: {
+    marginBottom: '8px',
+    fontSize: '12px',
+    color: '#1565c0',
+    backgroundColor: '#e3f2fd',
+    border: '1px solid #bbdefb',
+    borderRadius: '6px',
+    padding: '6px 8px',
+  },
+  debugSectionTitle: {
+    marginTop: '10px',
+    marginBottom: '4px',
+    fontSize: '12px',
+    color: '#555',
+    fontWeight: 600,
+  },
+  debugRow: {
+    display: 'grid',
+    gridTemplateColumns: '220px 1fr',
+    gap: '8px',
+    alignItems: 'start',
+    fontSize: '12px',
+    padding: '2px 0',
   },
   emptyState: {
     textAlign: 'center' as const,

@@ -188,6 +188,40 @@ export class ParseJobService implements IParseJobService {
   ) {}
 
   async startSeparation(params: StartSeparationParams): Promise<SeparationStartResult> {
+    const traceStartedAt = Date.now();
+    const formatTraceElapsed = (): number => Math.max(0, Date.now() - traceStartedAt);
+    const serializeForTrace = (value: unknown): string => {
+      try {
+        return JSON.stringify(value);
+      } catch (err) {
+        const stringifyError = err instanceof Error ? err.message : String(err);
+        return `<<json_stringify_failed:${stringifyError}>>`;
+      }
+    };
+    const trace = (
+      stage: string,
+      extra: Record<string, string | number | boolean | null | undefined> = {},
+    ): void => {
+      const fields: Record<string, string | number | boolean> = {
+        stage,
+        projectId: params.projectId,
+        jobId: 'N/A',
+        resultSetId: 'N/A',
+        runtimeProfileId: 'N/A',
+        elapsedMs: formatTraceElapsed(),
+      };
+      for (const [key, value] of Object.entries(extra)) {
+        if (value !== undefined && value !== null) {
+          fields[key] = value;
+        }
+      }
+      const serialized = Object.entries(fields)
+        .map(([key, value]) => `${key}="${String(value)}"`)
+        .join(' ');
+      console.log(`[REAL_CHAIN] parseJobTrace ${serialized}`);
+    };
+    trace('task_start', { sourceFilePath: params.sourceFilePath });
+
     const currentJobIdBefore = this.currentJobId;
     console.log(
       `[REAL_CHAIN] parseJobService.startSeparation entry projectId="${params.projectId}" sourceFilePath="${params.sourceFilePath}" projectDir="${params.projectDir}" currentJobIdBefore="${currentJobIdBefore ?? 'none'}"`,
@@ -238,6 +272,7 @@ export class ParseJobService implements IParseJobService {
     await this.parseJobRepo.create(job);
     this.currentJobId = jobId;
     this.cancelRequestedJobIds.delete(jobId);
+    trace('parse_job_created', { jobId });
     this.logger.info('startSeparation createdParseJobId', {
       createdParseJobId: jobId,
       currentJobIdBefore: currentJobIdBefore ?? null,
@@ -255,14 +290,54 @@ export class ParseJobService implements IParseJobService {
     assertJobTransition(jobId, JobStatus.Pending, JobStatus.Running);
     const startMs = Date.now();
     await this.parseJobRepo.updateStatus(jobId, JobStatus.Running);
+    trace('job_status_running', { jobId });
 
     // 更新项目状态 → Processing
     await this.projectRepo.updateStatus(params.projectId, ProjectStatus.Processing);
 
     // 6. 监听进度事件
+    let firstProgressLogged = false;
+    const resultSetId = this.normalizeResultSetId(params.resultSetId);
+    const isPilotResultSet = resultSetId.startsWith(PILOT_RESULT_SET_PREFIX);
+    const effectiveWorkerModelOverride = (params.workerModelOverride?.trim().length ?? 0) > 0
+      ? params.workerModelOverride!.trim()
+      : (isPilotResultSet ? PILOT_MODEL_ID : '');
+    const effectiveRuntimeProfileOverride = (params.runtimeProfileIdOverride?.trim().length ?? 0) > 0
+      ? params.runtimeProfileIdOverride!.trim()
+      : (isPilotResultSet ? PILOT_RUNTIME_PROFILE_ID : '');
+    const selectedRuntimeProfileId =
+      (effectiveRuntimeProfileOverride || process.env.DEMUCS_RUNTIME_PROFILE || 'demucs_env_override').trim()
+      || 'demucs_env_override';
+    trace('runtime_profile_selected', {
+      jobId,
+      resultSetId,
+      runtimeProfileId: selectedRuntimeProfileId,
+      runtimeProfileOverride: effectiveRuntimeProfileOverride || 'none',
+      modelOverride: effectiveWorkerModelOverride || 'none',
+    });
+
     this.progressUnsubscribe = this.ipcBridge.on(
       WorkerEventName.StageProgress,
       (event: WorkerEvent) => {
+        const workerStage =
+          typeof event.payload.stage === 'string' && event.payload.stage.trim().length > 0
+            ? event.payload.stage.trim()
+            : 'unknown';
+        const workerProgress =
+          typeof event.payload.progress === 'number' && Number.isFinite(event.payload.progress)
+            ? Number(event.payload.progress.toFixed(4))
+            : 'n/a';
+        const isEffectiveProgressStage = workerStage === 'INFER' || workerStage === 'POSTPROCESS' || workerStage === 'DONE';
+        if (!firstProgressLogged && isEffectiveProgressStage) {
+          firstProgressLogged = true;
+          trace('first_progress_received', {
+            jobId,
+            resultSetId,
+            runtimeProfileId: selectedRuntimeProfileId,
+            workerStage,
+            workerProgress,
+          });
+        }
         this.handleProgressEvent(jobId, event).catch((err) => {
           this.logger.error('Failed to handle progress event', err instanceof Error ? err : null, {
             jobId,
@@ -273,16 +348,8 @@ export class ParseJobService implements IParseJobService {
     );
 
     // 7. 发送分离命令
-    const resultSetId = this.normalizeResultSetId(params.resultSetId);
     const workerOutputDir = this.resolveWorkerOutputDir(params.projectDir, params.workerOutputDirOverride, resultSetId, jobId);
     try {
-      const isPilotResultSet = resultSetId.startsWith(PILOT_RESULT_SET_PREFIX);
-      const effectiveWorkerModelOverride = (params.workerModelOverride?.trim().length ?? 0) > 0
-        ? params.workerModelOverride!.trim()
-        : (isPilotResultSet ? PILOT_MODEL_ID : '');
-      const effectiveRuntimeProfileOverride = (params.runtimeProfileIdOverride?.trim().length ?? 0) > 0
-        ? params.runtimeProfileIdOverride!.trim()
-        : (isPilotResultSet ? PILOT_RUNTIME_PROFILE_ID : '');
       await fs.promises.mkdir(workerOutputDir, { recursive: true });
       const separationPayload = {
         filePath: params.sourceFilePath,
@@ -298,12 +365,27 @@ export class ParseJobService implements IParseJobService {
         `[REAL_CHAIN] parseJobService.startSeparation overrides jobId="${jobId}" projectId="${params.projectId}" resultSetId="${resultSetId}" modelOverride="${effectiveWorkerModelOverride || 'none'}" runtimeProfileOverride="${effectiveRuntimeProfileOverride || 'none'}"`,
       );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation send_before jobId="${jobId}" projectId="${params.projectId}" payload=${JSON.stringify(separationPayload)}`);
+      trace('start_separation_request_sent', {
+        jobId,
+        resultSetId,
+        runtimeProfileId: selectedRuntimeProfileId,
+      });
       const response = await this.ipcBridge.send(
         WorkerCommand.StartSeparation,
         separationPayload,
         this.config.separationTimeoutMs,
       );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation send_after jobId="${jobId}" projectId="${params.projectId}" responseSuccess=${response.success} responseErrorCode=${response.error?.code ?? 'N/A'} responseErrorMessage="${response.error?.message ?? ''}"`);
+      console.log(
+        `[REAL_CHAIN] parseJobService.startSeparation worker_response_payload jobId="${jobId}" projectId="${params.projectId}" responseJson=${serializeForTrace(response)}`,
+      );
+      trace('start_separation_response_received', {
+        jobId,
+        resultSetId,
+        runtimeProfileId: selectedRuntimeProfileId,
+        responseSuccess: response.success,
+        responseErrorCode: response.error?.code ?? 'none',
+      });
 
       this.cleanupProgressListener();
 
@@ -311,6 +393,12 @@ export class ParseJobService implements IParseJobService {
       //     必须在 schema 校验之前：response.success=false 时 data 可能缺失，
       //     直接进 schema 校验会丢失 Worker 原始错误信息。
       if (!response.success) {
+        trace('completion_failure_received', {
+          jobId,
+          resultSetId,
+          runtimeProfileId: selectedRuntimeProfileId,
+          errorCode: response.error?.code ?? 'UNKNOWN_WORKER_ERROR',
+        });
         const errCode = response.error?.code as string ?? 'UNKNOWN_WORKER_ERROR';
         const errMsg = response.error?.message as string ?? 'Worker returned error without details';
         if (errCode === ErrorCode.TASK_CANCELLED) {
@@ -344,6 +432,12 @@ export class ParseJobService implements IParseJobService {
         response,
       );
       console.log(`[REAL_CHAIN] parseJobService.startSeparation schema_validated jobId="${jobId}" projectId="${params.projectId}" valid=${validated.valid}`);
+      trace('schema_validated', {
+        jobId,
+        resultSetId,
+        runtimeProfileId: selectedRuntimeProfileId,
+        valid: validated.valid,
+      });
       await this.throwIfCancelRequested(jobId, params.projectId, 'after_worker_response');
 
       if (!validated.valid) {
@@ -361,43 +455,71 @@ export class ParseJobService implements IParseJobService {
       }
 
       // 9. 通过 adapter 归一化 → 写盘
-      const parentResultId = resultSetId;
-      const runtimeProfileId = (effectiveRuntimeProfileOverride || process.env.DEMUCS_RUNTIME_PROFILE || 'demucs_env_override').trim()
-        || 'demucs_env_override';
-      const provenanceContext: SeparationProvenanceContext = {
-        jobId,
-        runtimeProfileId,
-        parentResultId,
-        sourceKind: 'separation',
-      };
-      const adapted = this.resultAdapter.adapt(
-        validated.data!,
-        params.projectId,
-        params.projectDir,
-        provenanceContext,
-      );
-      await this.throwIfCancelRequested(jobId, params.projectId, 'before_materialize');
-      await this.materializeSeparatedStemFiles(
-        validated.data!,
-        workerOutputDir,
-        adapted.stemFiles,
-        jobId,
-        params.projectId,
-      );
-      console.log(`[REAL_CHAIN] parseJobService.startSeparation adapted jobId="${jobId}" projectId="${params.projectId}" stemFilesLength=${adapted.stemFiles.length}`);
-      await this.throwIfCancelRequested(jobId, params.projectId, 'before_handle_success');
-      await this.handleSeparationSuccess(jobId, params, adapted, startMs, {
-        parentResultId,
-        preserveExistingStems: !!params.preserveExistingStems,
-      });
+      try {
+        const parentResultId = resultSetId;
+        const runtimeProfileId = selectedRuntimeProfileId;
+        const provenanceContext: SeparationProvenanceContext = {
+          jobId,
+          runtimeProfileId,
+          parentResultId,
+          sourceKind: 'separation',
+        };
+        const adapted = this.resultAdapter.adapt(
+          validated.data!,
+          params.projectId,
+          params.projectDir,
+          provenanceContext,
+        );
+        await this.throwIfCancelRequested(jobId, params.projectId, 'before_materialize');
+        await this.materializeSeparatedStemFiles(
+          validated.data!,
+          workerOutputDir,
+          adapted.stemFiles,
+          jobId,
+          params.projectId,
+        );
+        console.log(`[REAL_CHAIN] parseJobService.startSeparation adapted jobId="${jobId}" projectId="${params.projectId}" stemFilesLength=${adapted.stemFiles.length}`);
+        await this.throwIfCancelRequested(jobId, params.projectId, 'before_handle_success');
+        await this.handleSeparationSuccess(jobId, params, adapted, startMs, {
+          parentResultId,
+          preserveExistingStems: !!params.preserveExistingStems,
+        });
+        trace('completion_success_received', {
+          jobId,
+          resultSetId: parentResultId,
+          runtimeProfileId,
+        });
 
-      const finalJob = await this.parseJobRepo.findById(jobId);
-      return {
-        job: finalJob ?? job,
-        projectStatusAfter: ProjectStatus.Ready,
-        warnings: adapted.warnings,
-      };
+        const finalJob = await this.parseJobRepo.findById(jobId);
+        return {
+          job: finalJob ?? job,
+          projectStatusAfter: ProjectStatus.Ready,
+          warnings: adapted.warnings,
+        };
+      } catch (pipelineErr) {
+        const error = pipelineErr instanceof Error ? pipelineErr : new Error(String(pipelineErr));
+        console.error(
+          `[REAL_CHAIN] parseJobService.startSeparation pipeline_error jobId="${jobId}" projectId="${params.projectId}" error="${error.message}"`,
+        );
+        console.error(
+          `[REAL_CHAIN] parseJobService.startSeparation pipeline_error_stack jobId="${jobId}" projectId="${params.projectId}" stack="${error.stack ?? 'N/A'}"`,
+        );
+        throw pipelineErr;
+      }
     } catch (err) {
+      const tracedError = err instanceof Error ? err : new Error(String(err));
+      console.error(
+        `[REAL_CHAIN] parseJobService.startSeparation catch_error jobId="${jobId}" projectId="${params.projectId}" error="${tracedError.message}"`,
+      );
+      console.error(
+        `[REAL_CHAIN] parseJobService.startSeparation catch_error_stack jobId="${jobId}" projectId="${params.projectId}" stack="${tracedError.stack ?? 'N/A'}"`,
+      );
+      trace('completion_failure_received', {
+        jobId,
+        resultSetId,
+        runtimeProfileId: selectedRuntimeProfileId,
+        errorCode: err instanceof AppError ? err.code : 'SEPARATION_EXECUTION_FAILED',
+      });
       this.cleanupProgressListener();
 
       if (err instanceof AppError) {
@@ -709,18 +831,78 @@ export class ParseJobService implements IParseJobService {
       sourceSignature,
       createdAt: Date.now(),
     };
+    const expectedCurrentResultStemCount = adapted.stemFiles.length;
+    if (expectedCurrentResultStemCount <= 0) {
+      throw new AppError({
+        code: ErrorCode.ENGINE_OUTPUT_INVALID,
+        message: `No stem files adapted for resultSet "${parentResultId}"`,
+        userMessage: '分离完成但未生成可用轨道，请重试',
+        context: {
+          projectId: params.projectId,
+          jobId,
+          parentResultId,
+          stage: 'parseJobService.handleSeparationSuccess',
+        },
+        retryable: false,
+      });
+    }
 
-    // 1. 写入 DB
-    if (options.preserveExistingStems) {
-      const existingStems = await this.stemFileRepo.findByProjectId(params.projectId);
-      const keptStems = existingStems.filter((stem) =>
-        this.normalizeResultSetId(stem.parentResultId) !== parentResultId,
-      );
-      await this.stemFileRepo.deleteByProjectId(params.projectId);
-      await this.stemFileRepo.createMany([...keptStems, ...adapted.stemFiles]);
-    } else {
+    const persistStemRecords = async (): Promise<void> => {
+      if (options.preserveExistingStems) {
+        const existingStems = await this.stemFileRepo.findByProjectId(params.projectId);
+        const keptStems = existingStems.filter((stem) =>
+          this.normalizeResultSetId(stem.parentResultId) !== parentResultId,
+        );
+        await this.stemFileRepo.deleteByProjectId(params.projectId);
+        await this.stemFileRepo.createMany([...keptStems, ...adapted.stemFiles]);
+        return;
+      }
+
       await this.stemFileRepo.deleteByProjectId(params.projectId);
       await this.stemFileRepo.createMany(adapted.stemFiles);
+    };
+
+    // 1. 写入 DB
+    await persistStemRecords();
+    let persistedStems = await this.stemFileRepo.findByProjectId(params.projectId);
+    let persistedCurrentResultStems = persistedStems.filter((stem) =>
+      this.normalizeResultSetId(stem.parentResultId) === parentResultId,
+    );
+    console.log(
+      `[REAL_CHAIN] parseJobService.handleSeparationSuccess stem_persist_verify projectId="${params.projectId}" jobId="${jobId}" parentResultId="${parentResultId}" expectedCount=${expectedCurrentResultStemCount} persistedCount=${persistedCurrentResultStems.length}`,
+    );
+    if (expectedCurrentResultStemCount > 0 && persistedCurrentResultStems.length < expectedCurrentResultStemCount) {
+      this.logger.warn('Stem persistence mismatch after first write, retry once', {
+        projectId: params.projectId,
+        jobId,
+        expectedCurrentResultStemCount,
+        persistedCurrentResultStemCount: persistedCurrentResultStems.length,
+        stage: 'parseJobService.handleSeparationSuccess',
+      });
+      await persistStemRecords();
+      persistedStems = await this.stemFileRepo.findByProjectId(params.projectId);
+      persistedCurrentResultStems = persistedStems.filter((stem) =>
+        this.normalizeResultSetId(stem.parentResultId) === parentResultId,
+      );
+      console.log(
+        `[REAL_CHAIN] parseJobService.handleSeparationSuccess stem_persist_verify_retry projectId="${params.projectId}" jobId="${jobId}" parentResultId="${parentResultId}" expectedCount=${expectedCurrentResultStemCount} persistedCount=${persistedCurrentResultStems.length}`,
+      );
+    }
+    if (expectedCurrentResultStemCount > 0 && persistedCurrentResultStems.length < expectedCurrentResultStemCount) {
+      throw new AppError({
+        code: ErrorCode.CACHE_MANIFEST_INVALID,
+        message: `Stem persistence incomplete for resultSet "${parentResultId}": expected=${expectedCurrentResultStemCount}, actual=${persistedCurrentResultStems.length}`,
+        userMessage: '分离完成后轨道写入异常，请重试',
+        context: {
+          projectId: params.projectId,
+          jobId,
+          parentResultId,
+          expectedCurrentResultStemCount,
+          persistedCurrentResultStemCount: persistedCurrentResultStems.length,
+          stage: 'parseJobService.handleSeparationSuccess',
+        },
+        retryable: false,
+      });
     }
 
     // 2. 写入 / 更新 manifest

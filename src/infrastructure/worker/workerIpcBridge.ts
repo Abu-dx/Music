@@ -463,7 +463,12 @@ export class WorkerIpcBridge implements IWorkerIpcBridge {
   // --- Internal ---
 
   private handleStdoutData(data: Buffer): void {
-    this.lineBuffer += data.toString('utf-8');
+    const chunkText = data.toString('utf-8');
+    const chunkPreview = chunkText.replace(/\s+/g, ' ').slice(0, 220);
+    console.log(
+      `[REAL_CHAIN] workerIpcBridge.stdout_chunk_received bytes=${data.length} pendingCount=${this.pendingRequests.size} preview="${chunkPreview}"`,
+    );
+    this.lineBuffer += chunkText;
 
     const lines = this.lineBuffer.split('\n');
     this.lineBuffer = lines.pop() ?? '';
@@ -473,13 +478,24 @@ export class WorkerIpcBridge implements IWorkerIpcBridge {
       if (!trimmed) continue;
 
       try {
+        console.log(
+          `[REAL_CHAIN] workerIpcBridge.stdout_json_parse_attempt pendingCount=${this.pendingRequests.size} linePreview="${trimmed.slice(0, 220)}"`,
+        );
         const message = JSON.parse(trimmed) as WorkerMessage;
         this.routeMessage(message);
-      } catch {
+      } catch (err) {
+        const parseErrorMessage = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[REAL_CHAIN] workerIpcBridge.stdout_json_parse_failed pendingCount=${this.pendingRequests.size} error="${parseErrorMessage}" linePreview="${trimmed.slice(0, 220)}"`,
+        );
         this.logger.warn('Invalid JSON from worker stdout', {
           line: trimmed.slice(0, 200),
+          parseError: parseErrorMessage,
           stage: 'workerIpcBridge.handleStdoutData',
         });
+        this.rejectPendingFromProtocolFault(
+          `Invalid JSON from worker stdout: ${parseErrorMessage}`,
+        );
       }
     }
   }
@@ -531,10 +547,18 @@ export class WorkerIpcBridge implements IWorkerIpcBridge {
   private handleResponse(response: WorkerResponse): void {
     const pending = this.pendingRequests.get(response.id);
     if (!pending) {
+      console.error(
+        `[REAL_CHAIN] workerIpcBridge.response_unknown_request_id responseId="${response.id}" pendingCount=${this.pendingRequests.size}`,
+      );
       this.logger.warn('Received response for unknown request', {
         responseId: response.id,
         stage: 'workerIpcBridge.handleResponse',
       });
+      if (this.pendingRequests.size > 0) {
+        this.rejectPendingFromProtocolFault(
+          `Response id mismatch from worker: responseId=${response.id}`,
+        );
+      }
       return;
     }
 
@@ -551,6 +575,27 @@ export class WorkerIpcBridge implements IWorkerIpcBridge {
       elapsedMs: Date.now() - pending.sentAt,
       stage: 'workerIpcBridge.handleResponse',
     });
+  }
+
+  private rejectPendingFromProtocolFault(reason: string): void {
+    if (this.pendingRequests.size === 0) {
+      return;
+    }
+    const pendingIds = Array.from(this.pendingRequests.keys());
+    console.error(
+      `[REAL_CHAIN] workerIpcBridge.protocol_fault_reject pendingCount=${pendingIds.length} reason="${reason}" pendingIds="${pendingIds.join(',')}"`,
+    );
+    for (const [id, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new AppError({
+        code: ErrorCode.WORKER_IPC_PROTOCOL_ERROR,
+        message: `Worker IPC protocol fault: ${reason}`,
+        userMessage: 'Worker 通信协议异常，请重试',
+        context: { requestId: id, command: pending.command, reason },
+        retryable: true,
+      }));
+    }
+    this.pendingRequests.clear();
   }
 
   private handleEvent(event: WorkerEvent): void {

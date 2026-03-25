@@ -577,17 +577,47 @@ export function initWorkerInfra(): WorkerInfra {
  * 启动 Worker（启动进程 + attach bridge + health check）
  */
 export async function startWorker(infra: WorkerInfra): Promise<void> {
-  console.log('[REAL_CHAIN] workerSetup.startWorker begin');
+  const traceStartedAt = Date.now();
+  const trace = (
+    stage: string,
+    extra: Record<string, string | number | boolean | null | undefined> = {},
+  ): void => {
+    const base: Record<string, string | number | boolean> = {
+      stage,
+      projectId: 'N/A',
+      resultSetId: 'N/A',
+      runtimeProfileId: process.env.DEMUCS_RUNTIME_PROFILE ?? 'none',
+      jobId: 'N/A',
+      elapsedMs: Math.max(0, Date.now() - traceStartedAt),
+    };
+    for (const [key, value] of Object.entries(extra)) {
+      if (value !== undefined && value !== null) {
+        base[key] = value;
+      }
+    }
+    const payload = Object.entries(base).map(([k, v]) => `${k}="${String(v)}"`).join(' ');
+    console.log(`[REAL_CHAIN] workerStartTrace ${payload}`);
+  };
+
+  trace('worker_spawn_start');
   await infra.workerManager.start();
+  trace('worker_spawn_end');
+
+  trace('worker_handshake_attach_start');
   infra.ipcBridge.attach();
+  trace('worker_handshake_attach_end');
 
   // 初始健康检查（失败不阻塞启动）
   try {
+    trace('worker_ready_health_check_start');
     await infra.healthChecker.check();
-    console.log('[REAL_CHAIN] workerSetup.startWorker health_check=passed');
+    trace('worker_ready_handshake_received', { healthCheck: 'passed' });
     logger.info('Worker health check passed');
   } catch (err) {
-    console.log(`[REAL_CHAIN] workerSetup.startWorker health_check=failed error="${err instanceof Error ? err.message : String(err)}"`);
+    trace('worker_ready_health_check_failed', {
+      healthCheck: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
     logger.warn('Initial health check failed, worker may not be ready yet', {
       error: err instanceof Error ? err.message : String(err),
     });
@@ -602,13 +632,17 @@ export async function startWorker(infra: WorkerInfra): Promise<void> {
       logger.info('Worker status recovered to Running (process still alive)', {
         pid: status.pid,
       });
-      console.log(`[REAL_CHAIN] workerSetup.startWorker recovered_to_running pid=${status.pid}`);
+      trace('worker_ready_recovered_to_running', { pid: status.pid });
     }
   }
 
   // 最终状态诊断（必须在所有恢复逻辑之后）
   const finalStatus = infra.workerManager.getStatus();
-  console.log(`[REAL_CHAIN] workerSetup.startWorker done status=${finalStatus.status} pid=${finalStatus.pid} acceptingRequests=${finalStatus.acceptingRequests}`);
+  trace('worker_start_done', {
+    status: finalStatus.status,
+    pid: finalStatus.pid ?? 'none',
+    acceptingRequests: finalStatus.acceptingRequests,
+  });
 
   // 启动周期健康检查
   infra.healthChecker.startPeriodicCheck();

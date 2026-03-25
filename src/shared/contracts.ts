@@ -491,6 +491,23 @@ export interface TempoAmbiguityDTO {
   halfTimeBpm?: number;
   doubleTimeBpm?: number;
   reason?: string;
+  explanation?: string;
+  confidenceGap?: number;
+}
+
+export interface TempoMethodStabilityDTO {
+  isStable?: boolean;
+  cv?: number;
+  confidenceRatio?: number;
+}
+
+export interface TempoMethodMetadataDTO {
+  backend?: string;
+  sampleRate?: number;
+  hopLength?: number;
+  beatCount?: number;
+  stability?: TempoMethodStabilityDTO;
+  [key: string]: unknown;
 }
 
 export interface TempoAnalysisDTO {
@@ -499,6 +516,7 @@ export interface TempoAnalysisDTO {
   method: string;
   candidates: TempoCandidateDTO[];
   ambiguity?: TempoAmbiguityDTO;
+  methodMetadata?: TempoMethodMetadataDTO;
 }
 
 export interface ChordSegmentDTO {
@@ -536,7 +554,10 @@ export interface ChordSegmentDTO {
   sourceFlags?: string[];
   symbol?: string;
   chordType?: string;
+  quality?: string;
   bassNote?: string;
+  adds?: string[];
+  suspensions?: string[];
   extensions?: string[];
   alterations?: string[];
   omissions?: string[];
@@ -570,6 +591,9 @@ export interface ChordAnalysisResultDTO {
   analysisMethods?: {
     chordAnalyzer: string;
     tempoAnalyzer: string;
+    chordAnalyzerVersion?: string;
+    tempoAnalyzerVersion?: string;
+    vocabularyTag?: string;
   };
   /** 和弦片段列表（按时间排序） */
   segments: ChordSegmentDTO[];
@@ -589,6 +613,7 @@ export interface ChordAnalysisResultDTO {
   /** 估计 BPM（可选） */
   estimatedBpm?: number;
   tempo?: TempoAnalysisDTO;
+  tempoAnalysisVersion?: string;
   /**
    * 分析引擎版本（GPT R11 Must Fix #4）
    * 用于缓存兼容性校验 — 版本不匹配时应重新分析。
@@ -599,6 +624,7 @@ export interface ChordAnalysisResultDTO {
    * 不同版本可能输出不同标签格式。
    */
   vocabularyVersion?: string;
+  analyzerFingerprint?: string;
   chordVocabulary?: {
     selected: string;
     supportsExtendedChords: boolean;

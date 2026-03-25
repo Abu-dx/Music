@@ -6,9 +6,11 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 ENV_RUNTIME_FORCE_UNHEALTHY_PROFILES = "RUNTIME_FORCE_UNHEALTHY_PROFILES"
+REQUIRED_MODULES_PROBE_TIMEOUT_SEC = 30
+REQUIRED_MODULES_PROBE_RETRY_COUNT = 1
 
 
 @dataclass
@@ -124,7 +126,144 @@ class RuntimeProfileRegistry:
 
 
 class RuntimeHealthChecker:
-    def check(self, profile: RuntimeProfile) -> RuntimeHealthResult:
+    def _emit_trace(
+        self,
+        trace_cb: Optional[Callable[[str, str, str, str], None]],
+        stage: str,
+        profile_id: str,
+        status: str,
+        detail: str = "",
+    ) -> None:
+        if trace_cb is None:
+            return
+        trace_cb(stage, profile_id, status, detail)
+
+    def _format_probe_timeout_tail(self, exc: subprocess.TimeoutExpired) -> str:
+        parts: List[str] = []
+        for raw in (exc.stderr, exc.stdout):
+            if raw is None:
+                continue
+            if isinstance(raw, bytes):
+                text = raw.decode(errors="ignore")
+            else:
+                text = str(raw)
+            if text.strip():
+                parts.append(text.strip())
+        merged = " | ".join(parts)
+        return merged[-500:] if merged else ""
+
+    def _is_redundant_health_check_for_modules(
+        self,
+        health_check: Optional[List[str]],
+        module_expr: str,
+    ) -> bool:
+        if not health_check or len(health_check) < 3:
+            return False
+        if health_check[1] != "-c":
+            return False
+        script = (health_check[2] or "").strip()
+        return script == module_expr.strip()
+
+    def _run_required_modules_probe(
+        self,
+        executable_path: str,
+        profile: RuntimeProfile,
+        module_expr: str,
+        modules_joined: str,
+        checks: List[str],
+        trace_cb: Optional[Callable[[str, str, str, str], None]] = None,
+    ) -> tuple[Optional[RuntimeHealthResult], bool]:
+        self._emit_trace(
+            trace_cb,
+            "required_modules_probe_start",
+            profile.id,
+            "start",
+            f"modules={modules_joined}",
+        )
+        retry_after_timeout = False
+        for attempt in range(1, REQUIRED_MODULES_PROBE_RETRY_COUNT + 2):
+            try:
+                probe = subprocess.run(
+                    [executable_path, "-c", module_expr],
+                    capture_output=True,
+                    text=True,
+                    timeout=REQUIRED_MODULES_PROBE_TIMEOUT_SEC,
+                    cwd=profile.working_directory or None,
+                    env=self._build_env(profile, extra_env={}),
+                )
+                if probe.returncode != 0:
+                    stderr_tail = (probe.stderr or probe.stdout or "")[-500:]
+                    if retry_after_timeout and attempt == 2:
+                        checks.append("required_modules_probe_retry_failed")
+                    checks.append(f"required_modules_missing:{modules_joined}:{stderr_tail}")
+                    self._emit_trace(
+                        trace_cb,
+                        "required_modules_probe_end",
+                        profile.id,
+                        "failed",
+                        f"attempt={attempt};reason=nonzero_returncode;detail={stderr_tail}",
+                    )
+                    return RuntimeHealthResult(healthy=False, checks=checks), False
+                if retry_after_timeout and attempt == 2:
+                    checks.append("required_modules_probe_retry_success")
+                self._emit_trace(
+                    trace_cb,
+                    "required_modules_probe_end",
+                    profile.id,
+                    "success",
+                    f"attempt={attempt}",
+                )
+                return None, False
+            except subprocess.TimeoutExpired as exc:
+                timeout_tail = self._format_probe_timeout_tail(exc)
+                if attempt == 1:
+                    checks.append(
+                        "required_modules_probe_timeout_first_attempt:"
+                        f"timeout={REQUIRED_MODULES_PROBE_TIMEOUT_SEC}s"
+                    )
+                    retry_after_timeout = True
+                    continue
+                checks.append(
+                    "required_modules_probe_retry_timeout:"
+                    f"timeout={REQUIRED_MODULES_PROBE_TIMEOUT_SEC}s:{timeout_tail}"
+                )
+                checks.append("required_modules_probe_degraded_timeout")
+                self._emit_trace(
+                    trace_cb,
+                    "required_modules_probe_end",
+                    profile.id,
+                    "timeout_degraded",
+                    f"attempt={attempt};timeout={REQUIRED_MODULES_PROBE_TIMEOUT_SEC}s;detail={timeout_tail}",
+                )
+                return None, True
+            except Exception as exc:
+                if retry_after_timeout and attempt == 2:
+                    checks.append("required_modules_probe_retry_failed")
+                checks.append(f"required_modules_probe_failed:{exc}")
+                self._emit_trace(
+                    trace_cb,
+                    "required_modules_probe_end",
+                    profile.id,
+                    "failed",
+                    f"attempt={attempt};reason=exception;detail={exc}",
+                )
+                return RuntimeHealthResult(healthy=False, checks=checks), False
+        self._emit_trace(
+            trace_cb,
+            "required_modules_probe_end",
+            profile.id,
+            "failed",
+            "reason=unknown",
+        )
+        return None, False
+
+    def check(
+        self,
+        profile: RuntimeProfile,
+        trace_cb: Optional[Callable[[str, str, str, str], None]] = None,
+        skip_required_modules_probe: bool = False,
+        skip_import_probe: bool = False,
+    ) -> RuntimeHealthResult:
         checks: List[str] = []
         forced_profiles = {
             item.strip()
@@ -133,35 +272,95 @@ class RuntimeHealthChecker:
         }
         if profile.id in forced_profiles:
             checks.append("forced_unhealthy_for_test")
+            self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "failed", "forced_unhealthy_for_test")
             return RuntimeHealthResult(healthy=False, checks=checks)
 
+        self._emit_trace(trace_cb, "executable_probe_start", profile.id, "start", profile.executable)
         executable_path = self._resolve_executable(profile.executable)
         if not executable_path:
             checks.append(f"executable_missing:{profile.executable}")
+            self._emit_trace(trace_cb, "executable_probe_end", profile.id, "failed", f"executable_missing:{profile.executable}")
+            self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "failed", "executable_missing")
             return RuntimeHealthResult(healthy=False, checks=checks)
+        self._emit_trace(trace_cb, "executable_probe_end", profile.id, "success", executable_path)
 
         if profile.required_modules:
             module_expr = "; ".join([f"import {module}" for module in profile.required_modules])
-            try:
-                probe = subprocess.run(
-                    [executable_path, "-c", module_expr],
-                    capture_output=True,
-                    text=True,
-                    timeout=12,
-                    cwd=profile.working_directory or None,
-                    env=self._build_env(profile, extra_env={}),
+            if skip_required_modules_probe:
+                checks.append("required_modules_probe_skipped")
+                self._emit_trace(
+                    trace_cb,
+                    "required_modules_probe_start",
+                    profile.id,
+                    "skipped",
+                    "reason=skip_required_modules_probe",
                 )
-                if probe.returncode != 0:
-                    stderr_tail = (probe.stderr or probe.stdout or "")[-500:]
-                    checks.append(
-                        f"required_modules_missing:{','.join(profile.required_modules)}:{stderr_tail}"
-                    )
-                    return RuntimeHealthResult(healthy=False, checks=checks)
-            except Exception as exc:
-                checks.append(f"required_modules_probe_failed:{exc}")
-                return RuntimeHealthResult(healthy=False, checks=checks)
+                self._emit_trace(
+                    trace_cb,
+                    "required_modules_probe_end",
+                    profile.id,
+                    "skipped",
+                    "reason=skip_required_modules_probe",
+                )
+                required_modules_probe_degraded = False
+            else:
+                required_module_failure, required_modules_probe_degraded = self._run_required_modules_probe(
+                    executable_path=executable_path,
+                    profile=profile,
+                    module_expr=module_expr,
+                    modules_joined=",".join(profile.required_modules),
+                    checks=checks,
+                    trace_cb=trace_cb,
+                )
+                if required_module_failure is not None:
+                    self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "failed", "|".join(required_module_failure.checks))
+                    return required_module_failure
+        else:
+            module_expr = ""
+            required_modules_probe_degraded = False
 
         if profile.health_check:
+            if skip_import_probe:
+                checks.append("health_check_probe_skipped")
+                self._emit_trace(
+                    trace_cb,
+                    "import_probe_start",
+                    profile.id,
+                    "skipped",
+                    "reason=skip_import_probe",
+                )
+                self._emit_trace(
+                    trace_cb,
+                    "import_probe_end",
+                    profile.id,
+                    "skipped",
+                    "reason=skip_import_probe",
+                )
+                checks.append("ok_degraded")
+                self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "success_degraded", "|".join(checks))
+                return RuntimeHealthResult(healthy=True, checks=checks)
+            self._emit_trace(
+                trace_cb,
+                "import_probe_start",
+                profile.id,
+                "start",
+                " ".join(profile.health_check),
+            )
+            if (
+                required_modules_probe_degraded
+                and self._is_redundant_health_check_for_modules(profile.health_check, module_expr)
+            ):
+                checks.append("health_check_skipped_after_required_modules_timeout_degraded")
+                checks.append("ok_degraded")
+                self._emit_trace(
+                    trace_cb,
+                    "import_probe_end",
+                    profile.id,
+                    "skipped",
+                    "reason=redundant_after_required_modules_timeout_degraded",
+                )
+                self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "success_degraded", "|".join(checks))
+                return RuntimeHealthResult(healthy=True, checks=checks)
             try:
                 probe = subprocess.run(
                     profile.health_check,
@@ -174,12 +373,31 @@ class RuntimeHealthChecker:
                 if probe.returncode != 0:
                     stderr_tail = (probe.stderr or probe.stdout or "")[-500:]
                     checks.append(f"health_check_failed:{stderr_tail}")
+                    self._emit_trace(
+                        trace_cb,
+                        "import_probe_end",
+                        profile.id,
+                        "failed",
+                        f"reason=nonzero_returncode;detail={stderr_tail}",
+                    )
+                    self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "failed", "|".join(checks))
                     return RuntimeHealthResult(healthy=False, checks=checks)
+                self._emit_trace(trace_cb, "import_probe_end", profile.id, "success", "ok")
             except Exception as exc:
                 checks.append(f"health_check_exception:{exc}")
+                timeout_flag = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "exception"
+                self._emit_trace(
+                    trace_cb,
+                    "import_probe_end",
+                    profile.id,
+                    "failed",
+                    f"reason={timeout_flag};detail={exc}",
+                )
+                self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "failed", "|".join(checks))
                 return RuntimeHealthResult(healthy=False, checks=checks)
 
         checks.append("ok")
+        self._emit_trace(trace_cb, "final_runtime_health_decision", profile.id, "success", "ok")
         return RuntimeHealthResult(healthy=True, checks=checks)
 
     def _resolve_executable(self, executable: str) -> Optional[str]:
@@ -201,7 +419,14 @@ class RuntimeResolver:
         self._registry = registry
         self._health_checker = health_checker
 
-    def resolve(self, requested_profile_id: str, default_profile_id: str) -> RuntimeResolution:
+    def resolve(
+        self,
+        requested_profile_id: str,
+        default_profile_id: str,
+        trace_cb: Optional[Callable[[str, str, str, str], None]] = None,
+        skip_required_modules_probe: bool = False,
+        skip_import_probe: bool = False,
+    ) -> RuntimeResolution:
         requested = (requested_profile_id or "").strip() or default_profile_id
         current = requested
         visited: set[str] = set()
@@ -213,7 +438,12 @@ class RuntimeResolver:
                 default_profile = self._registry.get(default_profile_id)
                 if default_profile is None:
                     raise RuntimeError(f"default runtime profile missing: {default_profile_id}")
-                health = self._health_checker.check(default_profile)
+                health = self._health_checker.check(
+                    default_profile,
+                    trace_cb=trace_cb,
+                    skip_required_modules_probe=skip_required_modules_probe,
+                    skip_import_probe=skip_import_probe,
+                )
                 return RuntimeResolution(
                     requested_profile_id=requested,
                     actual_profile_id=default_profile_id,
@@ -231,7 +461,12 @@ class RuntimeResolver:
                 current = default_profile_id
                 continue
 
-            health = self._health_checker.check(profile)
+            health = self._health_checker.check(
+                profile,
+                trace_cb=trace_cb,
+                skip_required_modules_probe=skip_required_modules_probe,
+                skip_import_probe=skip_import_probe,
+            )
             if health.healthy:
                 return RuntimeResolution(
                     requested_profile_id=requested,
