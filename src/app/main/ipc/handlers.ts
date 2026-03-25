@@ -173,6 +173,32 @@ function normalizeParentResultId(value: string | null | undefined): string {
   return normalized.length > 0 ? normalized : DEFAULT_ACTIVE_RESULT_ID;
 }
 
+type PilotRuntimePreflightResult = {
+  configured: boolean;
+  missingItems: string[];
+};
+
+function checkPilotRuntimeProfileAvailability(): PilotRuntimePreflightResult {
+  const pilotPython = process.env.DEMUCS_6S_PILOT_PYTHON_EXE?.trim() ?? '';
+  const pilotEnvRoot = process.env.DEMUCS_6S_PILOT_ENV_ROOT?.trim() ?? '';
+  const missingItems: string[] = [];
+
+  if (pilotPython.length === 0) {
+    missingItems.push('DEMUCS_6S_PILOT_PYTHON_EXE');
+  }
+  if (path.isAbsolute(pilotPython) && !fs.existsSync(pilotPython)) {
+    missingItems.push(`DEMUCS_6S_PILOT_PYTHON_EXE(path_not_found:${pilotPython})`);
+  }
+  if (pilotEnvRoot.length > 0 && path.isAbsolute(pilotEnvRoot) && !fs.existsSync(pilotEnvRoot)) {
+    missingItems.push(`DEMUCS_6S_PILOT_ENV_ROOT(path_not_found:${pilotEnvRoot})`);
+  }
+
+  return {
+    configured: missingItems.length === 0,
+    missingItems,
+  };
+}
+
 function filterStemsForResultSet<T extends { parentResultId?: string }>(
   stems: T[],
   activeResultId: string,
@@ -298,6 +324,26 @@ function normalizeErrorMessage(err: unknown, fallback: string): string {
 
 function toSeparationFailureMessage(err: unknown): string {
   const raw = normalizeErrorMessage(err, '分离失败，请稍后重试');
+  if (raw.includes('PILOT_RUNTIME_PROFILE_UNAVAILABLE')) {
+    const detail = raw.split('PILOT_RUNTIME_PROFILE_UNAVAILABLE:')[1]?.trim();
+    return detail
+      ? `实验6轨运行环境未就绪：${detail}`
+      : '实验6轨运行环境未就绪（缺少 pilot runtime profile），请先配置后再试';
+  }
+  if (raw.includes('PILOT_PARSE_JOB_FAILED')) {
+    return '实验6轨分离失败（任务执行失败），请查看日志中的错误码';
+  }
+  if (raw.includes('PILOT_RESULT_EMPTY')) {
+    return '实验6轨分离未产出可用轨道，请查看日志确认输入文件与模型输出';
+  }
+  if (raw.includes('PILOT_PROFILE_MISMATCH')) {
+    return '实验6轨模型输出与预期不一致，请查看日志中的模型信息';
+  }
+  const missingModuleMatch = raw.match(/required_modules_missing:([a-zA-Z0-9_.-]+)/i);
+  if (missingModuleMatch) {
+    const moduleName = missingModuleMatch[1];
+    return `运行环境缺少依赖模块：${moduleName}，请在对应 Python 环境安装后重试`;
+  }
   if (raw.includes('manifest') || raw.includes('MANIFEST')) {
     return '分离结果已生成，但项目元数据写入失败，请查看日志并重试';
   }
@@ -311,6 +357,20 @@ function toSeparationFailureMessage(err: unknown): string {
     return '分离引擎执行失败，请检查 Demucs/Python 环境';
   }
   return raw;
+}
+
+function classifyPilotFailure(
+  errorMessage: string,
+  errorCode: string | null,
+): string {
+  const merged = `${errorCode ?? ''} ${errorMessage}`.toUpperCase();
+  if (merged.includes('PILOT_RUNTIME_PROFILE_UNAVAILABLE')) return 'PILOT_RUNTIME_PROFILE_UNAVAILABLE';
+  if (merged.includes('PILOT_SOURCE_PATH_REQUIRED')) return 'PILOT_SOURCE_PATH_REQUIRED';
+  if (merged.includes('PILOT_PARSE_JOB_FAILED')) return 'PILOT_PARSE_JOB_FAILED';
+  if (merged.includes('PILOT_RESULT_EMPTY')) return 'PILOT_RESULT_EMPTY';
+  if (merged.includes('PILOT_PROFILE_MISMATCH')) return 'PILOT_PROFILE_MISMATCH';
+  if (merged.includes('PILOT_SEPARATION_PROVENANCE_INCOMPLETE')) return 'PILOT_SEPARATION_PROVENANCE_INCOMPLETE';
+  return 'PILOT_UNKNOWN_ERROR';
 }
 
 function toAnalysisFailureMessage(err: unknown, fallback: string): string {
@@ -407,7 +467,60 @@ function normalizeManifestRelativePath(projectDir: string, filePath: string): st
   if (relative.length > 0 && !relative.startsWith('..')) {
     return relative;
   }
+  // TODO(Phase 2 Gate): this fallback keeps legacy compatibility but may hide path issues.
+  // Upgrade to strict validation in a dedicated hardening pass.
   return `stems/${path.basename(filePath)}`;
+}
+
+function resolveManifestSourceFilePath(
+  manifest: Record<string, unknown> | null | undefined,
+  projectDir: string,
+): string | null {
+  if (!manifest) return null;
+  const rawCandidates: string[] = [];
+  if (typeof manifest.originalFilePath === 'string' && manifest.originalFilePath.trim().length > 0) {
+    rawCandidates.push(manifest.originalFilePath.trim());
+  }
+  if (typeof manifest.sourceFilePath === 'string' && manifest.sourceFilePath.trim().length > 0) {
+    rawCandidates.push(manifest.sourceFilePath.trim());
+  }
+
+  for (const candidate of rawCandidates) {
+    const resolved = path.isAbsolute(candidate)
+      ? candidate
+      : path.join(projectDir, candidate);
+    if (fs.existsSync(resolved)) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
+async function persistManifestSourceFilePath(
+  projectDir: string,
+  sourceFilePath: string,
+): Promise<void> {
+  const normalized = sourceFilePath.trim();
+  if (normalized.length === 0) return;
+  const manifest = await readProjectJsonRecord(projectDir, 'manifest.json');
+  if (!manifest) return;
+
+  const currentOriginal = typeof manifest.originalFilePath === 'string'
+    ? manifest.originalFilePath.trim()
+    : '';
+  const currentSource = typeof manifest.sourceFilePath === 'string'
+    ? manifest.sourceFilePath.trim()
+    : '';
+  if (currentOriginal === normalized && currentSource === normalized) {
+    return;
+  }
+
+  await writeProjectJsonRecord(projectDir, 'manifest.json', {
+    ...manifest,
+    originalFilePath: normalized,
+    sourceFilePath: normalized,
+    updatedAt: Date.now(),
+  });
 }
 
 async function ensurePilotManifestPersistence(
@@ -1259,13 +1372,36 @@ async function restoreExistingProjectFromDir(
   const engineVersion = (manifestData && typeof manifestData.engineVersion === 'string' && manifestData.engineVersion.trim().length > 0)
     ? manifestData.engineVersion.trim()
     : 'demucs';
+  const manifestHasOriginalFilePath = !!manifestData
+    && Object.prototype.hasOwnProperty.call(manifestData, 'originalFilePath');
+  const manifestHasSourceFilePath = !!manifestData
+    && Object.prototype.hasOwnProperty.call(manifestData, 'sourceFilePath');
+  const manifestOriginalFilePathValue = manifestData && typeof manifestData.originalFilePath === 'string'
+    ? manifestData.originalFilePath.trim()
+    : '';
+  const manifestSourceFilePathValue = manifestData && typeof manifestData.sourceFilePath === 'string'
+    ? manifestData.sourceFilePath.trim()
+    : '';
+  const restoredOriginalFilePath = resolveManifestSourceFilePath(manifestData, selectedDir);
+  console.log(
+    `[project:openExisting] source_path_probe projectId="${projectId}" projectDir="${selectedDir}" ` +
+    `manifestHasOriginalFilePath=${manifestHasOriginalFilePath} manifestHasSourceFilePath=${manifestHasSourceFilePath} ` +
+    `manifestOriginalFilePath="${manifestOriginalFilePathValue || 'none'}" ` +
+    `manifestSourceFilePath="${manifestSourceFilePathValue || 'none'}" ` +
+    `resolvedOriginalFilePath="${restoredOriginalFilePath ?? 'none'}"`,
+  );
+  if (!restoredOriginalFilePath) {
+    console.warn(
+      `[project:openExisting] original source path unavailable projectDir="${selectedDir}" projectId="${projectId}"`,
+    );
+  }
 
   const project: Project = {
     id: projectId,
     fingerprint: '',
     sourceType,
     displayName,
-    originalFilePath: null,
+    originalFilePath: restoredOriginalFilePath,
     cacheDir: selectedDir,
     createdAt: (manifestData && typeof manifestData.createdAt === 'number') ? manifestData.createdAt : now,
     updatedAt: restoredUpdatedAt,
@@ -1536,6 +1672,13 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             activeResultId: DEFAULT_ACTIVE_RESULT_ID,
             resultSets,
           });
+          try {
+            await persistManifestSourceFilePath(outputDir, filePath);
+          } catch (persistErr) {
+            console.warn(
+              `[project:startSeparation] persist sourceFilePath failed projectId="${projectId}" reason="${normalizeErrorMessage(persistErr, 'unknown')}"`,
+            );
+          }
           console.log(
             `[REAL_CHAIN] handlers.project:startSeparation manifest_patched projectId="${projectId}" manifestPath="${metadataPatchResult.manifestPath}" activeResultId="${DEFAULT_ACTIVE_RESULT_ID}" resultSetCount=${resultSets.length}`,
           );
@@ -1598,38 +1741,153 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       throw new Error('项目不存在，无法启动试点分离');
     }
 
-    const resolvedSourceFilePath = (() => {
-      if (typeof sourceFilePath === 'string' && sourceFilePath.trim().length > 0) {
-        return sourceFilePath.trim();
+    const pilotRuntimePreflight = checkPilotRuntimeProfileAvailability();
+    if (!pilotRuntimePreflight.configured) {
+      const missing = pilotRuntimePreflight.missingItems.length > 0
+        ? pilotRuntimePreflight.missingItems.join(', ')
+        : 'unknown';
+      console.error(
+        `[REAL_CHAIN] handlers.project:startPilotSeparation preflight_failed projectId="${projectId}" ` +
+        `reason="pilot_runtime_profile_unavailable" runtimeProfileId="${PILOT_RUNTIME_PROFILE_ID}" ` +
+        `DEMUCS_6S_PILOT_PYTHON_EXE="${process.env.DEMUCS_6S_PILOT_PYTHON_EXE ?? ''}" ` +
+        `DEMUCS_6S_PILOT_ENV_ROOT="${process.env.DEMUCS_6S_PILOT_ENV_ROOT ?? ''}" ` +
+        `missing="${missing}"`,
+      );
+      throw new Error(
+        `PILOT_RUNTIME_PROFILE_UNAVAILABLE: missing ${missing} or runtime profile registration for ${PILOT_RUNTIME_PROFILE_ID}`,
+      );
+    }
+
+    const jobId = `job-${crypto.randomUUID().slice(0, 8)}`;
+    const resultSetId = `pilot_6s_${Date.now()}`;
+    const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+    const requestSourceFilePath = typeof sourceFilePath === 'string' ? sourceFilePath.trim() : '';
+    const projectOriginalFilePath = typeof project.originalFilePath === 'string'
+      ? project.originalFilePath.trim()
+      : '';
+    const manifestOriginalFilePath = manifest && typeof manifest.originalFilePath === 'string'
+      ? manifest.originalFilePath.trim()
+      : '';
+    const manifestSourceFilePath = manifest && typeof manifest.sourceFilePath === 'string'
+      ? manifest.sourceFilePath.trim()
+      : '';
+    const rawCandidates = [
+      {
+        source: 'request.sourceFilePath',
+        path: requestSourceFilePath,
+      },
+      {
+        source: 'project.originalFilePath',
+        path: projectOriginalFilePath,
+      },
+      {
+        source: 'manifest.originalFilePath',
+        path: manifestOriginalFilePath,
+      },
+      {
+        source: 'manifest.sourceFilePath',
+        path: manifestSourceFilePath,
+      },
+    ].filter((candidate) => candidate.path.length > 0);
+    const sourceCandidates = rawCandidates
+      .map((candidate) => ({
+        ...candidate,
+        resolvedPath: path.isAbsolute(candidate.path)
+          ? candidate.path
+          : path.join(project.cacheDir, candidate.path),
+      }))
+      .filter((candidate, index, array) =>
+        array.findIndex((entry) => path.resolve(entry.resolvedPath) === path.resolve(candidate.resolvedPath)) === index,
+      );
+    const sourceProbe = await Promise.all(sourceCandidates.map(async (candidate) => {
+      const exists = fs.existsSync(candidate.resolvedPath);
+      if (!exists) {
+        return {
+          source: candidate.source,
+          rawPath: candidate.path,
+          resolvedPath: candidate.resolvedPath,
+          exists: false,
+          readable: false,
+          accessError: 'ENOENT',
+        };
       }
-      if (typeof project.originalFilePath === 'string' && project.originalFilePath.trim().length > 0) {
-        return project.originalFilePath.trim();
+      try {
+        await fs.promises.access(candidate.resolvedPath, fs.constants.R_OK);
+        return {
+          source: candidate.source,
+          rawPath: candidate.path,
+          resolvedPath: candidate.resolvedPath,
+          exists: true,
+          readable: true,
+          accessError: '',
+        };
+      } catch (err) {
+        return {
+          source: candidate.source,
+          rawPath: candidate.path,
+          resolvedPath: candidate.resolvedPath,
+          exists: true,
+          readable: false,
+          accessError: normalizeErrorMessage(err, 'ACCESS_DENIED'),
+        };
       }
-      return '';
-    })();
-    if (!resolvedSourceFilePath) {
+    }));
+    console.log(
+      `[REAL_CHAIN] handlers.project:startPilotSeparation source_probe projectId="${projectId}" jobId="${jobId}" resultSetId="${resultSetId}" ` +
+      `requestSourceFilePath="${requestSourceFilePath || 'none'}" ` +
+      `projectOriginalFilePath="${projectOriginalFilePath || 'none'}" ` +
+      `manifestOriginalFilePath="${manifestOriginalFilePath || 'none'}" ` +
+      `manifestSourceFilePath="${manifestSourceFilePath || 'none'}" probes=${JSON.stringify(sourceProbe)}`,
+    );
+    const resolvedSource = sourceProbe.find((probe) => probe.exists);
+    if (!resolvedSource && sourceProbe.length === 0) {
       console.warn(
         `[REAL_CHAIN] handlers.project:startPilotSeparation source_path_missing projectId="${projectId}" ` +
-        `hasInputPath=${typeof sourceFilePath === 'string' && sourceFilePath.trim().length > 0} ` +
-        `hasOriginalFilePath=${typeof project.originalFilePath === 'string' && project.originalFilePath.trim().length > 0}`,
+        `requestSourceFilePath="${requestSourceFilePath || 'none'}" ` +
+        `projectOriginalFilePath="${projectOriginalFilePath || 'none'}" ` +
+        `manifestOriginalFilePath="${manifestOriginalFilePath || 'none'}" ` +
+        `manifestSourceFilePath="${manifestSourceFilePath || 'none'}"`,
       );
       throw new Error(
         'PILOT_SOURCE_PATH_REQUIRED: 缺少可用的原始音频路径，请重新选择源文件后再试实验6轨分离',
       );
     }
-    if (!fs.existsSync(resolvedSourceFilePath)) {
+    if (!resolvedSource) {
       console.warn(
         `[REAL_CHAIN] handlers.project:startPilotSeparation source_path_unreadable projectId="${projectId}" ` +
-        `resolvedSourceFilePath="${resolvedSourceFilePath}"`,
+        `probes=${JSON.stringify(sourceProbe)}`,
       );
       throw new Error(
-        `PILOT_SOURCE_PATH_REQUIRED: 原始音频路径不可访问，请重新选择源文件后重试（path="${resolvedSourceFilePath}"）`,
+        'PILOT_SOURCE_PATH_REQUIRED: 原始音频路径不可访问，请重新选择源文件后重试',
+      );
+    }
+    if (!resolvedSource.readable) {
+      console.warn(
+        `[REAL_CHAIN] handlers.project:startPilotSeparation source_path_unreadable projectId="${projectId}" ` +
+        `resolvedSource=${JSON.stringify(resolvedSource)} probes=${JSON.stringify(sourceProbe)}`,
+      );
+      throw new Error(
+        'PILOT_SOURCE_PATH_REQUIRED: 原始音频路径不可访问，请重新选择源文件后重试',
+      );
+    }
+    const resolvedSourceFilePath = resolvedSource.resolvedPath;
+    console.log(
+      `[REAL_CHAIN] handlers.project:startPilotSeparation source_resolved projectId="${projectId}" jobId="${jobId}" resultSetId="${resultSetId}" ` +
+      `source="${resolvedSource.source}" rawPath="${resolvedSource.rawPath}" resolvedPath="${resolvedSourceFilePath}" ` +
+      `exists=${resolvedSource.exists} readable=${resolvedSource.readable}`,
+    );
+    if (project.originalFilePath !== resolvedSourceFilePath) {
+      await workerInfra.projectRepo.update(projectId, { originalFilePath: resolvedSourceFilePath });
+    }
+    try {
+      await persistManifestSourceFilePath(project.cacheDir, resolvedSourceFilePath);
+    } catch (persistErr) {
+      console.warn(
+        `[project:startPilotSeparation] persist sourceFilePath failed projectId="${projectId}" reason="${normalizeErrorMessage(persistErr, 'unknown')}"`,
       );
     }
 
     const win = BrowserWindow.fromWebContents(event.sender);
-    const jobId = `job-${crypto.randomUUID().slice(0, 8)}`;
-    const resultSetId = `pilot_6s_${Date.now()}`;
 
     const workerStatus = workerInfra.workerManager.getStatus();
     if (!workerInfra.workerManager.isAcceptingRequests()) {
@@ -1654,9 +1912,15 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     );
 
     (async () => {
+      let pilotFailureStage = 'start';
       try {
+        pilotFailureStage = 'start_parse_job';
         console.log(
           `[REAL_CHAIN] handlers.project:startPilotSeparation real_path_enter projectId="${projectId}" jobId="${jobId}" resultSetId="${resultSetId}" model="${PILOT_MODEL_ID}" runtimeProfile="${PILOT_RUNTIME_PROFILE_ID}"`,
+        );
+        console.log(
+          `[REAL_CHAIN] handlers.project:startPilotSeparation parse_job_call_before projectId="${projectId}" jobId="${jobId}" resultSetId="${resultSetId}" ` +
+          `sourceFilePath="${resolvedSourceFilePath}" modelId="${PILOT_MODEL_ID}" runtimeProfileId="${PILOT_RUNTIME_PROFILE_ID}"`,
         );
         const result = await workerInfra!.parseJobService.startSeparation({
           projectId,
@@ -1668,13 +1932,21 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           runtimeProfileIdOverride: PILOT_RUNTIME_PROFILE_ID,
           workerModelOverride: PILOT_MODEL_ID,
         });
+        console.log(
+          `[REAL_CHAIN] handlers.project:startPilotSeparation parse_job_call_after projectId="${projectId}" jobId="${jobId}" resultSetId="${resultSetId}" ` +
+          `projectStatusAfter="${result.projectStatusAfter}" jobStatus="${result.job.status}" ` +
+          `jobErrorCode="${result.job.errorCode ?? 'none'}" jobErrorMessage="${result.job.errorMessage ?? 'none'}" ` +
+          `warningCount=${result.warnings.length}`,
+        );
+        pilotFailureStage = 'validate_parse_job_result';
         if (result.projectStatusAfter !== ProjectStatus.Ready) {
-          const explicitError = result.job.errorMessage
-            || result.job.errorCode
-            || `pilot separation failed: projectStatusAfter=${result.projectStatusAfter}`;
+          const explicitError = `PILOT_PARSE_JOB_FAILED projectStatusAfter="${result.projectStatusAfter}" ` +
+            `jobStatus="${result.job.status}" errorCode="${result.job.errorCode ?? 'unknown'}" ` +
+            `errorMessage="${result.job.errorMessage ?? 'unknown'}"`;
           throw new Error(explicitError);
         }
 
+        pilotFailureStage = 'validate_pilot_stems';
         const stemFiles = await workerInfra!.stemFileRepo.findByProjectId(projectId);
         const pilotStems = filterStemsForResultSet(stemFiles, resultSetId);
         if (pilotStems.length === 0) {
@@ -1699,6 +1971,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
             `PILOT_PROFILE_MISMATCH expectedModel="${PILOT_MODEL_ID}" expectedRuntimeProfile="${PILOT_RUNTIME_PROFILE_ID}" actualModel="${mismatchStem.modelId ?? 'unknown'}" actualRuntimeProfile="${mismatchStem.runtimeProfileId ?? 'unknown'}"`,
           );
         }
+        pilotFailureStage = 'persist_manifest';
         await ensurePilotManifestPersistence(project, resultSetId, pilotStems);
         console.log(
           `[REAL_CHAIN] handlers.project:startPilotSeparation manifest_persisted projectId="${projectId}" resultSetId="${resultSetId}" pilotStemCount=${pilotStems.length}`,
@@ -1714,8 +1987,16 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
           });
         }
       } catch (err) {
+        const errorMessage = normalizeErrorMessage(err, 'unknown_pilot_error');
+        const errRecord = err as { code?: unknown; errorCode?: unknown };
+        const errorCode = typeof errRecord.code === 'string'
+          ? errRecord.code
+          : (typeof errRecord.errorCode === 'string' ? errRecord.errorCode : null);
+        const errorType = classifyPilotFailure(errorMessage, errorCode);
         console.error(
-          `[REAL_CHAIN] handlers.project:startPilotSeparation real_path_error projectId="${projectId}" jobId="${jobId}" error="${err instanceof Error ? err.message : String(err)}"`,
+          `[REAL_CHAIN] handlers.project:startPilotSeparation real_path_error projectId="${projectId}" jobId="${jobId}" resultSetId="${resultSetId}" ` +
+          `stage="${pilotFailureStage}" errorType="${errorType}" errorCode="${errorCode ?? 'none'}" ` +
+          `errorMessage="${errorMessage}" modelId="${PILOT_MODEL_ID}" runtimeProfileId="${PILOT_RUNTIME_PROFILE_ID}"`,
         );
         if (win && !win.isDestroyed()) {
           const normalizedError = toSeparationFailureMessage(err);
@@ -1812,6 +2093,41 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     await workerInfra.projectRepo.touchLastAccessedAt(projectId, lastAccessedAt);
     await patchProjectManifestMetadata(project.cacheDir, { lastAccessedAt });
     return { projectId, lastAccessedAt };
+  });
+
+  ipcMain.handle('project:rebindSourceFile', async (_event, projectId: string, filePath: string) => {
+    if (!workerInfra) {
+      throw new Error('原始音频重绑服务不可用，请重启应用后重试');
+    }
+    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('缺少项目 ID，无法重绑原始音频');
+    }
+    const normalizedFilePath = typeof filePath === 'string' ? filePath.trim() : '';
+    if (normalizedFilePath.length === 0) {
+      throw new Error('缺少原始音频路径，无法重绑');
+    }
+    try {
+      await fs.promises.access(normalizedFilePath, fs.constants.R_OK);
+    } catch (err) {
+      throw new Error(
+        `PILOT_SOURCE_PATH_REQUIRED: 指定的原始音频不可读（path="${normalizedFilePath}" reason="${normalizeErrorMessage(err, 'access_failed')}")`,
+      );
+    }
+
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) {
+      throw new Error('项目不存在，无法重绑原始音频');
+    }
+
+    await workerInfra.projectRepo.update(projectId, { originalFilePath: normalizedFilePath });
+    await persistManifestSourceFilePath(project.cacheDir, normalizedFilePath);
+    console.log(
+      `[REAL_CHAIN] handlers.project:rebindSourceFile projectId="${projectId}" sourceFilePath="${normalizedFilePath}"`,
+    );
+    return {
+      projectId,
+      originalFilePath: normalizedFilePath,
+    };
   });
 
   ipcMain.handle('project:setActiveResult', async (_event, projectId: string, resultSetId: string) => {
@@ -2640,7 +2956,21 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const allStems = workerInfra
       ? await workerInfra.stemFileRepo.findByProjectId(request.projectId)
       : [];
-    const exportableStems = allStems.filter(
+    let activeResultId = DEFAULT_ACTIVE_RESULT_ID;
+    let scopedStems = allStems;
+    if (workerInfra) {
+      const project = await workerInfra.projectRepo.findById(request.projectId);
+      if (project) {
+        const activeResultContext = await resolveActiveResultContext(project, allStems);
+        activeResultId = activeResultContext.activeResultId;
+        scopedStems = filterStemsForResultSet(allStems, activeResultId);
+      }
+    }
+    console.log(
+      `[REAL_CHAIN] handlers.export:stems active_gate projectId="${request.projectId}" ` +
+      `activeResultId="${activeResultId}" allStemsCount=${allStems.length} scopedStemsCount=${scopedStems.length}`,
+    );
+    const exportableStems = scopedStems.filter(
       (s) => s.exists && s.exportable && typeof s.filePath === 'string' && s.filePath.trim().length > 0,
     );
     const stemMap = new Map(exportableStems.map((s) => [s.id, s]));

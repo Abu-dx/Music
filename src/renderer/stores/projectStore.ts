@@ -48,6 +48,7 @@ export interface IProjectElectronAPI {
   getProject(projectId: string): Promise<ProjectSummaryDTO | null>;
   renameProject(projectId: string, displayName: string): Promise<{ projectId: string; displayName: string } | null>;
   markProjectAccessed(projectId: string): Promise<{ projectId: string; lastAccessedAt: number } | null>;
+  rebindSourceFile?(projectId: string, filePath: string): Promise<{ projectId: string; originalFilePath: string }>;
   setActiveResult?(projectId: string, resultSetId: string): Promise<{ projectId: string; activeResultId: string }>;
 
   /** 获取缓存占用摘要（GPT R7 Suggested #2�?*/
@@ -118,6 +119,7 @@ export interface IProjectStore {
   loadProject(projectId: string): Promise<void>;
   renameProject(projectId: string, displayName: string): Promise<void>;
   markProjectAccessed(projectId: string): Promise<void>;
+  rebindSourceFile(projectId: string, filePath: string): Promise<void>;
   setActiveResult(projectId: string, resultSetId: string): Promise<void>;
   loadCacheStats(): Promise<void>;
   /** 加载结果摘要 + 分轨列表（GPT R8 Must Fix #1�?*/
@@ -220,6 +222,13 @@ export class ProjectStore implements IProjectStore {
 
   async markProjectAccessed(projectId: string): Promise<void> {
     await this.api.markProjectAccessed(projectId);
+  }
+
+  async rebindSourceFile(projectId: string, filePath: string): Promise<void> {
+    if (!this.api.rebindSourceFile) {
+      throw new Error('当前环境不支持原始音频重绑');
+    }
+    await this.api.rebindSourceFile(projectId, filePath);
   }
 
   async setActiveResult(projectId: string, resultSetId: string): Promise<void> {

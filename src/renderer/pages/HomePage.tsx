@@ -88,12 +88,22 @@ export const HomePage: React.FC<HomePageProps> = ({
     };
   }, [store]);
 
-  const handleProjectClick = (project: { id: string; status: string }) => {
-    if (project.status === 'processing') {
-      onNavigateToProgress(project.id);
-    } else {
+  const handleProjectClick = async (project: { id: string; status: string }) => {
+    if (project.status !== 'processing') {
       onNavigateToProject(project.id);
+      return;
     }
+
+    // Refresh single-project status before routing.
+    // Failed/cancelled projects should not be routed into ProgressPage.
+    await store.loadProject(project.id).catch(() => undefined);
+    const latest = store.getSnapshot().currentProject;
+    const latestStatus = latest?.id === project.id ? latest.status : project.status;
+    if (latestStatus === 'processing') {
+      onNavigateToProgress(project.id);
+      return;
+    }
+    onNavigateToProject(project.id);
   };
 
   return (

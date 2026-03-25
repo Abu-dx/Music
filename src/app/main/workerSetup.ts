@@ -431,6 +431,54 @@ function resolveEnvironmentRootFromPythonExecutable(executablePath: string): str
   return executableDir;
 }
 
+function resolvePythonExecutableFromEnvironmentRoot(environmentRoot: string): string | null {
+  const normalizedRoot = environmentRoot.trim();
+  if (!normalizedRoot) return null;
+  const candidates = process.platform === 'win32'
+    ? [
+      path.join(normalizedRoot, 'Scripts', 'python.exe'),
+      path.join(normalizedRoot, 'python.exe'),
+    ]
+    : [
+      path.join(normalizedRoot, 'bin', 'python3'),
+      path.join(normalizedRoot, 'bin', 'python'),
+    ];
+
+  for (const candidate of candidates) {
+    if (isUsablePythonExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+type PilotRuntimeCandidate = {
+  environmentRoot: string;
+  executable: string;
+};
+
+function resolveDefaultPilotRuntimeCandidate(): PilotRuntimeCandidate | null {
+  const candidateRoots = [
+    path.join(process.cwd(), '.venv_pilot'),
+    path.join(process.cwd(), '.venv-6s-pilot'),
+    path.join(process.cwd(), '.venv6s'),
+    path.join(app.getAppPath(), '.venv_pilot'),
+    path.join(app.getAppPath(), '.venv-6s-pilot'),
+    path.join(app.getAppPath(), '.venv6s'),
+  ];
+
+  for (const root of candidateRoots) {
+    const executable = resolvePythonExecutableFromEnvironmentRoot(root);
+    if (executable) {
+      return {
+        environmentRoot: root,
+        executable,
+      };
+    }
+  }
+  return null;
+}
+
 export interface WorkerInfra {
   workerManager: WorkerManager;
   ipcBridge: WorkerIpcBridge;
@@ -475,7 +523,35 @@ export function initWorkerInfra(): WorkerInfra {
   if (!process.env.DEMUCS_RUNTIME_PROFILE || process.env.DEMUCS_RUNTIME_PROFILE.trim().length === 0) {
     process.env.DEMUCS_RUNTIME_PROFILE = 'demucs_env_override';
   }
-  const pilotExecutable = process.env.DEMUCS_6S_PILOT_PYTHON_EXE?.trim();
+  let pilotExecutable = process.env.DEMUCS_6S_PILOT_PYTHON_EXE?.trim() ?? '';
+  const pilotEnvironmentRoot = process.env.DEMUCS_6S_PILOT_ENV_ROOT?.trim() ?? '';
+  if (!pilotExecutable && !pilotEnvironmentRoot) {
+    const defaultPilotRuntime = resolveDefaultPilotRuntimeCandidate();
+    if (defaultPilotRuntime) {
+      process.env.DEMUCS_6S_PILOT_ENV_ROOT = defaultPilotRuntime.environmentRoot;
+      process.env.DEMUCS_6S_PILOT_PYTHON_EXE = defaultPilotRuntime.executable;
+      pilotExecutable = defaultPilotRuntime.executable;
+      logger.info('Auto-configured pilot runtime profile from default environment root', {
+        pilotEnvironmentRoot: defaultPilotRuntime.environmentRoot,
+        pilotExecutable: defaultPilotRuntime.executable,
+      });
+    }
+  }
+  if (!pilotExecutable && pilotEnvironmentRoot) {
+    const derivedPilotExecutable = resolvePythonExecutableFromEnvironmentRoot(pilotEnvironmentRoot);
+    if (derivedPilotExecutable) {
+      process.env.DEMUCS_6S_PILOT_PYTHON_EXE = derivedPilotExecutable;
+      pilotExecutable = derivedPilotExecutable;
+      logger.info('Resolved DEMUCS_6S_PILOT_PYTHON_EXE from DEMUCS_6S_PILOT_ENV_ROOT', {
+        pilotEnvironmentRoot,
+        pilotExecutable: derivedPilotExecutable,
+      });
+    } else {
+      logger.warn('Unable to resolve DEMUCS_6S_PILOT_PYTHON_EXE from DEMUCS_6S_PILOT_ENV_ROOT', {
+        pilotEnvironmentRoot,
+      });
+    }
+  }
   if (pilotExecutable && (!process.env.DEMUCS_6S_PILOT_ENV_ROOT || process.env.DEMUCS_6S_PILOT_ENV_ROOT.trim().length === 0)) {
     process.env.DEMUCS_6S_PILOT_ENV_ROOT = resolveEnvironmentRootFromPythonExecutable(pilotExecutable);
     logger.info('Resolved DEMUCS_6S_PILOT_ENV_ROOT from pilot executable', {
@@ -562,6 +638,7 @@ export function initWorkerInfra(): WorkerInfra {
     workerScriptPath,
     demucsRuntimeProfile: process.env.DEMUCS_RUNTIME_PROFILE,
     demucs6sPilotRuntimeProfile: process.env.DEMUCS_6S_PILOT_PYTHON_EXE ? 'demucs_6s_pilot' : 'disabled',
+    demucs6sPilotPythonPath: process.env.DEMUCS_6S_PILOT_PYTHON_EXE ?? '',
     demucs6sPilotEnvironmentRoot: process.env.DEMUCS_6S_PILOT_ENV_ROOT ?? '',
     analysisRuntimeProfile: process.env.ANALYSIS_RUNTIME_PROFILE,
   });

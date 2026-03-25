@@ -56,6 +56,31 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
 
   const resultLoadedProjectRef = useRef<string | null>(null);
 
+  const currentProject = projectSnap.currentProject?.id === projectId
+    ? projectSnap.currentProject
+    : null;
+  const resultForProject = projectSnap.projectResult?.id === projectId
+    ? projectSnap.projectResult
+    : null;
+  const projectStatus = currentProject?.status ?? resultForProject?.status ?? null;
+  const hasReadableResult = !!resultForProject
+    && projectSnap.stems.some((stem) => stem.presence === 'exists');
+
+  useEffect(() => {
+    let cancelled = false;
+    projectStore.loadProject(projectId).catch(() => undefined);
+    // Re-entering a failed/cancelled project should recover from ProgressPage.
+    // Pull result snapshot once to decide whether we can jump back to ResultPage.
+    projectStore.loadProjectResult(projectId).catch(() => {
+      if (!cancelled) {
+        resultLoadedProjectRef.current = null;
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, projectStore]);
+
   useEffect(() => {
     if (!jobSnap.isComplete) {
       resultLoadedProjectRef.current = null;
@@ -70,15 +95,27 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
     });
   }, [jobSnap.isComplete, projectId, projectStore]);
 
-  const projectName = projectSnap.currentProject?.displayName ?? '未命名项目';
+  const projectName = currentProject?.displayName ?? resultForProject?.displayName ?? '未命名项目';
   const successTrackCount =
-    projectSnap.projectResult?.id === projectId
+    resultForProject
       ? projectSnap.stems.length
       : null;
 
   // GPT R7 Must Fix #6锛氭墍鏈夎繍琛屾€佺洿鎺ヤ粠 jobStore snapshot 璇诲彇锛屼笉鎺ㄥ
   const { isRunning, isComplete, isFailed, cacheHit, progress, stageDisplayName,
     errorMessage, warnings, currentStageIndex, orderedStages, elapsedMs } = jobSnap;
+  const isIdleWithoutJob = !isRunning && !isComplete && !isFailed;
+  const shouldRecoverFromIdle = isIdleWithoutJob
+    && projectStatus !== null
+    && projectStatus !== 'processing'
+    && projectStatus !== 'ready_to_parse'
+    && projectStatus !== 'importing';
+
+  useEffect(() => {
+    if (shouldRecoverFromIdle && hasReadableResult) {
+      onNavigateToResult(projectId);
+    }
+  }, [shouldRecoverFromIdle, hasReadableResult, onNavigateToResult, projectId]);
 
   return (
     <div className="progress-page" style={styles.container}>
@@ -92,7 +129,9 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
               ? '分离完成'
               : isFailed
                 ? '分离失败'
-                : '等待中'}
+                : shouldRecoverFromIdle
+                  ? '任务已结束'
+                  : '等待中'}
         </span>
       </div>
 
@@ -175,9 +214,31 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
         <div style={styles.errorBox}>
           <div style={styles.errorTitle}>分离失败</div>
           <div style={styles.errorMessage}>{errorMessage}</div>
-          <button style={styles.retryButton} onClick={onNavigateToUpload}>
-            重新上传
-          </button>
+          <div style={styles.recoverActions}>
+            <button style={styles.retryButton} onClick={onNavigateToUpload}>
+              重新上传
+            </button>
+            <button style={styles.homeButton} onClick={onNavigateToHome}>
+              返回首页
+            </button>
+          </div>
+        </div>
+      )}
+
+      {shouldRecoverFromIdle && !hasReadableResult && (
+        <div style={styles.errorBox}>
+          <div style={styles.errorTitle}>任务未在运行</div>
+          <div style={styles.errorMessage}>
+            当前项目状态：{projectStatus ?? 'unknown'}。该项目没有可读取结果，请返回首页或重新上传。
+          </div>
+          <div style={styles.recoverActions}>
+            <button style={styles.homeButton} onClick={onNavigateToHome}>
+              返回首页
+            </button>
+            <button style={styles.retryButton} onClick={onNavigateToUpload}>
+              重新上传
+            </button>
+          </div>
         </div>
       )}
 
@@ -362,6 +423,10 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: '14px',
     color: '#b71c1c',
     marginBottom: '12px',
+  },
+  recoverActions: {
+    display: 'flex',
+    gap: '10px',
   },
   retryButton: {
     padding: '8px 16px',

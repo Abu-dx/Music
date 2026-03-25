@@ -38,6 +38,9 @@ dist/
 # 虚拟环境 - 千万不要提交！
 python/venvs/
 python/venv/
+.venv_pilot/
+.venv-6s-pilot/
+.venv6s/
 
 # 临时文件
 .tmp_*

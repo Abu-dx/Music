@@ -133,6 +133,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameBusy, setRenameBusy] = useState(false);
   const [pilotBusy, setPilotBusy] = useState(false);
+  const [rebindBusy, setRebindBusy] = useState(false);
   const [resultSetSwitchBusy, setResultSetSwitchBusy] = useState(false);
   const [pilotInfo, setPilotInfo] = useState<string | null>(null);
   const [pilotError, setPilotError] = useState<string | null>(null);
@@ -364,6 +365,30 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     }
   }, [projectResultWithMeta?.resultSets, projectResultWithMeta?.sourceFilePath, projectStore, projectId]);
 
+  const handleRebindSourceFile = useCallback(async () => {
+    const currentSource =
+      (typeof projectResultWithMeta?.sourceFilePath === 'string' && projectResultWithMeta.sourceFilePath.trim().length > 0)
+        ? projectResultWithMeta.sourceFilePath.trim()
+        : '';
+    const nextPath = window.prompt('请输入原始音频文件完整路径', currentSource);
+    if (!nextPath) return;
+    const normalizedPath = nextPath.trim();
+    if (!normalizedPath) return;
+
+    try {
+      setRebindBusy(true);
+      setPilotError(null);
+      setPilotInfo(null);
+      await projectStore.rebindSourceFile(projectId, normalizedPath);
+      setPilotInfo('原始音频路径已更新，可重新启动实验6轨分离。');
+      await projectStore.loadProjectResult(projectId);
+    } catch (err) {
+      setPilotError(err instanceof Error ? err.message : '原始音频重绑失败');
+    } finally {
+      setRebindBusy(false);
+    }
+  }, [projectResultWithMeta?.sourceFilePath, projectStore, projectId]);
+
   // 全部导出
   const handleExportAll = useCallback(async () => {
     const existingIds = stems
@@ -456,6 +481,12 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const existingStems = stems.filter(s => s.presence === 'exists');
   const mergedStems = stems.filter(s => s.presence === 'merged');
   const missingStems = stems.filter(s => s.presence === 'missing');
+  const hasReadableResult = existingStems.length > 0;
+  const showFailedNoReadableResult =
+    !isLoading
+    && !!projectResult
+    && projectResult.status === 'failed'
+    && !hasReadableResult;
   // Header track count must be derived from the same grouped lists used by the UI sections.
   const headerTrackCount = [existingStems, mergedStems, missingStems]
     .reduce((sum, group) => sum + group.length, 0);
@@ -591,6 +622,17 @@ export const ResultPage: React.FC<ResultPageProps> = ({
         >
           {pilotBusy ? '实验6轨启动中...' : '实验6轨分离'}
         </button>
+        <button
+          style={{
+            ...styles.actionButton,
+            ...(rebindBusy ? styles.playerButtonDisabled : {}),
+          }}
+          onClick={handleRebindSourceFile}
+          disabled={rebindBusy}
+          title="重绑历史项目原始音频路径（不做猜路径）"
+        >
+          {rebindBusy ? '重绑中...' : '重绑原始音频'}
+        </button>
       </div>
       {openDirError && (
         <div style={styles.inlineError}>{openDirError}</div>
@@ -654,7 +696,24 @@ export const ResultPage: React.FC<ResultPageProps> = ({
       )}
 
       {/* === 空结果 === */}
-      {stems.length === 0 && !isLoading && (
+      {showFailedNoReadableResult && (
+        <div style={styles.failedResultBox}>
+          <div style={styles.failedResultTitle}>项目处理失败</div>
+          <div style={styles.failedResultText}>
+            当前项目状态为 failed，且当前结果集暂无可读轨道。请返回首页或重新上传源音频后重试。
+          </div>
+          <div style={styles.failedResultActions}>
+            <button style={styles.backButton} onClick={onNavigateToHome}>
+              返回首页
+            </button>
+            <button style={styles.newButton} onClick={onNavigateToUpload}>
+              重新上传
+            </button>
+          </div>
+        </div>
+      )}
+
+      {stems.length === 0 && !isLoading && !showFailedNoReadableResult && (
         <div style={styles.emptyState}>当前结果集暂无可读轨道</div>
       )}
 
@@ -1275,6 +1334,31 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '40px',
     color: '#999',
     fontSize: '15px',
+  },
+  failedResultBox: {
+    marginTop: '12px',
+    marginBottom: '20px',
+    padding: '16px',
+    backgroundColor: '#ffebee',
+    border: '1px solid #ffcdd2',
+    borderRadius: '8px',
+    textAlign: 'center' as const,
+  },
+  failedResultTitle: {
+    fontSize: '16px',
+    fontWeight: 600,
+    color: '#b71c1c',
+    marginBottom: '8px',
+  },
+  failedResultText: {
+    fontSize: '14px',
+    color: '#c62828',
+    marginBottom: '12px',
+  },
+  failedResultActions: {
+    display: 'flex',
+    justifyContent: 'center',
+    gap: '8px',
   },
   footer: {
     display: 'flex',

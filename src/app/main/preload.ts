@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('project:rename', projectId, displayName),
   markProjectAccessed: (projectId: string) =>
     ipcRenderer.invoke('project:markAccessed', projectId),
+  rebindSourceFile: (projectId: string, filePath: string) =>
+    ipcRenderer.invoke('project:rebindSourceFile', projectId, filePath),
   setActiveResult: (projectId: string, resultSetId: string) =>
     ipcRenderer.invoke('project:setActiveResult', projectId, resultSetId),
   getProjectResult: (projectId: string) =>
