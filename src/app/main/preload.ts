@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('project:startSeparation', filePath),
   startPilotSeparation: (projectId: string, sourceFilePath?: string) =>
     ipcRenderer.invoke('project:startPilotSeparation', projectId, sourceFilePath),
+  startOrchestratedSeparation: (projectId: string, sourceFilePath?: string) =>
+    ipcRenderer.invoke('project:startOrchestratedSeparation', projectId, sourceFilePath),
   cancelSeparation: (jobId?: string) =>
     ipcRenderer.invoke('project:cancelSeparation', jobId),
   getProject: (projectId: string) =>

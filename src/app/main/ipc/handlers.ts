@@ -14,6 +14,7 @@ import { ipcMain, BrowserWindow, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import { spawnSync } from 'child_process';
 import { app } from 'electron';
 import {
   ProjectSourceType,
@@ -24,9 +25,20 @@ import {
   StemStatus,
 } from '../../../shared/enums';
 import { StemType } from '../../../shared/enums';
-import type { Project } from '../../../domain/entities';
+import type { Project, ManifestStemEntry } from '../../../domain/entities';
 import type { WorkerInfra } from '../workerSetup';
 import { inferStemTypeFromFilename } from '../../../domain/policies';
+import {
+  OrchestratedSeparationService,
+} from '../../../application/services/orchestratedSeparationService';
+import type {
+  SpecialistDescriptor,
+  SpecialistExecutionPlan,
+  SpecialistHealthStatus,
+  SpecialistPassReport,
+  SpecialistStatus,
+  StemSelectionPolicy,
+} from '../../../application/services/orchestrationTypes';
 import {
   patchProjectManifestMetadata,
   ProjectManifestResultSetEntry,
@@ -162,6 +174,14 @@ const DEFAULT_CHORD_ANALYZER_ID = 'chord_rule_chroma_v2_pilot';
 const DEFAULT_TEMPO_ANALYZER_ID = 'tempo_rule_onset_v2_pilot';
 const PILOT_MODEL_ID = 'htdemucs_6s';
 const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
+const ORCH_GUITAR_SPECIALIST_DEFAULT_MODEL_ID = 'mel_roformer_guitar';
+const ORCH_GUITAR_SPECIALIST_DEFAULT_RUNTIME_PROFILE_ID = PILOT_RUNTIME_PROFILE_ID;
+const ORCH_GUITAR_SPECIALIST_SUPPORTED_MODEL_IDS = new Set(['mel_roformer_guitar']);
+const ORCH_GUITAR_SPECIALIST_COMMAND_ENV = 'ORCH_GUITAR_SPECIALIST_CMD';
+const ORCH_GUITAR_SPECIALIST_CHECKPOINT_ENV = 'ORCH_GUITAR_SPECIALIST_CHECKPOINT';
+const ORCH_RESULT_SET_PREFIX = 'orch_6s_';
+const ORCH_RESULT_MODEL_ID = 'orchestrated_6s';
+const ORCH_RESULT_RUNTIME_PROFILE_ID = 'orchestrator_main';
 
 type ActiveResultContext = {
   activeResultId: string;
@@ -647,6 +667,231 @@ async function ensurePilotManifestPersistence(
   }
 }
 
+function normalizeSpecialistHealthStatus(raw: string | undefined): SpecialistHealthStatus {
+  const normalized = (raw ?? '').trim().toLowerCase();
+  if (normalized === 'healthy') return 'healthy';
+  if (normalized === 'failed') return 'failed';
+  if (normalized === 'unavailable') return 'unavailable';
+  return 'unknown';
+}
+
+function isTruthyEnv(value: string | undefined): boolean {
+  const normalized = (value ?? '').trim().toLowerCase();
+  if (!normalized) return false;
+  return !['0', 'false', 'off', 'no'].includes(normalized);
+}
+
+function probePythonDemucsHealth(pythonExe: string): SpecialistHealthStatus {
+  if (!pythonExe || !path.isAbsolute(pythonExe) || !fs.existsSync(pythonExe)) {
+    return 'unavailable';
+  }
+  const probe = spawnSync(
+    pythonExe,
+    ['-c', 'import demucs'],
+    { encoding: 'utf-8', timeout: 12_000 },
+  );
+  if (probe.error) {
+    return 'failed';
+  }
+  if (typeof probe.status === 'number' && probe.status !== 0) {
+    return 'failed';
+  }
+  return 'healthy';
+}
+
+function resolveGuitarSpecialistHealthStatus(runtimeProfileId: string): SpecialistHealthStatus {
+  if (!runtimeProfileId) return 'unknown';
+  if (runtimeProfileId === PILOT_RUNTIME_PROFILE_ID) {
+    const pilotPreflight = checkPilotRuntimeProfileAvailability();
+    if (!pilotPreflight.configured) {
+      return 'unavailable';
+    }
+    const pilotPython = process.env.DEMUCS_6S_PILOT_PYTHON_EXE?.trim() ?? '';
+    return probePythonDemucsHealth(pilotPython);
+  }
+  return normalizeSpecialistHealthStatus(process.env.ORCH_GUITAR_SPECIALIST_HEALTH_STATUS);
+}
+
+function resolveGuitarSpecialistRequiredEnv(
+  guitarEnabled: boolean,
+  guitarModelId: string,
+  runtimeProfileId: string,
+): string[] {
+  if (!guitarEnabled) {
+    return ['ORCH_GUITAR_SPECIALIST_ENABLED'];
+  }
+  if (!ORCH_GUITAR_SPECIALIST_SUPPORTED_MODEL_IDS.has(guitarModelId)) {
+    return ['ORCH_GUITAR_SPECIALIST_MODEL_ID'];
+  }
+  const required = [ORCH_GUITAR_SPECIALIST_COMMAND_ENV, ORCH_GUITAR_SPECIALIST_CHECKPOINT_ENV];
+  if (runtimeProfileId === PILOT_RUNTIME_PROFILE_ID) {
+    required.push('DEMUCS_6S_PILOT_PYTHON_EXE');
+  }
+  return required;
+}
+
+function applyGuitarSpecialistCheckpointHealth(
+  healthStatus: SpecialistHealthStatus,
+  checkpointPath: string,
+): SpecialistHealthStatus {
+  if (!checkpointPath) return healthStatus;
+  const resolvedCheckpoint = path.isAbsolute(checkpointPath)
+    ? checkpointPath
+    : path.resolve(checkpointPath);
+  if (!fs.existsSync(resolvedCheckpoint)) {
+    return 'failed';
+  }
+  try {
+    const stat = fs.statSync(resolvedCheckpoint);
+    if (!stat.isFile()) {
+      return 'failed';
+    }
+  } catch {
+    return 'failed';
+  }
+  return healthStatus;
+}
+
+function resolveOrchestrationSpecialists(): SpecialistDescriptor[] {
+  const guitarEnabled = isTruthyEnv(process.env.ORCH_GUITAR_SPECIALIST_ENABLED);
+  const guitarModelId = guitarEnabled
+    ? (process.env.ORCH_GUITAR_SPECIALIST_MODEL_ID?.trim() || ORCH_GUITAR_SPECIALIST_DEFAULT_MODEL_ID)
+    : '';
+  const guitarRuntimeProfileId = guitarEnabled
+    ? (process.env.ORCH_GUITAR_SPECIALIST_RUNTIME_PROFILE_ID?.trim() || ORCH_GUITAR_SPECIALIST_DEFAULT_RUNTIME_PROFILE_ID)
+    : '';
+  const guitarCheckpointPath = process.env.ORCH_GUITAR_SPECIALIST_CHECKPOINT?.trim() ?? '';
+  const guitarHealthStatus = guitarEnabled
+    ? resolveGuitarSpecialistHealthStatus(guitarRuntimeProfileId)
+    : 'unknown';
+  const guitarHealthStatusWithCheckpoint = applyGuitarSpecialistCheckpointHealth(
+    guitarHealthStatus,
+    guitarCheckpointPath,
+  );
+  const guitarRequiredEnv = resolveGuitarSpecialistRequiredEnv(
+    guitarEnabled,
+    guitarModelId,
+    guitarRuntimeProfileId,
+  );
+  console.log(
+    `[REAL_CHAIN] handlers.resolveOrchestrationSpecialists guitar enabled=${guitarEnabled} ` +
+    `modelId="${guitarModelId || 'none'}" runtimeProfileId="${guitarRuntimeProfileId || 'none'}" ` +
+    `healthStatus="${guitarHealthStatusWithCheckpoint}" cmdConfigured=${Boolean(process.env.ORCH_GUITAR_SPECIALIST_CMD?.trim())} ` +
+    `checkpoint="${guitarCheckpointPath || 'none'}"`,
+  );
+
+  const pianoModelId = process.env.ORCH_PIANO_SPECIALIST_MODEL_ID?.trim() ?? '';
+  const pianoRuntimeProfileId = process.env.ORCH_PIANO_SPECIALIST_RUNTIME_PROFILE_ID?.trim() ?? '';
+
+  return [
+    {
+      specialistId: 'guitar_specialist',
+      targetStem: StemType.Guitar,
+      modelId: guitarModelId,
+      runtimeProfileId: guitarRuntimeProfileId,
+      requiredEnv: guitarRequiredEnv,
+      healthStatus: guitarHealthStatusWithCheckpoint,
+      selectionPriority: 10,
+      supportsFallback: true,
+    },
+    {
+      specialistId: 'piano_specialist',
+      targetStem: StemType.Keyboard,
+      modelId: pianoModelId,
+      runtimeProfileId: pianoRuntimeProfileId,
+      requiredEnv: ['ORCH_PIANO_SPECIALIST_MODEL_ID', 'ORCH_PIANO_SPECIALIST_RUNTIME_PROFILE_ID'],
+      healthStatus: normalizeSpecialistHealthStatus(process.env.ORCH_PIANO_SPECIALIST_HEALTH_STATUS),
+      selectionPriority: 20,
+      supportsFallback: true,
+    },
+  ];
+}
+
+function resolveOrchestrationSelectionPolicy(): StemSelectionPolicy {
+  return {
+    policyId: 'phase2_5a_default',
+    baselineStemTypes: [StemType.Drums, StemType.Bass, StemType.Vocal, StemType.Other],
+    specialistStemTypes: [StemType.Guitar, StemType.Keyboard],
+    fallbackToBaselineOnFailure: true,
+  };
+}
+
+function buildSpecialistStatusMap(
+  specialistReports: SpecialistPassReport[],
+): Record<string, SpecialistStatus> {
+  const map: Record<string, SpecialistStatus> = {};
+  for (const report of specialistReports) {
+    map[report.specialistId] = report.status;
+  }
+  return map;
+}
+
+async function ensureOrchestratedManifestPersistence(
+  project: Project,
+  resultSetEntry: ProjectManifestResultSetEntry,
+  orchManifestStems: ManifestStemEntry[],
+  debugReportRelativePath: string,
+): Promise<void> {
+  const resultSetId = resultSetEntry.id;
+  const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+  if (!manifest) {
+    throw new Error(`ORCH_MANIFEST_MISSING projectId="${project.id}" cacheDir="${project.cacheDir}"`);
+  }
+
+  const existingResultSets = normalizeResultSetEntries(manifest.resultSets);
+  const mergedResultSets = [
+    ...existingResultSets.filter((entry) => entry.id !== resultSetId),
+    resultSetEntry,
+  ];
+  const rawStems = Array.isArray(manifest.stems)
+    ? manifest.stems.filter(isObjectLike)
+    : [];
+  const keptStems = rawStems.filter((entry) =>
+    normalizeParentResultId(typeof entry.parentResultId === 'string' ? entry.parentResultId : undefined) !== resultSetId,
+  );
+  const activeFromManifest = typeof manifest.activeResultId === 'string' ? manifest.activeResultId.trim() : '';
+  const resolvedActive = mergedResultSets.some((entry) => entry.id === activeFromManifest)
+    ? activeFromManifest
+    : DEFAULT_ACTIVE_RESULT_ID;
+
+  const existingOrchestration = isObjectLike(manifest.orchestration) ? manifest.orchestration : {};
+  const existingReports = isObjectLike(existingOrchestration.reports) ? existingOrchestration.reports : {};
+  const nextReports = {
+    ...existingReports,
+    [resultSetId]: {
+      path: debugReportRelativePath,
+      createdAt: Date.now(),
+    },
+  };
+  const orchestrationMeta = {
+    ...existingOrchestration,
+    lastResultSetId: resultSetId,
+    reports: nextReports,
+  };
+
+  await writeProjectJsonRecord(project.cacheDir, 'manifest.json', {
+    ...manifest,
+    activeResultId: resolvedActive,
+    resultSets: mergedResultSets,
+    stems: [...keptStems, ...orchManifestStems],
+    orchestration: orchestrationMeta,
+    updatedAt: Date.now(),
+  });
+
+  const verified = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+  const verifiedSets = normalizeResultSetEntries(verified?.resultSets);
+  if (!verifiedSets.some((entry) => entry.id === resultSetId)) {
+    throw new Error(`ORCH_MANIFEST_RESULT_SET_NOT_PERSISTED resultSetId="${resultSetId}"`);
+  }
+  const verifiedStems = Array.isArray(verified?.stems) ? verified.stems.filter(isObjectLike) : [];
+  const hasOrchStems = verifiedStems.some((entry) =>
+    normalizeParentResultId(typeof entry.parentResultId === 'string' ? entry.parentResultId : undefined) === resultSetId,
+  );
+  if (!hasOrchStems) {
+    throw new Error(`ORCH_MANIFEST_STEMS_NOT_PERSISTED resultSetId="${resultSetId}"`);
+  }
+}
+
 function buildDefaultResultSetEntry(project: Project, stems: Array<{
   modelId?: string;
   runtimeProfileId?: string;
@@ -720,6 +965,158 @@ async function resolveActiveResultContext(
     resultSets,
     modelId: activeSet?.modelId ?? null,
     runtimeProfileId: activeSet?.runtimeProfileId ?? null,
+  };
+}
+
+async function resolveOrchestrationDebugSnapshot(
+  project: Project,
+  stems: Array<{
+    stemType?: string;
+    modelId?: string;
+    runtimeProfileId?: string;
+    parentResultId?: string;
+    sourceSignature?: string;
+    selectionReason?: string;
+    fallbackUsed?: boolean;
+    sourceResultSetId?: string;
+  }>,
+  activeResultContext: ActiveResultContext,
+): Promise<Record<string, unknown>> {
+  const orchResultSets = activeResultContext.resultSets
+    .filter((entry) => entry.id.startsWith(ORCH_RESULT_SET_PREFIX))
+    .sort((a, b) => b.createdAt - a.createdAt);
+  if (orchResultSets.length === 0) {
+    return {
+      exists: false,
+      activeIsOrch: activeResultContext.activeResultId.startsWith(ORCH_RESULT_SET_PREFIX),
+      orchResultSetId: null,
+      latestOrchResultSetId: null,
+      baselinePassStatus: 'not_configured',
+      guitarSpecialistStatus: 'not_configured',
+      pianoSpecialistStatus: 'not_configured',
+      specialistReports: [],
+      passReports: [],
+      stemSelections: [],
+      reportPath: null,
+    };
+  }
+
+  const latestOrchResultSetId = orchResultSets[0].id;
+  const inspectedResultSetId = activeResultContext.activeResultId.startsWith(ORCH_RESULT_SET_PREFIX)
+    ? activeResultContext.activeResultId
+    : latestOrchResultSetId;
+  const fallbackStemSelections = filterStemsForResultSet(stems, inspectedResultSetId).map((stem) => ({
+    stemType: stem.stemType ?? 'unknown',
+    modelId: stem.modelId ?? 'unknown',
+    runtimeProfileId: stem.runtimeProfileId ?? 'unknown',
+    selectionReason: stem.selectionReason ?? 'unknown',
+    fallbackUsed: !!stem.fallbackUsed,
+    sourceResultSetId: stem.sourceResultSetId ?? null,
+    sourceSignature: stem.sourceSignature ?? null,
+  }));
+
+  const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+  const manifestOrchestration = isObjectLike(manifest?.orchestration)
+    ? manifest!.orchestration as Record<string, unknown>
+    : null;
+  const orchestrationReports = manifestOrchestration && isObjectLike(manifestOrchestration.reports)
+    ? manifestOrchestration.reports as Record<string, unknown>
+    : null;
+  const reportFromManifest = orchestrationReports
+    && isObjectLike(orchestrationReports[inspectedResultSetId])
+    ? orchestrationReports[inspectedResultSetId] as Record<string, unknown>
+    : null;
+  const reportPathFromManifest = reportFromManifest && typeof reportFromManifest.path === 'string'
+    ? reportFromManifest.path.trim()
+    : '';
+  const reportPath = reportPathFromManifest.length > 0
+    ? reportPathFromManifest
+    : path.posix.join('results', inspectedResultSetId, 'orchestration-report.json');
+  const reportRecord = await readProjectJsonRecord(project.cacheDir, reportPath);
+  const reportPasses = Array.isArray(reportRecord?.passReports)
+    ? reportRecord!.passReports.filter(isObjectLike).map((entry) => ({
+      passId: typeof entry.passId === 'string' ? entry.passId : 'unknown',
+      resultSetId: typeof entry.resultSetId === 'string' ? entry.resultSetId : '',
+      executionStatus: typeof entry.executionStatus === 'string'
+        ? entry.executionStatus
+        : (typeof entry.status === 'string' ? entry.status : 'unknown'),
+      specialistStatus: typeof entry.specialistStatus === 'string' ? entry.specialistStatus : null,
+      reason: typeof entry.reason === 'string' ? entry.reason : null,
+      modelId: typeof entry.modelId === 'string' ? entry.modelId : '',
+      runtimeProfileId: typeof entry.runtimeProfileId === 'string' ? entry.runtimeProfileId : '',
+      warningCount: typeof entry.warningCount === 'number' ? entry.warningCount : 0,
+      jobStatus: typeof entry.jobStatus === 'string' ? entry.jobStatus : null,
+      errorCode: typeof entry.errorCode === 'string' ? entry.errorCode : null,
+      errorMessage: typeof entry.errorMessage === 'string' ? entry.errorMessage : null,
+    }))
+    : [];
+  const reportSpecialistReports = Array.isArray(reportRecord?.specialistReports)
+    ? reportRecord!.specialistReports.filter(isObjectLike).map((entry) => ({
+      specialistId: typeof entry.specialistId === 'string' ? entry.specialistId : 'unknown',
+      targetStem: typeof entry.targetStem === 'string' ? entry.targetStem : 'unknown',
+      modelId: typeof entry.modelId === 'string' ? entry.modelId : '',
+      runtimeProfileId: typeof entry.runtimeProfileId === 'string' ? entry.runtimeProfileId : '',
+      resultSetId: typeof entry.resultSetId === 'string' ? entry.resultSetId : '',
+      status: typeof entry.status === 'string' ? entry.status : 'not_configured',
+      healthStatus: typeof entry.healthStatus === 'string' ? entry.healthStatus : 'unknown',
+      reason: typeof entry.reason === 'string' ? entry.reason : null,
+      warningCount: typeof entry.warningCount === 'number' ? entry.warningCount : 0,
+      jobStatus: typeof entry.jobStatus === 'string' ? entry.jobStatus : null,
+      errorCode: typeof entry.errorCode === 'string' ? entry.errorCode : null,
+      errorMessage: typeof entry.errorMessage === 'string' ? entry.errorMessage : null,
+      selected: !!entry.selected,
+      fallbackUsed: !!entry.fallbackUsed,
+      selectionReason: typeof entry.selectionReason === 'string' ? entry.selectionReason : null,
+      sourceResultSetId: typeof entry.sourceResultSetId === 'string' ? entry.sourceResultSetId : null,
+      passStatusBeforeFallback: typeof entry.passStatusBeforeFallback === 'string'
+        ? entry.passStatusBeforeFallback
+        : null,
+    }))
+    : [];
+  const reportStemSelections = Array.isArray(reportRecord?.stemSelections)
+    ? reportRecord!.stemSelections.filter(isObjectLike).map((entry) => ({
+      stemType: typeof entry.stemType === 'string' ? entry.stemType : 'unknown',
+      modelId: typeof entry.modelId === 'string' ? entry.modelId : 'unknown',
+      runtimeProfileId: typeof entry.runtimeProfileId === 'string' ? entry.runtimeProfileId : 'unknown',
+      selectionReason: typeof entry.selectionReason === 'string' ? entry.selectionReason : 'unknown',
+      fallbackUsed: !!entry.fallbackUsed,
+      sourceResultSetId: typeof entry.sourceResultSetId === 'string' ? entry.sourceResultSetId : null,
+      sourceSignature: typeof entry.sourceSignature === 'string' ? entry.sourceSignature : null,
+    }))
+    : fallbackStemSelections;
+
+  const baselinePassStatus = (() => {
+    if (typeof reportRecord?.baselinePassStatus === 'string') {
+      return reportRecord.baselinePassStatus;
+    }
+    return reportPasses.find((entry) => entry.passId === 'baseline_6s')?.executionStatus ?? 'failed';
+  })();
+  const fallbackSpecialistStatus = (specialistId: 'guitar_specialist' | 'piano_specialist'): SpecialistStatus => {
+    const pass = reportPasses.find((entry) => entry.passId === specialistId);
+    if (!pass) return 'not_configured';
+    if (typeof pass.specialistStatus === 'string') {
+      return pass.specialistStatus as SpecialistStatus;
+    }
+    if (pass.executionStatus === 'failed') return 'failed';
+    if (pass.executionStatus === 'skipped') return 'skipped_by_policy';
+    return 'selected';
+  };
+  const guitarSpecialistReport = reportSpecialistReports.find((entry) => entry.specialistId === 'guitar_specialist');
+  const pianoSpecialistReport = reportSpecialistReports.find((entry) => entry.specialistId === 'piano_specialist');
+
+  return {
+    exists: true,
+    activeIsOrch: activeResultContext.activeResultId.startsWith(ORCH_RESULT_SET_PREFIX),
+    orchResultSetId: inspectedResultSetId,
+    latestOrchResultSetId,
+    availableOrchResultSetIds: orchResultSets.map((entry) => entry.id),
+    baselinePassStatus,
+    guitarSpecialistStatus: guitarSpecialistReport?.status ?? fallbackSpecialistStatus('guitar_specialist'),
+    pianoSpecialistStatus: pianoSpecialistReport?.status ?? fallbackSpecialistStatus('piano_specialist'),
+    specialistReports: reportSpecialistReports,
+    passReports: reportPasses,
+    stemSelections: reportStemSelections,
+    reportPath,
   };
 }
 
@@ -2090,6 +2487,136 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     };
   });
 
+  ipcMain.handle('project:startOrchestratedSeparation', async (_event, projectId: string, sourceFilePath?: string) => {
+    if (!workerInfra) {
+      throw new Error('分离服务不可用，请重启应用后重试');
+    }
+    if (typeof projectId !== 'string' || projectId.trim().length === 0) {
+      throw new Error('缺少项目 ID，无法启动 orchestration 试点');
+    }
+    const project = await workerInfra.projectRepo.findById(projectId);
+    if (!project) {
+      throw new Error('项目不存在，无法启动 orchestration 试点');
+    }
+    const pilotRuntimePreflight = checkPilotRuntimeProfileAvailability();
+    if (!pilotRuntimePreflight.configured) {
+      const missing = pilotRuntimePreflight.missingItems.length > 0
+        ? pilotRuntimePreflight.missingItems.join(', ')
+        : 'unknown';
+      throw new Error(`ORCH_RUNTIME_PROFILE_UNAVAILABLE: missing ${missing}`);
+    }
+
+    const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
+    const requestSourceFilePath = typeof sourceFilePath === 'string' ? sourceFilePath.trim() : '';
+    const projectOriginalFilePath = typeof project.originalFilePath === 'string'
+      ? project.originalFilePath.trim()
+      : '';
+    const manifestOriginalFilePath = manifest && typeof manifest.originalFilePath === 'string'
+      ? manifest.originalFilePath.trim()
+      : '';
+    const manifestSourceFilePath = manifest && typeof manifest.sourceFilePath === 'string'
+      ? manifest.sourceFilePath.trim()
+      : '';
+    const sourceCandidates = [
+      requestSourceFilePath,
+      projectOriginalFilePath,
+      manifestOriginalFilePath,
+      manifestSourceFilePath,
+    ]
+      .filter((candidate) => candidate.length > 0)
+      .map((candidate) => (path.isAbsolute(candidate) ? candidate : path.join(project.cacheDir, candidate)));
+    let resolvedSourceFilePath = '';
+    for (const candidate of sourceCandidates) {
+      if (!fs.existsSync(candidate)) continue;
+      try {
+        await fs.promises.access(candidate, fs.constants.R_OK);
+        resolvedSourceFilePath = candidate;
+        break;
+      } catch {
+        // try next candidate
+      }
+    }
+    console.log(
+      `[REAL_CHAIN] handlers.project:startOrchestratedSeparation source_probe projectId="${projectId}" ` +
+      `requestSourceFilePath="${requestSourceFilePath || 'none'}" projectOriginalFilePath="${projectOriginalFilePath || 'none'}" ` +
+      `manifestOriginalFilePath="${manifestOriginalFilePath || 'none'}" manifestSourceFilePath="${manifestSourceFilePath || 'none'}" ` +
+      `resolved="${resolvedSourceFilePath || 'none'}"`,
+    );
+    if (!resolvedSourceFilePath) {
+      throw new Error('ORCH_SOURCE_PATH_REQUIRED: 缺少可读的原始音频路径，无法启动 orchestration');
+    }
+    if (project.originalFilePath !== resolvedSourceFilePath) {
+      await workerInfra.projectRepo.update(projectId, { originalFilePath: resolvedSourceFilePath });
+    }
+    await persistManifestSourceFilePath(project.cacheDir, resolvedSourceFilePath);
+
+    const orchestrationResultSetId = `${ORCH_RESULT_SET_PREFIX}${Date.now()}`;
+    const orchestrationService = new OrchestratedSeparationService(
+      workerInfra.parseJobService,
+      workerInfra.projectRepo,
+      workerInfra.stemFileRepo,
+    );
+    const specialists = resolveOrchestrationSpecialists();
+    const executionPlan: SpecialistExecutionPlan = {
+      orchestratedResultSetId: orchestrationResultSetId,
+      baselineModelId: PILOT_MODEL_ID,
+      baselineRuntimeProfileId: PILOT_RUNTIME_PROFILE_ID,
+      specialists,
+      selectionPolicy: resolveOrchestrationSelectionPolicy(),
+    };
+    const orchestrationResult = await orchestrationService.start({
+      projectId,
+      sourceFilePath: resolvedSourceFilePath,
+      projectDir: project.cacheDir,
+      executionPlan,
+    });
+
+    const existingStems = await workerInfra.stemFileRepo.findByProjectId(projectId);
+    const keptStems = existingStems.filter((stem) =>
+      normalizeParentResultId(stem.parentResultId) !== orchestrationResultSetId,
+    );
+    await workerInfra.stemFileRepo.deleteByProjectId(projectId);
+    await workerInfra.stemFileRepo.createMany([...keptStems, ...orchestrationResult.stemFiles]);
+
+    const resultSetEntry: ProjectManifestResultSetEntry = {
+      id: orchestrationResult.resultSetEntry.id,
+      modelId: orchestrationResult.resultSetEntry.modelId,
+      runtimeProfileId: orchestrationResult.resultSetEntry.runtimeProfileId,
+      sourceSignature: orchestrationResult.resultSetEntry.sourceSignature,
+      createdAt: orchestrationResult.resultSetEntry.createdAt,
+    };
+    const manifestEntries: ManifestStemEntry[] = orchestrationResult.manifestEntries.map((entry) => ({
+      ...entry,
+      relativePath: normalizeManifestRelativePath(project.cacheDir, path.join(project.cacheDir, entry.relativePath)),
+    }));
+    await ensureOrchestratedManifestPersistence(
+      project,
+      resultSetEntry,
+      manifestEntries,
+      orchestrationResult.debugReportRelativePath,
+    );
+    await workerInfra.projectRepo.updateStatus(projectId, ProjectStatus.Ready);
+    console.log(
+      `[REAL_CHAIN] handlers.project:startOrchestratedSeparation completed projectId="${projectId}" resultSetId="${orchestrationResultSetId}" ` +
+      `baselineResultSetId="${orchestrationResult.baselineResultSetId}" stemCount=${orchestrationResult.stemFiles.length} ` +
+      `passReports=${JSON.stringify(orchestrationResult.passReports)}`,
+    );
+
+    return {
+      jobId: `orch-${crypto.randomUUID().slice(0, 8)}`,
+      projectId,
+      resultSetId: orchestrationResultSetId,
+      modelId: ORCH_RESULT_MODEL_ID,
+      runtimeProfileId: ORCH_RESULT_RUNTIME_PROFILE_ID,
+      passReports: orchestrationResult.passReports,
+      specialistReports: orchestrationResult.specialistReports,
+      specialistStatusMap: buildSpecialistStatusMap(orchestrationResult.specialistReports),
+      warnings: orchestrationResult.warnings,
+      orchestrationDebug: orchestrationResult.debugReport,
+      cacheHit: false,
+    };
+  });
+
   ipcMain.handle('project:cancelSeparation', async (_event, jobId?: string) => {
     if (workerInfra) {
       await workerInfra.parseJobService.cancelSeparation(jobId ?? undefined);
@@ -2246,6 +2773,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     const allStems = await workerInfra.stemFileRepo.findByProjectId(projectId);
     const latestJob = await workerInfra.parseJobRepo.findLatestByProjectId(projectId);
     const activeResultContext = await resolveActiveResultContext(project, allStems);
+    const orchestrationDebug = await resolveOrchestrationDebugSnapshot(project, allStems, activeResultContext);
     const stems = filterStemsForResultSet(allStems, activeResultContext.activeResultId);
     console.log(
       `[REAL_CHAIN] handlers.project:getResult active_context projectId="${projectId}" resultSetCount=${activeResultContext.resultSets.length} ` +
@@ -2294,6 +2822,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       sourceFilePath: project.originalFilePath ?? null,
       activeResultModelId: activeResultContext.modelId,
       activeResultRuntimeProfileId: activeResultContext.runtimeProfileId,
+      orchestrationDebug,
     };
   });
 
@@ -2336,6 +2865,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
         parentResultId: sf.parentResultId,
         sourceSignature: sf.sourceSignature,
         sourceKind: sf.sourceKind,
+        selectionReason: sf.selectionReason,
+        fallbackUsed: sf.fallbackUsed,
+        sourceResultSetId: sf.sourceResultSetId,
       }));
     }
 

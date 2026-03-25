@@ -46,6 +46,7 @@ MODEL_SUPPORTED_STEM_TYPES = {
 
 DEFAULT_SEPARATION_ENGINE = "demucs"
 ALLOWED_SEPARATION_ENGINES = {"demucs", "bs_roformer_sw"}
+GUITAR_SPECIALIST_MODEL_IDS = {"mel_roformer_guitar"}
 ENV_WORKER_PYTHON_EXE = "WORKER_PYTHON_EXE"
 ENV_DEMUCS_PYTHON_EXE = "DEMUCS_PYTHON_EXE"
 ENV_DEMUCS_6S_PILOT_PYTHON_EXE = "DEMUCS_6S_PILOT_PYTHON_EXE"
@@ -56,6 +57,8 @@ ENV_STEM_ROUTING_CONFIG_JSON = "STEM_ROUTING_CONFIG_JSON"
 ENV_CHORD_ANALYZER = "CHORD_ANALYZER"
 ENV_TEMPO_ANALYZER = "TEMPO_ANALYZER"
 ENV_ANALYZER_STRICT_MODE = "ANALYZER_STRICT_MODE"
+ENV_ORCH_GUITAR_SPECIALIST_CMD = "ORCH_GUITAR_SPECIALIST_CMD"
+ENV_ORCH_GUITAR_SPECIALIST_CHECKPOINT = "ORCH_GUITAR_SPECIALIST_CHECKPOINT"
 
 LEGACY_CHORD_ANALYZER_ID = "chord_rule_chroma_v1"
 PILOT_CHORD_ANALYZER_ID = "chord_rule_chroma_v2_pilot"
@@ -2038,7 +2041,15 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
         })
 
 
-def _resolve_separation_engine(request_id: str) -> str:
+def _resolve_separation_engine(request_id: str, model_override: Optional[str] = None) -> str:
+    normalized_model = (model_override or "").strip().lower()
+    if normalized_model in GUITAR_SPECIALIST_MODEL_IDS:
+        log(
+            "INFO",
+            f"[REAL_CHAIN] start_separation specialist_engine_override request_id={request_id} "
+            f"model={normalized_model} engine=bs_roformer_sw",
+        )
+        return "bs_roformer_sw"
     requested = os.environ.get("SEPARATION_ENGINE", DEFAULT_SEPARATION_ENGINE).strip().lower()
     if requested not in ALLOWED_SEPARATION_ENGINES:
         log(
@@ -2212,6 +2223,7 @@ def _run_bs_roformer_engine(
     file_path: str,
     output_dir: str,
     stems_dir: str,
+    specialist_model_id: Optional[str] = None,
 ) -> dict:
     """
     Experimental runner for bs-roformer-sw.
@@ -2220,10 +2232,30 @@ def _run_bs_roformer_engine(
        e.g. BS_ROFORMER_CMD=\"python -m bs_roformer.inference --input \\\"{input}\\\" --output-dir \\\"{output}\\\" --model bs_roformer_sw\"
     2) Built-in candidate commands (best effort).
     """
+    specialist_model = (specialist_model_id or "").strip().lower()
     bs_cmd_template = os.environ.get("BS_ROFORMER_CMD", "").strip()
+    specialist_cmd_template = os.environ.get(ENV_ORCH_GUITAR_SPECIALIST_CMD, "").strip()
+    specialist_checkpoint = os.environ.get(ENV_ORCH_GUITAR_SPECIALIST_CHECKPOINT, "").strip()
 
     candidates: List[Tuple[List[str], bool]] = []
-    if bs_cmd_template:
+    if specialist_model in GUITAR_SPECIALIST_MODEL_IDS:
+        if not specialist_cmd_template:
+            raise RuntimeError(
+                "Guitar specialist command missing: set ORCH_GUITAR_SPECIALIST_CMD"
+            )
+        if "{checkpoint}" in specialist_cmd_template and not specialist_checkpoint:
+            raise RuntimeError(
+                "Guitar specialist checkpoint missing: set ORCH_GUITAR_SPECIALIST_CHECKPOINT"
+            )
+        rendered = (
+            specialist_cmd_template
+            .replace("{input}", file_path)
+            .replace("{output}", output_dir)
+            .replace("{checkpoint}", specialist_checkpoint)
+            .replace("{model}", specialist_model)
+        )
+        candidates.append(([rendered], True))
+    elif bs_cmd_template:
         rendered = bs_cmd_template.replace("{input}", file_path).replace("{output}", output_dir)
         candidates.append(([rendered], True))
     else:
@@ -2335,7 +2367,7 @@ def _run_bs_roformer_engine(
 
     return {
         "engineVersion": "bs-roformer-sw-experimental",
-        "modelName": "bs_roformer_sw",
+        "modelName": specialist_model if specialist_model else "bs_roformer_sw",
         "supportedStemTypes": BS_SUPPORTED_STEM_TYPES,
         "stems": stems,
     }
@@ -2386,7 +2418,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
     })
 
     try:
-        selected_engine = _resolve_separation_engine(request_id)
+        selected_engine = _resolve_separation_engine(request_id, model_override=model_override)
         log("INFO", f"[REAL_CHAIN] start_separation engine_selected request_id={request_id} engine={selected_engine}")
 
         # 鍙戦€?progress: infer starting
@@ -2405,6 +2437,7 @@ def handle_start_separation(request_id: str, payload: dict) -> None:
                     file_path=file_path,
                     output_dir=output_dir,
                     stems_dir=stems_dir,
+                    specialist_model_id=model_override,
                 )
             except Exception as bs_exc:
                 used_fallback = True

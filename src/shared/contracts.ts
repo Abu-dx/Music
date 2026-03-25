@@ -267,6 +267,9 @@ export interface StemTrackDTO {
   parentResultId?: string;
   sourceSignature?: string;
   sourceKind?: string;
+  selectionReason?: string;
+  fallbackUsed?: boolean;
+  sourceResultSetId?: string;
 }
 
 /**

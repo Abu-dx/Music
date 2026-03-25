@@ -160,6 +160,40 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     sourceFilePath?: string | null;
     activeResultModelId?: string | null;
     activeResultRuntimeProfileId?: string | null;
+    orchestrationDebug?: {
+      exists?: boolean;
+      orchResultSetId?: string | null;
+      latestOrchResultSetId?: string | null;
+      baselinePassStatus?: string;
+      guitarSpecialistStatus?: string;
+      pianoSpecialistStatus?: string;
+      specialistReports?: Array<{
+        specialistId?: string;
+        status?: string;
+        healthStatus?: string;
+        reason?: string | null;
+        passStatusBeforeFallback?: string | null;
+        fallbackUsed?: boolean;
+        selected?: boolean;
+      }>;
+      passReports?: Array<{
+        passId?: string;
+        executionStatus?: string;
+        specialistStatus?: string | null;
+        reason?: string | null;
+        resultSetId?: string;
+      }>;
+      stemSelections?: Array<{
+        stemType?: string;
+        modelId?: string;
+        runtimeProfileId?: string;
+        selectionReason?: string;
+        fallbackUsed?: boolean;
+        sourceResultSetId?: string | null;
+      }>;
+      reportPath?: string | null;
+      availableOrchResultSetIds?: string[];
+    };
   }) | null;
   const activeResultId = projectResultWithMeta?.activeResultId?.trim() || 'main';
   const availableResultSets = (projectResultWithMeta?.resultSets ?? [])
@@ -181,6 +215,13 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     ?? 'unknown';
   const isActivePilotResult = activeResultId.startsWith('pilot_');
   const activeResultKindLabel = isActivePilotResult ? '实验结果集' : '主线结果集';
+  const orchestrationDebug = projectResultWithMeta?.orchestrationDebug;
+  const hasOrchestrationResultSet = (projectResultWithMeta?.resultSets ?? [])
+    .some((entry) => typeof entry?.id === 'string' && entry.id.startsWith('orch_6s_'));
+  const orchestrationExists = Boolean(orchestrationDebug?.exists) || hasOrchestrationResultSet;
+  const orchestrationStemSelections = Array.isArray(orchestrationDebug?.stemSelections)
+    ? orchestrationDebug.stemSelections
+    : [];
   const tempoAnalyzerId = analysisSnap.chordResult?.analysisMethods?.tempoAnalyzer ?? 'unknown';
   const tempoMethod = analysisSnap.chordResult?.tempo?.method ?? null;
   const tempoConfidence = analysisSnap.chordResult?.tempo?.confidence;
@@ -728,6 +769,73 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           当前正在查看 pilot 实验结果；main 主线结果仍保留，默认主线仍为 main。
         </div>
       )}
+
+      <div style={styles.section}>
+        <h3 style={styles.sectionTitle}>Orchestration 调试（只读）</h3>
+        <div style={styles.chordSummaryBox}>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>检测到 orch_6s_*</span>
+            <span style={styles.chordSummaryValue}>{orchestrationExists ? 'yes' : 'no'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Orch ResultSetId</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.orchResultSetId ?? orchestrationDebug?.latestOrchResultSetId ?? 'none'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Baseline Pass</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.baselinePassStatus ?? 'not_configured'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Guitar Specialist</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.guitarSpecialistStatus ?? 'not_configured'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Piano Specialist</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.pianoSpecialistStatus ?? 'not_configured'}</span>
+          </div>
+          {typeof orchestrationDebug?.reportPath === 'string' && orchestrationDebug.reportPath.trim().length > 0 && (
+            <div style={styles.chordSummaryRow}>
+              <span style={styles.chordSummaryLabel}>Debug Report Path</span>
+              <span style={styles.chordSummaryValue}>{orchestrationDebug.reportPath}</span>
+            </div>
+          )}
+          <details style={styles.chordDebugPanel}>
+            <summary style={styles.chordDebugSummary}>Specialist Report（只读）</summary>
+            <pre style={styles.chordDebugPre}>
+              {JSON.stringify(
+                Array.isArray(orchestrationDebug?.specialistReports)
+                  ? orchestrationDebug.specialistReports
+                  : [],
+                null,
+                2,
+              )}
+            </pre>
+          </details>
+          <details style={styles.chordDebugPanel}>
+            <summary style={styles.chordDebugSummary}>Pass Report（只读）</summary>
+            <pre style={styles.chordDebugPre}>
+              {JSON.stringify(Array.isArray(orchestrationDebug?.passReports) ? orchestrationDebug.passReports : [], null, 2)}
+            </pre>
+          </details>
+          <details style={styles.chordDebugPanel}>
+            <summary style={styles.chordDebugSummary}>Stem Provenance（只读）</summary>
+            <pre style={styles.chordDebugPre}>
+              {JSON.stringify(
+                orchestrationStemSelections.map((entry) => ({
+                  stemType: entry.stemType ?? 'unknown',
+                  modelId: entry.modelId ?? 'unknown',
+                  runtimeProfileId: entry.runtimeProfileId ?? 'unknown',
+                  selectionReason: entry.selectionReason ?? 'unknown',
+                  fallbackUsed: Boolean(entry.fallbackUsed),
+                  sourceResultSetId: entry.sourceResultSetId ?? null,
+                })),
+                null,
+                2,
+              )}
+            </pre>
+          </details>
+        </div>
+      </div>
 
       {/* === 已生成轨道 === */}
       {existingStems.length > 0 && (

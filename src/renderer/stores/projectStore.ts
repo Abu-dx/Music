@@ -40,6 +40,7 @@ export interface IProjectElectronAPI {
   /** 通过文件路径创建项目并启动分�?*/
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
   startPilotSeparation?(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
+  startOrchestratedSeparation?(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
 
   /** 取消分离任务 */
   cancelSeparation(jobId?: string): Promise<void>;
@@ -115,6 +116,7 @@ export interface IProjectStore {
   loadRecentProjects(limit?: number): Promise<void>;
   startSeparation(filePath: string): Promise<SeparationStartResultDTO>;
   startPilotSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
+  startOrchestratedSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO>;
   cancelSeparation(jobId?: string): Promise<void>;
   loadProject(projectId: string): Promise<void>;
   renameProject(projectId: string, displayName: string): Promise<void>;
@@ -198,6 +200,13 @@ export class ProjectStore implements IProjectStore {
       throw new Error('当前环境不支持实验6轨分离');
     }
     return this.api.startPilotSeparation(projectId, sourceFilePath);
+  }
+
+  async startOrchestratedSeparation(projectId: string, sourceFilePath?: string): Promise<SeparationStartResultDTO> {
+    if (!this.api.startOrchestratedSeparation) {
+      throw new Error('当前环境不支持 orchestration 试点分离');
+    }
+    return this.api.startOrchestratedSeparation(projectId, sourceFilePath);
   }
 
   async cancelSeparation(jobId?: string): Promise<void> {

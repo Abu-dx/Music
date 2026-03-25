@@ -106,6 +106,9 @@ export interface StemFile {
   parentResultId?: string;
   sourceSignature?: string;
   sourceKind?: string;
+  selectionReason?: string;
+  fallbackUsed?: boolean;
+  sourceResultSetId?: string;
 }
 
 /** 轨道来源 — 值对象 */
@@ -273,6 +276,9 @@ export interface ManifestStemEntry {
   parentResultId?: string;
   sourceSignature?: string;
   sourceKind?: string;
+  selectionReason?: string;
+  fallbackUsed?: boolean;
+  sourceResultSetId?: string;
 }
 
 // ============================================================================
