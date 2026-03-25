@@ -158,7 +158,7 @@ const DEFAULT_CHORD_CACHE_PATH = 'chord/chord-analysis.json';
 const DEFAULT_ACTIVE_RESULT_ID = 'main';
 const DEFAULT_RESULT_MODEL_ID = 'demucs';
 const DEFAULT_RESULT_RUNTIME_PROFILE_ID = 'demucs_env_override';
-const DEFAULT_CHORD_ANALYZER_ID = 'chord_rule_chroma_v1';
+const DEFAULT_CHORD_ANALYZER_ID = 'chord_rule_chroma_v2_pilot';
 const DEFAULT_TEMPO_ANALYZER_ID = 'tempo_rule_onset_v2_pilot';
 const PILOT_MODEL_ID = 'htdemucs_6s';
 const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
@@ -380,11 +380,20 @@ function classifyPilotFailure(
 
 function toAnalysisFailureMessage(err: unknown, fallback: string): string {
   const raw = normalizeErrorMessage(err, fallback);
+  if (raw.includes('ANALYZER_SELECTION_FAILED')) {
+    return '分析器选择失败（未找到请求的 analyzer 或 strict 模式阻断）';
+  }
+  if (raw.includes('ANALYSIS_RUNTIME_UNSUPPORTED')) {
+    return '分析运行时不支持当前分析器，请检查 runtime profile 配置';
+  }
   if (raw.includes('INPUT_FILE_NOT_FOUND') || raw.includes('Source file not found')) {
     return '分析输入文件不存在，未返回分析结果';
   }
   if (raw.includes('ANALYSIS_DEPENDENCY_MISSING')) {
     return '分析依赖缺失（librosa/torchaudio），未返回分析结果';
+  }
+  if (raw.includes('ANALYSIS_CHORD_RESULT_EMPTY')) {
+    return '和弦分析未产出有效片段，请检查输入音频或分析器配置';
   }
   if (raw.includes('WORKER_IPC') || raw.includes('Worker')) {
     return '分析 Worker 不可用，未返回分析结果';

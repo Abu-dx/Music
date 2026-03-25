@@ -185,6 +185,31 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const tempoMethod = analysisSnap.chordResult?.tempo?.method ?? null;
   const tempoConfidence = analysisSnap.chordResult?.tempo?.confidence;
   const tempoAmbiguity = analysisSnap.chordResult?.tempo?.ambiguity;
+  const chordAnalyzerId = analysisSnap.chordResult?.analysisMethods?.chordAnalyzer ?? 'unknown';
+  const chordMethod = analysisSnap.currentSegment?.method
+    ?? analysisSnap.chordResult?.segments.find((segment) => typeof segment.method === 'string')?.method
+    ?? null;
+  const chordConfidenceValues = (analysisSnap.chordResult?.segments ?? [])
+    .flatMap((segment) => (typeof segment.confidence === 'number' ? [segment.confidence] : []));
+  const chordAverageConfidence = chordConfidenceValues.length > 0
+    ? chordConfidenceValues.reduce((sum, value) => sum + value, 0) / chordConfidenceValues.length
+    : null;
+  const chordCandidatePreview = (() => {
+    const targetSegment = analysisSnap.currentSegment
+      ?? analysisSnap.chordResult?.segments.find((segment) => Array.isArray(segment.candidates) && segment.candidates.length > 0)
+      ?? null;
+    if (!targetSegment || !Array.isArray(targetSegment.candidates)) return [];
+    return targetSegment.candidates
+      .filter((candidate) => typeof candidate.label === 'string' && candidate.label.trim().length > 0)
+      .slice(0, 3)
+      .map((candidate) => {
+        const base = candidate.label.trim();
+        if (typeof candidate.confidence === 'number') {
+          return `${base}(${candidate.confidence.toFixed(2)})`;
+        }
+        return base;
+      });
+  })();
   const tempoAmbiguityText = tempoAmbiguity
     ? [
       tempoAmbiguity.isAmbiguous ? 'ambiguous' : 'stable',
@@ -193,6 +218,46 @@ export const ResultPage: React.FC<ResultPageProps> = ({
       typeof tempoAmbiguity.doubleTimeBpm === 'number' ? `double=${Math.round(tempoAmbiguity.doubleTimeBpm)}` : '',
     ].filter((item) => item.length > 0).join(' | ')
     : 'none';
+  const structuredChordSegments = (analysisSnap.chordResult?.segments ?? []).map((segment) => ({
+    label: segment.label,
+    symbol: segment.symbol ?? null,
+    chordType: segment.chordType ?? null,
+    bassNote: segment.bassNote ?? null,
+    extensions: Array.isArray(segment.extensions) ? segment.extensions : [],
+    alterations: Array.isArray(segment.alterations) ? segment.alterations : [],
+    omissions: Array.isArray(segment.omissions) ? segment.omissions : [],
+    confidence: typeof segment.confidence === 'number' ? Number(segment.confidence.toFixed(3)) : null,
+    candidates: Array.isArray(segment.candidates)
+      ? segment.candidates.map((candidate) => ({
+        label: candidate.label,
+        confidence: typeof candidate.confidence === 'number' ? Number(candidate.confidence.toFixed(3)) : null,
+        method: candidate.method ?? null,
+      }))
+      : [],
+  }));
+  const chordStructureCoverage = structuredChordSegments.reduce((acc, segment) => {
+    const symbol = (segment.symbol ?? segment.label ?? '').toLowerCase();
+    if (symbol.includes('7')) acc.has7 += 1;
+    if (symbol.includes('9')) acc.has9 += 1;
+    if (symbol.includes('add')) acc.hasAdd += 1;
+    if (symbol.includes('sus')) acc.hasSus += 1;
+    if (symbol.includes('/') || segment.bassNote) acc.hasSlash += 1;
+    if (segment.extensions.length > 0) acc.withExtensions += 1;
+    if (segment.alterations.length > 0) acc.withAlterations += 1;
+    if (segment.omissions.length > 0) acc.withOmissions += 1;
+    if (segment.candidates.length > 0) acc.withCandidates += 1;
+    return acc;
+  }, {
+    has7: 0,
+    has9: 0,
+    hasAdd: 0,
+    hasSus: 0,
+    hasSlash: 0,
+    withExtensions: 0,
+    withAlterations: 0,
+    withOmissions: 0,
+    withCandidates: 0,
+  });
 
   useEffect(() => {
     accessMarkedRef.current = false;
@@ -762,6 +827,40 @@ export const ResultPage: React.FC<ResultPageProps> = ({
               <span style={styles.chordSummaryLabel}>和弦片段</span>
               <span style={styles.chordSummaryValue}>{analysisSnap.segmentCount} 个</span>
             </div>
+            <div style={styles.chordSummaryRow}>
+              <span style={styles.chordSummaryLabel}>Chord Analyzer</span>
+              <span style={styles.chordSummaryValue}>{chordAnalyzerId}</span>
+            </div>
+            {chordMethod && (
+              <div style={styles.chordSummaryRow}>
+                <span style={styles.chordSummaryLabel}>Chord Method</span>
+                <span style={styles.chordSummaryValue}>{chordMethod}</span>
+              </div>
+            )}
+            {typeof chordAverageConfidence === 'number' && (
+              <div style={styles.chordSummaryRow}>
+                <span style={styles.chordSummaryLabel}>Chord Confidence(avg)</span>
+                <span style={styles.chordSummaryValue}>{chordAverageConfidence.toFixed(2)}</span>
+              </div>
+            )}
+            {chordCandidatePreview.length > 0 && (
+              <div style={styles.chordSummaryRow}>
+                <span style={styles.chordSummaryLabel}>Chord Candidates</span>
+                <span style={styles.chordSummaryValue}>{chordCandidatePreview.join(' | ')}</span>
+              </div>
+            )}
+            <details style={styles.chordDebugPanel}>
+              <summary style={styles.chordDebugSummary}>结构化和弦调试（只读）</summary>
+              <div style={styles.chordDebugMeta}>
+                {`total=${structuredChordSegments.length} | 7=${chordStructureCoverage.has7} | 9=${chordStructureCoverage.has9} | add=${chordStructureCoverage.hasAdd} | sus=${chordStructureCoverage.hasSus} | slash=${chordStructureCoverage.hasSlash}`}
+              </div>
+              <div style={styles.chordDebugMeta}>
+                {`extensions=${chordStructureCoverage.withExtensions} | alterations=${chordStructureCoverage.withAlterations} | omissions=${chordStructureCoverage.withOmissions} | candidates=${chordStructureCoverage.withCandidates}`}
+              </div>
+              <pre style={styles.chordDebugPre}>
+                {JSON.stringify(structuredChordSegments.slice(0, 8), null, 2)}
+              </pre>
+            </details>
             {analysisSnap.estimatedKey && (
               <div style={styles.chordSummaryRow}>
                 <span style={styles.chordSummaryLabel}>调性</span>
@@ -1358,6 +1457,38 @@ const styles: Record<string, React.CSSProperties> = {
   chordSummaryValue: {
     color: '#1a1a1a',
     fontWeight: 500,
+  },
+  chordDebugPanel: {
+    marginTop: '8px',
+    padding: '8px 10px',
+    borderRadius: '6px',
+    border: '1px solid #d9d9d9',
+    backgroundColor: '#fcfcfc',
+  },
+  chordDebugSummary: {
+    cursor: 'pointer',
+    color: '#2f3b4a',
+    fontSize: '13px',
+    fontWeight: 600,
+    userSelect: 'none' as const,
+  },
+  chordDebugMeta: {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#666',
+  },
+  chordDebugPre: {
+    marginTop: '8px',
+    marginBottom: 0,
+    padding: '10px',
+    borderRadius: '6px',
+    backgroundColor: '#111827',
+    color: '#e5e7eb',
+    fontSize: '11px',
+    lineHeight: 1.45,
+    overflowX: 'auto' as const,
+    whiteSpace: 'pre' as const,
+    maxHeight: '240px',
   },
   estimatedTag: {
     fontSize: '10px',

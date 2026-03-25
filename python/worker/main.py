@@ -12,6 +12,7 @@ JSON-line stdio 鍗忚瀹炵幇 + Demucs 鍒嗙寮曟搸鎺ュ叆銆?
 import json
 import sys
 import os
+import re
 import subprocess
 import traceback
 import time
@@ -56,7 +57,9 @@ ENV_CHORD_ANALYZER = "CHORD_ANALYZER"
 ENV_TEMPO_ANALYZER = "TEMPO_ANALYZER"
 ENV_ANALYZER_STRICT_MODE = "ANALYZER_STRICT_MODE"
 
-DEFAULT_CHORD_ANALYZER_ID = "chord_rule_chroma_v1"
+LEGACY_CHORD_ANALYZER_ID = "chord_rule_chroma_v1"
+PILOT_CHORD_ANALYZER_ID = "chord_rule_chroma_v2_pilot"
+DEFAULT_CHORD_ANALYZER_ID = PILOT_CHORD_ANALYZER_ID
 LEGACY_TEMPO_ANALYZER_ID = "tempo_rule_onset_v1"
 PILOT_TEMPO_ANALYZER_ID = "tempo_rule_onset_v2_pilot"
 DEFAULT_TEMPO_ANALYZER_ID = PILOT_TEMPO_ANALYZER_ID
@@ -84,6 +87,30 @@ CHORD_MIN_SEGMENT_MS = 160
 CHORD_MERGE_THRESHOLD_MS = 220
 CHORD_DEJITTER_CONFIDENCE_MAX = 0.45
 CHORD_SHORT_SEGMENT_CONFIDENCE_MAX = 0.60
+CHORD_FRAME_SCORE_MIN = 0.24
+CHORD_BASS_SLASH_RATIO = 0.88
+CHORD_ROOT_TIE_MARGIN = 0.035
+
+CHORD_TEMPLATE_DEFINITIONS: List[Dict[str, Any]] = [
+    {"suffix": "", "chordType": "major", "intervals": [0, 4, 7], "weights": [1.00, 0.92, 0.90]},
+    {"suffix": "m", "chordType": "minor", "intervals": [0, 3, 7], "weights": [1.00, 0.92, 0.90]},
+    {"suffix": "6", "chordType": "major6", "intervals": [0, 4, 7, 9], "weights": [1.00, 0.88, 0.86, 0.64]},
+    {"suffix": "m6", "chordType": "minor6", "intervals": [0, 3, 7, 9], "weights": [1.00, 0.88, 0.86, 0.64]},
+    {"suffix": "7", "chordType": "dominant7", "intervals": [0, 4, 7, 10], "weights": [1.00, 0.88, 0.86, 0.72]},
+    {"suffix": "maj7", "chordType": "major7", "intervals": [0, 4, 7, 11], "weights": [1.00, 0.88, 0.86, 0.70]},
+    {"suffix": "m7", "chordType": "minor7", "intervals": [0, 3, 7, 10], "weights": [1.00, 0.88, 0.86, 0.72]},
+    {"suffix": "m7b5", "chordType": "half_diminished", "intervals": [0, 3, 6, 10], "weights": [1.00, 0.88, 0.78, 0.70]},
+    {"suffix": "dim", "chordType": "diminished", "intervals": [0, 3, 6], "weights": [1.00, 0.90, 0.82]},
+    {"suffix": "dim7", "chordType": "diminished7", "intervals": [0, 3, 6, 9], "weights": [1.00, 0.88, 0.80, 0.68]},
+    {"suffix": "aug", "chordType": "augmented", "intervals": [0, 4, 8], "weights": [1.00, 0.90, 0.80]},
+    {"suffix": "9", "chordType": "dominant9", "intervals": [0, 4, 7, 10, 2], "weights": [1.00, 0.86, 0.84, 0.70, 0.62]},
+    {"suffix": "maj9", "chordType": "major9", "intervals": [0, 4, 7, 11, 2], "weights": [1.00, 0.86, 0.84, 0.70, 0.62]},
+    {"suffix": "m9", "chordType": "minor9", "intervals": [0, 3, 7, 10, 2], "weights": [1.00, 0.86, 0.84, 0.70, 0.62]},
+    {"suffix": "add9", "chordType": "added_tone", "intervals": [0, 4, 7, 2], "weights": [1.00, 0.90, 0.88, 0.64]},
+    {"suffix": "sus2", "chordType": "suspended", "intervals": [0, 2, 7], "weights": [1.00, 0.90, 0.88]},
+    {"suffix": "sus4", "chordType": "suspended", "intervals": [0, 5, 7], "weights": [1.00, 0.92, 0.88]},
+    {"suffix": "7sus4", "chordType": "suspended7", "intervals": [0, 5, 7, 10], "weights": [1.00, 0.88, 0.84, 0.70]},
+]
 
 
 class AnalyzerSelectionError(RuntimeError):
@@ -150,6 +177,30 @@ def _validate_tempo_analysis_result(payload: Any) -> Tuple[bool, str]:
     candidates = tempo_payload.get("candidates")
     if candidates is None or not isinstance(candidates, list):
         return False, "tempo_candidates_missing"
+    return True, "ok"
+
+
+def _validate_chord_analysis_result(payload: Any) -> Tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "chord_result_not_dict"
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        return False, "chord_segments_missing"
+    if len(segments) == 0:
+        return False, "chord_segments_empty"
+    valid_count = 0
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        if not isinstance(segment.get("label"), str):
+            continue
+        if not isinstance(segment.get("startMs"), (int, float)):
+            continue
+        if not isinstance(segment.get("endMs"), (int, float)):
+            continue
+        valid_count += 1
+    if valid_count == 0:
+        return False, "chord_segments_invalid"
     return True, "ok"
 
 
@@ -369,7 +420,7 @@ def estimate_key_from_chroma(chroma_mean: "List[float]") -> Tuple[str, float]:
     return top1_label, margin
 
 
-def extract_chord_segments_from_chroma(
+def extract_chord_segments_from_chroma_legacy(
     chroma: "List[List[float]]",
     sr: int,
     hop_length: int,
@@ -512,6 +563,299 @@ def extract_chord_segments_from_chroma(
         low_conf_ratio = low_conf_count / len(compact)
     if low_conf_ratio > 0.35:
         warnings.append("和弦结果中低置信度片段较多，建议人工复核")
+
+    return compact, warnings
+
+
+def _build_enhanced_chord_templates(np_module: Any) -> List[Dict[str, Any]]:
+    templates: List[Dict[str, Any]] = []
+    for root_pc, note in enumerate(ANALYSIS_NOTE_NAMES):
+        for spec in CHORD_TEMPLATE_DEFINITIONS:
+            suffix = str(spec["suffix"])
+            intervals = [int(v) for v in spec["intervals"]]
+            weights = [float(v) for v in spec["weights"]]
+            if len(intervals) != len(weights):
+                continue
+            tone_set = {(root_pc + interval) % 12 for interval in intervals}
+            template = np_module.zeros((12,), dtype=np_module.float32)
+            for interval, weight in zip(intervals, weights):
+                template[(root_pc + interval) % 12] = weight
+            template_sum = float(np_module.sum(template))
+            template_norm = template / max(template_sum, 1e-8)
+            templates.append({
+                "label": f"{note}{suffix}",
+                "rootPc": root_pc,
+                "suffix": suffix,
+                "chordType": spec["chordType"],
+                "toneSet": tone_set,
+                "templateNorm": template_norm,
+            })
+    return templates
+
+
+def _score_chord_template(
+    frame_norm: Any,
+    template_spec: Dict[str, Any],
+) -> Tuple[float, float]:
+    tone_set = template_spec["toneSet"]
+    template_norm = template_spec["templateNorm"]
+    root_pc = int(template_spec["rootPc"])
+    suffix = str(template_spec["suffix"])
+    tone_energy = float(sum(float(frame_norm[idx]) for idx in tone_set))
+    non_tone_energy = max(0.0, 1.0 - tone_energy)
+    root_energy = float(frame_norm[root_pc])
+    template_match = float(sum(float(frame_norm[idx]) * float(template_norm[idx]) for idx in range(12)))
+    score = (
+        template_match * 0.62
+        + tone_energy * 0.28
+        + root_energy * 0.10
+        - non_tone_energy * 0.22
+    )
+
+    if suffix in {"7", "maj7", "m7"}:
+        seventh_interval = 11 if suffix == "maj7" else 10
+        seventh_pc = (root_pc + seventh_interval) % 12
+        if float(frame_norm[seventh_pc]) < 0.03:
+            score -= 0.05
+    if suffix in {"9", "maj9", "m9", "add9"}:
+        ninth_pc = (root_pc + 2) % 12
+        if float(frame_norm[ninth_pc]) < 0.03:
+            score -= 0.06
+    if suffix in {"6", "m6", "dim7"}:
+        sixth_pc = (root_pc + 9) % 12
+        if float(frame_norm[sixth_pc]) < 0.03:
+            score -= 0.05
+    if suffix in {"sus2"}:
+        sus2_pc = (root_pc + 2) % 12
+        if float(frame_norm[sus2_pc]) < 0.04:
+            score -= 0.05
+    if suffix == "sus4":
+        sus4_pc = (root_pc + 5) % 12
+        if float(frame_norm[sus4_pc]) < 0.04:
+            score -= 0.05
+    if suffix == "7sus4":
+        sus4_pc = (root_pc + 5) % 12
+        seventh_pc = (root_pc + 10) % 12
+        if float(frame_norm[sus4_pc]) < 0.04:
+            score -= 0.05
+        if float(frame_norm[seventh_pc]) < 0.03:
+            score -= 0.05
+    if suffix in {"dim", "dim7", "m7b5"}:
+        flat5_pc = (root_pc + 6) % 12
+        if float(frame_norm[flat5_pc]) < 0.04:
+            score -= 0.05
+    if suffix == "aug":
+        sharp5_pc = (root_pc + 8) % 12
+        if float(frame_norm[sharp5_pc]) < 0.04:
+            score -= 0.05
+
+    return score, tone_energy
+
+
+def extract_chord_segments_from_chroma_enhanced(
+    chroma: "List[List[float]]",
+    sr: int,
+    hop_length: int,
+) -> Tuple[List[dict], List[str]]:
+    try:
+        import numpy as np  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("numpy is required for chord extraction") from exc
+
+    arr = np.asarray(chroma, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] != 12 or arr.shape[1] == 0:
+        return [], ["和弦特征不足，未生成片段"]
+
+    # Mild temporal smoothing reduces jitter while preserving transitions.
+    if arr.shape[1] >= 3:
+        smoothed = arr.copy()
+        smoothed[:, 1:-1] = (arr[:, :-2] + arr[:, 1:-1] + arr[:, 2:]) / 3.0
+        arr = smoothed
+
+    templates = _build_enhanced_chord_templates(np)
+    labels: List[str] = []
+    confidences: List[float] = []
+    frame_candidates: List[List[Dict[str, Any]]] = []
+    ambiguous_frame_count = 0
+
+    for frame_idx in range(arr.shape[1]):
+        frame = arr[:, frame_idx]
+        energy = float(np.sum(frame))
+        if energy <= 1e-8:
+            labels.append("N")
+            confidences.append(0.0)
+            frame_candidates.append([])
+            continue
+        frame_norm = frame / energy
+        bass_pc = int(np.argmax(frame))
+
+        scored: List[Tuple[Dict[str, Any], float, float]] = []
+        for template in templates:
+            score, tone_energy = _score_chord_template(frame_norm, template)
+            scored.append((template, score, tone_energy))
+        scored.sort(key=lambda item: item[1], reverse=True)
+
+        best_tpl, best_score, best_tone_energy = scored[0]
+        near_best = [
+            item for item in scored
+            if (best_score - item[1]) <= CHORD_ROOT_TIE_MARGIN
+        ]
+        if len(near_best) > 1:
+            near_best.sort(
+                key=lambda item: (
+                    1 if int(item[0]["rootPc"]) == bass_pc else 0,
+                    item[1],
+                ),
+                reverse=True,
+            )
+            best_tpl, best_score, best_tone_energy = near_best[0]
+
+        second_score = next(
+            (item[1] for item in scored if item[0] is not best_tpl),
+            -1.0,
+        )
+        third_score = scored[2][1] if len(scored) > 2 else second_score
+        if best_score < CHORD_FRAME_SCORE_MIN:
+            labels.append("N")
+            confidences.append(0.0)
+            frame_candidates.append([])
+            continue
+
+        margin = max(0.0, best_score - second_score)
+        margin_norm = margin / max(abs(best_score), 1e-8)
+        conf = max(0.0, min(1.0, 0.14 + 0.54 * margin_norm + 0.32 * best_tone_energy))
+        if margin_norm < 0.12:
+            ambiguous_frame_count += 1
+
+        best_label = str(best_tpl["label"])
+        root_pc = int(best_tpl["rootPc"])
+        bass_ratio = float(frame_norm[bass_pc]) / max(float(frame_norm[root_pc]), 1e-8)
+        if (
+            bass_pc != root_pc
+            and bass_pc in best_tpl["toneSet"]
+            and float(frame_norm[bass_pc]) >= 0.10
+            and bass_ratio >= CHORD_BASS_SLASH_RATIO
+        ):
+            best_label = f"{best_label}/{ANALYSIS_NOTE_NAMES[bass_pc]}"
+
+        labels.append(best_label)
+        confidences.append(conf)
+
+        top_candidates: List[Dict[str, Any]] = []
+        for template, score, _tone_energy in scored[:4]:
+            rel = max(0.0, score - third_score)
+            rel_norm = rel / max(abs(best_score - third_score), 1e-8)
+            candidate_conf = max(0.05, min(1.0, conf * (0.55 + 0.45 * rel_norm)))
+            top_candidates.append({
+                "label": str(template["label"]),
+                "confidence": candidate_conf,
+                "method": "template_rank",
+            })
+        frame_candidates.append(top_candidates)
+
+    frame_ms = (hop_length / max(sr, 1)) * 1000.0
+    segments: List[dict] = []
+    start_idx = 0
+    current = labels[0]
+
+    def append_segment(seg_label: str, seg_start: int, seg_end: int) -> None:
+        if seg_end <= seg_start:
+            return
+        start_ms = int(round(seg_start * frame_ms))
+        end_ms = int(round(seg_end * frame_ms))
+        mean_conf = float(sum(confidences[seg_start:seg_end]) / max(seg_end - seg_start, 1))
+
+        candidate_scores: Dict[str, float] = {}
+        candidate_counts: Dict[str, int] = {}
+        for bucket in frame_candidates[seg_start:seg_end]:
+            for candidate in bucket:
+                label = str(candidate.get("label", "")).strip()
+                if not label:
+                    continue
+                confidence = float(candidate.get("confidence", 0.0))
+                candidate_scores[label] = candidate_scores.get(label, 0.0) + confidence
+                candidate_counts[label] = candidate_counts.get(label, 0) + 1
+        candidate_hints: List[Dict[str, Any]] = []
+        for label, score_sum in candidate_scores.items():
+            count = max(candidate_counts.get(label, 1), 1)
+            candidate_hints.append({
+                "label": label,
+                "confidence": max(0.0, min(1.0, score_sum / count)),
+                "method": "template_rank",
+            })
+        candidate_hints.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+
+        segments.append({
+            "startMs": max(0, start_ms),
+            "endMs": max(0, end_ms),
+            "label": seg_label,
+            "simplifiedLabel": seg_label.split("/", 1)[0],
+            "confidence": max(0.0, min(1.0, mean_conf)),
+            "sourceFlags": ["mixed"],
+            "candidateHints": candidate_hints[:4],
+        })
+
+    for idx in range(1, len(labels)):
+        if labels[idx] != current:
+            append_segment(current, start_idx, idx)
+            start_idx = idx
+            current = labels[idx]
+    append_segment(current, start_idx, len(labels))
+
+    smoothed: List[dict] = []
+    i = 0
+    while i < len(segments):
+        if i == 0 or i >= len(segments) - 1:
+            smoothed.append(segments[i])
+            i += 1
+            continue
+        prev_seg = smoothed[-1]
+        curr_seg = segments[i]
+        next_seg = segments[i + 1]
+        curr_duration = curr_seg["endMs"] - curr_seg["startMs"]
+        curr_conf = float(curr_seg.get("confidence", 0.0))
+        if (
+            curr_duration <= CHORD_MERGE_THRESHOLD_MS
+            and curr_conf <= CHORD_DEJITTER_CONFIDENCE_MAX
+            and prev_seg["label"] == next_seg["label"]
+        ):
+            prev_seg["endMs"] = next_seg["endMs"]
+            prev_seg["confidence"] = max(
+                float(prev_seg.get("confidence", 0.0)),
+                curr_conf,
+                float(next_seg.get("confidence", 0.0)),
+            )
+            i += 2
+            continue
+        smoothed.append(curr_seg)
+        i += 1
+
+    compact: List[dict] = []
+    for seg in smoothed:
+        duration = seg["endMs"] - seg["startMs"]
+        if (
+            compact
+            and duration < CHORD_MIN_SEGMENT_MS
+            and float(seg.get("confidence", 0.0)) <= CHORD_SHORT_SEGMENT_CONFIDENCE_MAX
+        ):
+            compact[-1]["endMs"] = seg["endMs"]
+            compact[-1]["confidence"] = max(
+                float(compact[-1].get("confidence", 0.0)),
+                float(seg.get("confidence", 0.0)),
+            )
+            continue
+        compact.append(seg)
+
+    warnings: List[str] = []
+    if compact:
+        low_conf_count = sum(1 for seg in compact if float(seg.get("confidence", 0.0)) < 0.2)
+        low_conf_ratio = low_conf_count / len(compact)
+        if low_conf_ratio > 0.32:
+            warnings.append("和弦结果中低置信度片段较多，建议人工复核")
+    if len(labels) > 0:
+        ambiguous_ratio = ambiguous_frame_count / len(labels)
+        if ambiguous_ratio > 0.28:
+            warnings.append("复杂和弦候选分歧较大，建议关注 candidates 字段")
 
     return compact, warnings
 
@@ -700,6 +1044,146 @@ def infer_chord_metadata_from_label(label: str) -> Dict[str, Any]:
     }
 
 
+def infer_chord_metadata_from_label_v2(label: str) -> Dict[str, Any]:
+    normalized = (label or "").strip()
+    if not normalized or normalized == "N":
+        return {
+            "symbol": normalized or "N",
+            "chordType": "no_chord",
+            "bassNote": None,
+            "extensions": [],
+            "alterations": [],
+            "omissions": [],
+            "vocabularyTag": "extended_v2.1",
+        }
+
+    parts = normalized.split("/", 1)
+    symbol = parts[0].strip()
+    bass = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+    lowered = symbol.lower()
+
+    chord_type = "major"
+    if "m7b5" in lowered or "ø" in lowered:
+        chord_type = "half_diminished"
+    elif "7sus" in lowered:
+        chord_type = "suspended7"
+    elif "sus" in lowered:
+        chord_type = "suspended"
+    elif "add" in lowered:
+        chord_type = "added_tone"
+    elif "maj9" in lowered:
+        chord_type = "major9"
+    elif "m9" in lowered or "min9" in lowered:
+        chord_type = "minor9"
+    elif "9" in lowered:
+        chord_type = "dominant9"
+    elif "maj7" in lowered:
+        chord_type = "major7"
+    elif "dim7" in lowered:
+        chord_type = "diminished7"
+    elif "m7" in lowered or "min7" in lowered:
+        chord_type = "minor7"
+    elif "dim" in lowered:
+        chord_type = "diminished"
+    elif "aug" in lowered:
+        chord_type = "augmented"
+    elif re.search(r"(^|[^a-z])m6($|[^0-9a-z])", lowered):
+        chord_type = "minor6"
+    elif re.search(r"(^|[^a-z])6($|[^0-9a-z])", lowered):
+        chord_type = "major6"
+    elif "7" in lowered:
+        chord_type = "dominant7"
+    elif lowered.endswith("m") and "maj" not in lowered:
+        chord_type = "minor"
+
+    extension_tokens = re.findall(r"(?:add|maj)?(6|7|9|11|13)", lowered)
+    extensions = sorted(set(extension_tokens), key=lambda token: int(token))
+    alterations = sorted(set(re.findall(r"([#b](?:5|9|11|13))", lowered)))
+    omission_numbers = re.findall(r"(?:omit|no)(3|5|7|9|11|13)", lowered)
+    omissions = [f"no{token}" for token in sorted(set(omission_numbers), key=lambda token: int(token))]
+
+    return {
+        "symbol": normalized,
+        "chordType": chord_type,
+        "bassNote": bass,
+        "extensions": extensions,
+        "alterations": alterations,
+        "omissions": omissions,
+        "vocabularyTag": "extended_v2.1",
+    }
+
+
+def build_chord_candidates_v2(
+    label: str,
+    confidence: Optional[float],
+    analyzer_id: str,
+    template_hints: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    normalized = (label or "").strip()
+    candidates: List[Dict[str, Any]] = []
+    if not normalized:
+        return candidates
+
+    base_conf = confidence if confidence is not None else 0.45
+    candidates.append({
+        "label": normalized,
+        "confidence": max(0.0, min(1.0, base_conf)),
+        "method": analyzer_id,
+    })
+
+    if "/" in normalized:
+        slashless = normalized.split("/", 1)[0].strip()
+        if slashless and slashless != normalized:
+            candidates.append({
+                "label": slashless,
+                "confidence": max(0.0, min(1.0, base_conf * 0.92)),
+                "method": analyzer_id,
+            })
+
+    root_match = re.match(r"^([A-G](?:#|b)?)(.*)$", normalized)
+    if root_match:
+        root = root_match.group(1)
+        suffix = root_match.group(2)
+        if "sus" in suffix.lower():
+            fallback = f"{root}"
+            if fallback != normalized:
+                candidates.append({
+                    "label": fallback,
+                    "confidence": max(0.0, min(1.0, base_conf * 0.86)),
+                    "method": analyzer_id,
+                })
+
+    if template_hints:
+        for hint in template_hints:
+            if not isinstance(hint, dict):
+                continue
+            hint_label = str(hint.get("label", "")).strip()
+            if not hint_label:
+                continue
+            hint_conf_raw = hint.get("confidence")
+            hint_conf = (
+                float(hint_conf_raw)
+                if isinstance(hint_conf_raw, (int, float))
+                else max(0.05, min(1.0, base_conf * 0.82))
+            )
+            hint_method = str(hint.get("method", "")).strip() or analyzer_id
+            candidates.append({
+                "label": hint_label,
+                "confidence": max(0.0, min(1.0, hint_conf)),
+                "method": hint_method,
+            })
+
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for candidate in candidates:
+        key = str(candidate.get("label", "")).strip()
+        if not key:
+            continue
+        prev = dedup.get(key)
+        if prev is None or float(candidate.get("confidence", 0.0)) > float(prev.get("confidence", 0.0)):
+            dedup[key] = candidate
+    return list(dedup.values())
+
+
 class ChordAnalyzer(Protocol):
     analyzer_id: str
     analyzer_type: str
@@ -730,8 +1214,8 @@ class TempoAnalyzer(Protocol):
         ...
 
 
-class DefaultChordAnalyzer:
-    analyzer_id = DEFAULT_CHORD_ANALYZER_ID
+class LegacyChordAnalyzer:
+    analyzer_id = LEGACY_CHORD_ANALYZER_ID
     analyzer_type = "rule_based"
     runtime_profile_id = DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID
     analysis_version = "chord-v1"
@@ -755,7 +1239,7 @@ class DefaultChordAnalyzer:
         sr: int,
         hop_length: int,
     ) -> Dict[str, Any]:
-        segments, warnings = extract_chord_segments_from_chroma(chroma, sr, hop_length)
+        segments, warnings = extract_chord_segments_from_chroma_legacy(chroma, sr, hop_length)
         enriched_segments: List[Dict[str, Any]] = []
         for segment in segments:
             label = str(segment.get("label", "N"))
@@ -873,6 +1357,84 @@ class LegacyTempoAnalyzer:
         }
 
 
+class PilotChordAnalyzer:
+    analyzer_id = PILOT_CHORD_ANALYZER_ID
+    analyzer_type = "rule_based"
+    runtime_profile_id = DEFAULT_ANALYSIS_RUNTIME_PROFILE_ID
+    analysis_version = "chord-v2.2-pilot"
+    vocabulary_version = "extended-v2.1"
+    selected_vocabulary = "extended"
+    supports_extended_chords = True
+    supported_descriptors = [
+        "major",
+        "minor",
+        "dominant7",
+        "major7",
+        "minor7",
+        "major6",
+        "minor6",
+        "half_diminished",
+        "diminished",
+        "diminished7",
+        "augmented",
+        "major9",
+        "minor9",
+        "add9",
+        "sus2",
+        "sus4",
+        "suspended7",
+        "slash",
+        "altered",
+        "omitted",
+    ]
+
+    def analyze(
+        self,
+        *,
+        chroma: List[List[float]],
+        sr: int,
+        hop_length: int,
+    ) -> Dict[str, Any]:
+        segments, warnings = extract_chord_segments_from_chroma_enhanced(chroma, sr, hop_length)
+        enriched_segments: List[Dict[str, Any]] = []
+        for segment in segments:
+            label = str(segment.get("label", "N"))
+            confidence_raw = segment.get("confidence")
+            confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else None
+            template_hints = segment.get("candidateHints")
+            metadata = infer_chord_metadata_from_label_v2(label)
+            enriched: Dict[str, Any] = {
+                **segment,
+                "symbol": metadata["symbol"],
+                "chordType": metadata["chordType"],
+                "bassNote": metadata["bassNote"],
+                "extensions": metadata["extensions"],
+                "alterations": metadata["alterations"],
+                "omissions": metadata["omissions"],
+                "method": self.analyzer_id,
+                "vocabularyTag": metadata["vocabularyTag"],
+                "candidates": build_chord_candidates_v2(
+                    label,
+                    confidence,
+                    self.analyzer_id,
+                    template_hints=template_hints if isinstance(template_hints, list) else None,
+                ),
+            }
+            enriched_segments.append(enriched)
+
+        return {
+            "segments": enriched_segments,
+            "warnings": warnings,
+            "analysisVersion": self.analysis_version,
+            "vocabularyVersion": self.vocabulary_version,
+            "chordVocabulary": {
+                "selected": self.selected_vocabulary,
+                "supportsExtendedChords": self.supports_extended_chords,
+                "supportedDescriptors": self.supported_descriptors,
+            },
+        }
+
+
 class PilotTempoAnalyzer:
     analyzer_id = PILOT_TEMPO_ANALYZER_ID
     analyzer_type = "rule_based"
@@ -966,7 +1528,8 @@ class PilotTempoAnalyzer:
 
 
 CHORD_ANALYZER_REGISTRY: Dict[str, ChordAnalyzer] = {
-    DEFAULT_CHORD_ANALYZER_ID: DefaultChordAnalyzer(),
+    LEGACY_CHORD_ANALYZER_ID: LegacyChordAnalyzer(),
+    PILOT_CHORD_ANALYZER_ID: PilotChordAnalyzer(),
 }
 
 TEMPO_ANALYZER_REGISTRY: Dict[str, TempoAnalyzer] = {
@@ -1391,6 +1954,16 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
             sr=sr,
             hop_length=hop_length,
         )
+        chord_result_valid, chord_result_reason = _validate_chord_analysis_result(chord_result)
+        if not chord_result_valid:
+            send_response(request_id, False, error={
+                "code": "ANALYSIS_CHORD_RESULT_EMPTY",
+                "message": (
+                    f"Chord analyzer returned invalid/empty payload: analyzer={chord_analyzer.analyzer_id}, "
+                    f"runtime_profile={chord_runtime.actual_profile_id}, reason={chord_result_reason}"
+                ),
+            })
+            return
         segments = chord_result.get("segments", [])
         warnings.extend(chord_result.get("warnings", []))
 
