@@ -182,6 +182,14 @@ const ORCH_GUITAR_SPECIALIST_SUPPORTED_MODEL_IDS = new Set([
 ]);
 const ORCH_GUITAR_SPECIALIST_COMMAND_ENV = 'ORCH_GUITAR_SPECIALIST_CMD';
 const ORCH_GUITAR_SPECIALIST_CHECKPOINT_ENV = 'ORCH_GUITAR_SPECIALIST_CHECKPOINT';
+const ORCH_PIANO_SPECIALIST_DEFAULT_MODEL_ID = 'mel_roformer_piano';
+const ORCH_PIANO_SPECIALIST_DEFAULT_RUNTIME_PROFILE_ID = PILOT_RUNTIME_PROFILE_ID;
+const ORCH_PIANO_SPECIALIST_SUPPORTED_MODEL_IDS = new Set([
+  'mel_roformer_piano',
+  'bs_roformer_sw_piano',
+]);
+const ORCH_PIANO_SPECIALIST_COMMAND_ENV = 'ORCH_PIANO_SPECIALIST_CMD';
+const ORCH_PIANO_SPECIALIST_CHECKPOINT_ENV = 'ORCH_PIANO_SPECIALIST_CHECKPOINT';
 const ORCH_RESULT_SET_PREFIX = 'orch_6s_';
 const ORCH_RESULT_MODEL_ID = 'orchestrated_6s';
 const ORCH_RESULT_RUNTIME_PROFILE_ID = 'orchestrator_main';
@@ -192,6 +200,7 @@ type ActiveResultContext = {
   fallbackReason: string | null;
   sourceSignature: string | null;
   resultSets: ProjectManifestResultSetEntry[];
+  allResultSets: ProjectManifestResultSetEntry[];
   modelId: string | null;
   runtimeProfileId: string | null;
 };
@@ -218,6 +227,128 @@ function resolveOrchResultSetRole(resultSetId: string | null | undefined): OrchR
   if (lower.includes('__base_6s') || lower.includes('base6s')) return 'baseline_pass';
   if (lower.includes('__guitar_specialist') || lower.includes('__piano_specialist')) return 'specialist_pass';
   return 'final_orchestrated';
+}
+
+function isInternalOrchIntermediateResultSet(resultSetId: string): boolean {
+  const role = resolveOrchResultSetRole(resultSetId);
+  return role === 'baseline_pass' || role === 'specialist_pass';
+}
+
+type PersistedSpecialistConfigEntry = {
+  enabled?: boolean;
+  modelId?: string;
+  runtimeProfileId?: string;
+  cmd?: string;
+  checkpoint?: string;
+  healthStatus?: string;
+};
+
+type SpecialistConfigSource = 'env' | 'persisted' | 'default';
+
+type PersistedOrchestrationSpecialistConfig = {
+  version: number;
+  updatedAt: number;
+  guitar?: PersistedSpecialistConfigEntry;
+  piano?: PersistedSpecialistConfigEntry;
+};
+
+function getOrchestrationSpecialistConfigPath(): string {
+  return path.join(app.getPath('userData'), 'orchestration-specialists.json');
+}
+
+function readPersistedOrchestrationSpecialistConfig(): PersistedOrchestrationSpecialistConfig | null {
+  const configPath = getOrchestrationSpecialistConfigPath();
+  try {
+    if (!fs.existsSync(configPath)) return null;
+    const raw = fs.readFileSync(configPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!isObjectLike(parsed)) return null;
+    return {
+      version: typeof parsed.version === 'number' ? parsed.version : 1,
+      updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
+      guitar: isObjectLike(parsed.guitar) ? parsed.guitar as PersistedSpecialistConfigEntry : undefined,
+      piano: isObjectLike(parsed.piano) ? parsed.piano as PersistedSpecialistConfigEntry : undefined,
+    };
+  } catch (error) {
+    console.warn(`[orchestration-config] read failed path="${configPath}" reason="${normalizeErrorMessage(error, 'unknown')}"`);
+    return null;
+  }
+}
+
+function writePersistedOrchestrationSpecialistConfig(config: PersistedOrchestrationSpecialistConfig): void {
+  const configPath = getOrchestrationSpecialistConfigPath();
+  try {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  } catch (error) {
+    console.warn(`[orchestration-config] write failed path="${configPath}" reason="${normalizeErrorMessage(error, 'unknown')}"`);
+  }
+}
+
+function resolveStringWithEnvFallback(
+  envKey: string,
+  persistedValue: string | undefined,
+  fallback: string,
+): string {
+  const fromEnv = process.env[envKey];
+  if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
+    return fromEnv.trim();
+  }
+  const fromPersisted = typeof persistedValue === 'string' ? persistedValue.trim() : '';
+  if (fromPersisted.length > 0) return fromPersisted;
+  return fallback;
+}
+
+function resolveBooleanWithEnvFallback(
+  envKey: string,
+  persistedValue: boolean | undefined,
+  fallback: boolean,
+): boolean {
+  const fromEnv = process.env[envKey];
+  if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
+    return isTruthyEnv(fromEnv);
+  }
+  if (typeof persistedValue === 'boolean') return persistedValue;
+  return fallback;
+}
+
+function hasEnvValue(key: string): boolean {
+  const value = process.env[key];
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function resolveSpecialistConfigSource(
+  envKeys: string[],
+  persistedEntry: PersistedSpecialistConfigEntry | undefined,
+): SpecialistConfigSource {
+  if (envKeys.some((key) => hasEnvValue(key))) return 'env';
+  if (
+    persistedEntry
+    && (
+      typeof persistedEntry.enabled === 'boolean'
+      || typeof persistedEntry.modelId === 'string'
+      || typeof persistedEntry.runtimeProfileId === 'string'
+      || typeof persistedEntry.cmd === 'string'
+      || typeof persistedEntry.checkpoint === 'string'
+      || typeof persistedEntry.healthStatus === 'string'
+    )
+  ) {
+    return 'persisted';
+  }
+  return 'default';
+}
+
+function applySpecialistRuntimeEnv(envKey: string, value: string): void {
+  const normalized = value.trim();
+  if (normalized.length > 0) {
+    process.env[envKey] = normalized;
+  }
+}
+
+function maskCheckpointForDebug(checkpointPath: string): string | null {
+  const normalized = checkpointPath.trim();
+  if (normalized.length === 0) return null;
+  return path.basename(normalized);
 }
 
 type PilotRuntimePreflightResult = {
@@ -774,21 +905,183 @@ function applyGuitarSpecialistCheckpointHealth(
   return healthStatus;
 }
 
-function resolveOrchestrationSpecialists(): SpecialistDescriptor[] {
-  const guitarEnabled = isTruthyEnv(process.env.ORCH_GUITAR_SPECIALIST_ENABLED);
+function resolvePianoSpecialistHealthStatus(runtimeProfileId: string): SpecialistHealthStatus {
+  const preflight = checkPilotRuntimeProfileAvailability();
+  if (runtimeProfileId === PILOT_RUNTIME_PROFILE_ID && !preflight.configured) {
+    return 'unavailable';
+  }
+  return normalizeSpecialistHealthStatus(process.env.ORCH_PIANO_SPECIALIST_HEALTH_STATUS);
+}
+
+function resolvePianoSpecialistRequiredEnv(
+  pianoEnabled: boolean,
+  pianoModelId: string,
+  runtimeProfileId: string,
+): string[] {
+  if (!pianoEnabled) {
+    return ['ORCH_PIANO_SPECIALIST_ENABLED'];
+  }
+  if (!ORCH_PIANO_SPECIALIST_SUPPORTED_MODEL_IDS.has(pianoModelId)) {
+    return ['ORCH_PIANO_SPECIALIST_MODEL_ID'];
+  }
+  const required = [ORCH_PIANO_SPECIALIST_COMMAND_ENV, ORCH_PIANO_SPECIALIST_CHECKPOINT_ENV];
+  if (runtimeProfileId === PILOT_RUNTIME_PROFILE_ID) {
+    required.push('DEMUCS_6S_PILOT_PYTHON_EXE');
+  }
+  return required;
+}
+
+function applyPianoSpecialistCheckpointHealth(
+  healthStatus: SpecialistHealthStatus,
+  checkpointPath: string,
+): SpecialistHealthStatus {
+  if (!checkpointPath) return healthStatus;
+  const resolvedCheckpoint = path.isAbsolute(checkpointPath)
+    ? checkpointPath
+    : path.resolve(checkpointPath);
+  if (!fs.existsSync(resolvedCheckpoint)) {
+    return 'failed';
+  }
+  try {
+    const stat = fs.statSync(resolvedCheckpoint);
+    if (!stat.isFile()) {
+      return 'failed';
+    }
+  } catch {
+    return 'failed';
+  }
+  return healthStatus;
+}
+
+type ResolvedSpecialistConfig = {
+  enabled: boolean;
+  modelId: string;
+  runtimeProfileId: string;
+  cmd: string;
+  checkpoint: string;
+  healthStatus: SpecialistHealthStatus;
+  configSource: SpecialistConfigSource;
+  missingFields: string[];
+  blocker: string | null;
+};
+
+type ResolvedOrchestrationSpecialists = {
+  specialists: SpecialistDescriptor[];
+  configSnapshot: {
+    guitar: ResolvedSpecialistConfig;
+    piano: ResolvedSpecialistConfig;
+  };
+};
+
+type OrchestrationRunConfigSnapshot = {
+  guitarEnabled: boolean;
+  guitarModelId: string | null;
+  guitarRuntimeProfileId: string | null;
+  guitarSelectionStatus: SpecialistStatus;
+  guitarCheckpoint: string | null;
+  guitarConfigSource: SpecialistConfigSource;
+  guitarMissingFields: string[];
+  guitarBlocker: string | null;
+  pianoEnabled: boolean;
+  pianoModelId: string | null;
+  pianoRuntimeProfileId: string | null;
+  pianoSelectionStatus: SpecialistStatus;
+  pianoCheckpoint: string | null;
+  pianoConfigSource: SpecialistConfigSource;
+  pianoMissingFields: string[];
+  pianoBlocker: string | null;
+};
+
+function buildSpecialistMissingFields(
+  enabled: boolean,
+  modelId: string,
+  runtimeProfileId: string,
+  cmd: string,
+  checkpoint: string,
+): string[] {
+  const missingFields: string[] = [];
+  if (!enabled) {
+    missingFields.push('enabled');
+    return missingFields;
+  }
+  if (!modelId.trim()) missingFields.push('modelId');
+  if (!runtimeProfileId.trim()) missingFields.push('runtimeProfileId');
+  if (!cmd.trim()) missingFields.push('cmd');
+  if (!checkpoint.trim()) missingFields.push('checkpoint');
+  return missingFields;
+}
+
+function buildSpecialistBlocker(
+  enabled: boolean,
+  missingFields: string[],
+  healthStatus: SpecialistHealthStatus,
+): string | null {
+  if (!enabled) return 'specialist disabled';
+  if (missingFields.length > 0) return 'required fields missing';
+  if (healthStatus === 'unavailable') return 'runtime unavailable';
+  if (healthStatus === 'failed') return 'health check failed';
+  return null;
+}
+
+function resolveOrchestrationSpecialists(): ResolvedOrchestrationSpecialists {
+  const persisted = readPersistedOrchestrationSpecialistConfig();
+  const guitarPersisted = persisted?.guitar;
+  const pianoPersisted = persisted?.piano;
+  const guitarConfigSource = resolveSpecialistConfigSource([
+    'ORCH_GUITAR_SPECIALIST_ENABLED',
+    'ORCH_GUITAR_SPECIALIST_MODEL_ID',
+    'ORCH_GUITAR_SPECIALIST_RUNTIME_PROFILE_ID',
+    ORCH_GUITAR_SPECIALIST_COMMAND_ENV,
+    ORCH_GUITAR_SPECIALIST_CHECKPOINT_ENV,
+  ], guitarPersisted);
+  const pianoConfigSource = resolveSpecialistConfigSource([
+    'ORCH_PIANO_SPECIALIST_ENABLED',
+    'ORCH_PIANO_SPECIALIST_MODEL_ID',
+    'ORCH_PIANO_SPECIALIST_RUNTIME_PROFILE_ID',
+    ORCH_PIANO_SPECIALIST_COMMAND_ENV,
+    ORCH_PIANO_SPECIALIST_CHECKPOINT_ENV,
+  ], pianoPersisted);
+
+  const guitarEnabled = resolveBooleanWithEnvFallback('ORCH_GUITAR_SPECIALIST_ENABLED', guitarPersisted?.enabled, false);
   const guitarModelId = guitarEnabled
-    ? (process.env.ORCH_GUITAR_SPECIALIST_MODEL_ID?.trim() || ORCH_GUITAR_SPECIALIST_DEFAULT_MODEL_ID)
+    ? resolveStringWithEnvFallback('ORCH_GUITAR_SPECIALIST_MODEL_ID', guitarPersisted?.modelId, ORCH_GUITAR_SPECIALIST_DEFAULT_MODEL_ID)
     : '';
   const guitarRuntimeProfileId = guitarEnabled
-    ? (process.env.ORCH_GUITAR_SPECIALIST_RUNTIME_PROFILE_ID?.trim() || ORCH_GUITAR_SPECIALIST_DEFAULT_RUNTIME_PROFILE_ID)
+    ? resolveStringWithEnvFallback(
+      'ORCH_GUITAR_SPECIALIST_RUNTIME_PROFILE_ID',
+      guitarPersisted?.runtimeProfileId,
+      ORCH_GUITAR_SPECIALIST_DEFAULT_RUNTIME_PROFILE_ID,
+    )
     : '';
-  const guitarCheckpointPath = process.env.ORCH_GUITAR_SPECIALIST_CHECKPOINT?.trim() ?? '';
+  const guitarCmd = guitarEnabled
+    ? resolveStringWithEnvFallback(ORCH_GUITAR_SPECIALIST_COMMAND_ENV, guitarPersisted?.cmd, '')
+    : '';
+  const guitarCheckpointPath = guitarEnabled
+    ? resolveStringWithEnvFallback(ORCH_GUITAR_SPECIALIST_CHECKPOINT_ENV, guitarPersisted?.checkpoint, '')
+    : '';
+  const guitarHealthRaw = guitarEnabled
+    ? resolveStringWithEnvFallback('ORCH_GUITAR_SPECIALIST_HEALTH_STATUS', guitarPersisted?.healthStatus, '')
+    : '';
+  if (guitarCmd) applySpecialistRuntimeEnv(ORCH_GUITAR_SPECIALIST_COMMAND_ENV, guitarCmd);
+  if (guitarCheckpointPath) applySpecialistRuntimeEnv(ORCH_GUITAR_SPECIALIST_CHECKPOINT_ENV, guitarCheckpointPath);
   const guitarHealthStatus = guitarEnabled
     ? resolveGuitarSpecialistHealthStatus(guitarRuntimeProfileId)
     : 'unknown';
   const guitarHealthStatusWithCheckpoint = applyGuitarSpecialistCheckpointHealth(
     guitarHealthStatus,
     guitarCheckpointPath,
+  );
+  const guitarMissingFields = buildSpecialistMissingFields(
+    guitarEnabled,
+    guitarModelId,
+    guitarRuntimeProfileId,
+    guitarCmd,
+    guitarCheckpointPath,
+  );
+  const guitarBlocker = buildSpecialistBlocker(
+    guitarEnabled,
+    guitarMissingFields,
+    guitarHealthStatusWithCheckpoint,
   );
   const guitarRequiredEnv = resolveGuitarSpecialistRequiredEnv(
     guitarEnabled,
@@ -798,35 +1091,158 @@ function resolveOrchestrationSpecialists(): SpecialistDescriptor[] {
   console.log(
     `[REAL_CHAIN] handlers.resolveOrchestrationSpecialists guitar enabled=${guitarEnabled} ` +
     `modelId="${guitarModelId || 'none'}" runtimeProfileId="${guitarRuntimeProfileId || 'none'}" ` +
-    `healthStatus="${guitarHealthStatusWithCheckpoint}" cmdConfigured=${Boolean(process.env.ORCH_GUITAR_SPECIALIST_CMD?.trim())} ` +
+    `healthStatus="${guitarHealthRaw || guitarHealthStatusWithCheckpoint}" cmdConfigured=${Boolean(guitarCmd)} ` +
     `checkpoint="${guitarCheckpointPath || 'none'}"`,
   );
 
-  const pianoModelId = process.env.ORCH_PIANO_SPECIALIST_MODEL_ID?.trim() ?? '';
-  const pianoRuntimeProfileId = process.env.ORCH_PIANO_SPECIALIST_RUNTIME_PROFILE_ID?.trim() ?? '';
+  const pianoEnabled = resolveBooleanWithEnvFallback('ORCH_PIANO_SPECIALIST_ENABLED', pianoPersisted?.enabled, false);
+  const pianoModelId = pianoEnabled
+    ? resolveStringWithEnvFallback('ORCH_PIANO_SPECIALIST_MODEL_ID', pianoPersisted?.modelId, ORCH_PIANO_SPECIALIST_DEFAULT_MODEL_ID)
+    : '';
+  const pianoRuntimeProfileId = pianoEnabled
+    ? resolveStringWithEnvFallback(
+      'ORCH_PIANO_SPECIALIST_RUNTIME_PROFILE_ID',
+      pianoPersisted?.runtimeProfileId,
+      ORCH_PIANO_SPECIALIST_DEFAULT_RUNTIME_PROFILE_ID,
+    )
+    : '';
+  const pianoCmd = pianoEnabled
+    ? resolveStringWithEnvFallback(ORCH_PIANO_SPECIALIST_COMMAND_ENV, pianoPersisted?.cmd, '')
+    : '';
+  const pianoCheckpointPath = pianoEnabled
+    ? resolveStringWithEnvFallback(ORCH_PIANO_SPECIALIST_CHECKPOINT_ENV, pianoPersisted?.checkpoint, '')
+    : '';
+  const pianoHealthRaw = pianoEnabled
+    ? resolveStringWithEnvFallback('ORCH_PIANO_SPECIALIST_HEALTH_STATUS', pianoPersisted?.healthStatus, '')
+    : '';
+  if (pianoCmd) applySpecialistRuntimeEnv(ORCH_PIANO_SPECIALIST_COMMAND_ENV, pianoCmd);
+  if (pianoCheckpointPath) applySpecialistRuntimeEnv(ORCH_PIANO_SPECIALIST_CHECKPOINT_ENV, pianoCheckpointPath);
+  const pianoHealthStatus = pianoEnabled
+    ? resolvePianoSpecialistHealthStatus(pianoRuntimeProfileId)
+    : 'unknown';
+  const pianoHealthStatusWithCheckpoint = applyPianoSpecialistCheckpointHealth(
+    pianoHealthStatus,
+    pianoCheckpointPath,
+  );
+  const pianoMissingFields = buildSpecialistMissingFields(
+    pianoEnabled,
+    pianoModelId,
+    pianoRuntimeProfileId,
+    pianoCmd,
+    pianoCheckpointPath,
+  );
+  const pianoBlocker = buildSpecialistBlocker(
+    pianoEnabled,
+    pianoMissingFields,
+    pianoHealthStatusWithCheckpoint,
+  );
+  const pianoRequiredEnv = resolvePianoSpecialistRequiredEnv(
+    pianoEnabled,
+    pianoModelId,
+    pianoRuntimeProfileId,
+  );
+  console.log(
+    `[REAL_CHAIN] handlers.resolveOrchestrationSpecialists piano enabled=${pianoEnabled} ` +
+    `modelId="${pianoModelId || 'none'}" runtimeProfileId="${pianoRuntimeProfileId || 'none'}" ` +
+    `healthStatus="${pianoHealthRaw || pianoHealthStatusWithCheckpoint}" cmdConfigured=${Boolean(pianoCmd)} ` +
+    `checkpoint="${pianoCheckpointPath || 'none'}"`,
+  );
 
-  return [
-    {
-      specialistId: 'guitar_specialist',
-      targetStem: StemType.Guitar,
+  writePersistedOrchestrationSpecialistConfig({
+    version: 1,
+    updatedAt: Date.now(),
+    guitar: {
+      enabled: guitarEnabled,
       modelId: guitarModelId,
       runtimeProfileId: guitarRuntimeProfileId,
-      requiredEnv: guitarRequiredEnv,
-      healthStatus: guitarHealthStatusWithCheckpoint,
-      selectionPriority: 10,
-      supportsFallback: true,
+      cmd: guitarCmd,
+      checkpoint: guitarCheckpointPath,
+      healthStatus: guitarHealthRaw || guitarHealthStatusWithCheckpoint,
     },
-    {
-      specialistId: 'piano_specialist',
-      targetStem: StemType.Keyboard,
+    piano: {
+      enabled: pianoEnabled,
       modelId: pianoModelId,
       runtimeProfileId: pianoRuntimeProfileId,
-      requiredEnv: ['ORCH_PIANO_SPECIALIST_MODEL_ID', 'ORCH_PIANO_SPECIALIST_RUNTIME_PROFILE_ID'],
-      healthStatus: normalizeSpecialistHealthStatus(process.env.ORCH_PIANO_SPECIALIST_HEALTH_STATUS),
-      selectionPriority: 20,
-      supportsFallback: true,
+      cmd: pianoCmd,
+      checkpoint: pianoCheckpointPath,
+      healthStatus: pianoHealthRaw || pianoHealthStatusWithCheckpoint,
     },
-  ];
+  });
+
+  return {
+    specialists: [
+      {
+        specialistId: 'guitar_specialist',
+        targetStem: StemType.Guitar,
+        modelId: guitarModelId,
+        runtimeProfileId: guitarRuntimeProfileId,
+        requiredEnv: guitarRequiredEnv,
+        healthStatus: guitarHealthStatusWithCheckpoint,
+        selectionPriority: 10,
+        supportsFallback: true,
+      },
+      {
+        specialistId: 'piano_specialist',
+        targetStem: StemType.Keyboard,
+        modelId: pianoModelId,
+        runtimeProfileId: pianoRuntimeProfileId,
+        requiredEnv: pianoRequiredEnv,
+        healthStatus: pianoHealthStatusWithCheckpoint,
+        selectionPriority: 20,
+        supportsFallback: true,
+      },
+    ],
+    configSnapshot: {
+      guitar: {
+        enabled: guitarEnabled,
+        modelId: guitarModelId,
+        runtimeProfileId: guitarRuntimeProfileId,
+        cmd: guitarCmd,
+        checkpoint: guitarCheckpointPath,
+        healthStatus: guitarHealthStatusWithCheckpoint,
+        configSource: guitarConfigSource,
+        missingFields: guitarMissingFields,
+        blocker: guitarBlocker,
+      },
+      piano: {
+        enabled: pianoEnabled,
+        modelId: pianoModelId,
+        runtimeProfileId: pianoRuntimeProfileId,
+        cmd: pianoCmd,
+        checkpoint: pianoCheckpointPath,
+        healthStatus: pianoHealthStatusWithCheckpoint,
+        configSource: pianoConfigSource,
+        missingFields: pianoMissingFields,
+        blocker: pianoBlocker,
+      },
+    },
+  };
+}
+
+function buildOrchestrationRunConfigSnapshot(
+  configSnapshot: ResolvedOrchestrationSpecialists['configSnapshot'],
+  specialistReports: SpecialistPassReport[],
+): OrchestrationRunConfigSnapshot {
+  const guitarStatus = specialistReports.find((entry) => entry.specialistId === 'guitar_specialist')?.status ?? 'not_configured';
+  const pianoStatus = specialistReports.find((entry) => entry.specialistId === 'piano_specialist')?.status ?? 'not_configured';
+  return {
+    guitarEnabled: configSnapshot.guitar.enabled,
+    guitarModelId: configSnapshot.guitar.modelId || null,
+    guitarRuntimeProfileId: configSnapshot.guitar.runtimeProfileId || null,
+    guitarSelectionStatus: guitarStatus,
+    guitarCheckpoint: maskCheckpointForDebug(configSnapshot.guitar.checkpoint),
+    guitarConfigSource: configSnapshot.guitar.configSource,
+    guitarMissingFields: configSnapshot.guitar.missingFields,
+    guitarBlocker: configSnapshot.guitar.blocker,
+    pianoEnabled: configSnapshot.piano.enabled,
+    pianoModelId: configSnapshot.piano.modelId || null,
+    pianoRuntimeProfileId: configSnapshot.piano.runtimeProfileId || null,
+    pianoSelectionStatus: pianoStatus,
+    pianoCheckpoint: maskCheckpointForDebug(configSnapshot.piano.checkpoint),
+    pianoConfigSource: configSnapshot.piano.configSource,
+    pianoMissingFields: configSnapshot.piano.missingFields,
+    pianoBlocker: configSnapshot.piano.blocker,
+  };
 }
 
 function resolveOrchestrationSelectionPolicy(): StemSelectionPolicy {
@@ -853,6 +1269,7 @@ async function ensureOrchestratedManifestPersistence(
   resultSetEntry: ProjectManifestResultSetEntry,
   orchManifestStems: ManifestStemEntry[],
   debugReportRelativePath: string,
+  runConfigSnapshot: OrchestrationRunConfigSnapshot,
 ): Promise<void> {
   const resultSetId = resultSetEntry.id;
   const manifest = await readProjectJsonRecord(project.cacheDir, 'manifest.json');
@@ -878,6 +1295,9 @@ async function ensureOrchestratedManifestPersistence(
 
   const existingOrchestration = isObjectLike(manifest.orchestration) ? manifest.orchestration : {};
   const existingReports = isObjectLike(existingOrchestration.reports) ? existingOrchestration.reports : {};
+  const existingRunSnapshots = isObjectLike(existingOrchestration.runConfigSnapshots)
+    ? existingOrchestration.runConfigSnapshots
+    : {};
   const nextReports = {
     ...existingReports,
     [resultSetId]: {
@@ -885,10 +1305,15 @@ async function ensureOrchestratedManifestPersistence(
       createdAt: Date.now(),
     },
   };
+  const nextRunSnapshots = {
+    ...existingRunSnapshots,
+    [resultSetId]: runConfigSnapshot,
+  };
   const orchestrationMeta = {
     ...existingOrchestration,
     lastResultSetId: resultSetId,
     reports: nextReports,
+    runConfigSnapshots: nextRunSnapshots,
   };
 
   await writeProjectJsonRecord(project.cacheDir, 'manifest.json', {
@@ -944,9 +1369,11 @@ async function resolveActiveResultContext(
     : '';
   const normalizedSets = normalizeResultSetEntries(manifest?.resultSets);
   const fallbackSet = buildDefaultResultSetEntry(project, stems);
-  const resultSets = normalizedSets.length > 0
+  const allResultSets = normalizedSets.length > 0
     ? normalizedSets
     : (fallbackSet ? [fallbackSet] : []);
+  const visibleResultSets = allResultSets.filter((entry) => !isInternalOrchIntermediateResultSet(entry.id));
+  const resultSets = visibleResultSets.length > 0 ? visibleResultSets : allResultSets;
 
   const hasMainResultSet = resultSets.some((entry) => entry.id === DEFAULT_ACTIVE_RESULT_ID);
   const fallbackActiveId = DEFAULT_ACTIVE_RESULT_ID;
@@ -966,11 +1393,11 @@ async function resolveActiveResultContext(
     );
   }
 
-  if ((normalizedSets.length === 0 || !fromManifest || fromManifest !== activeResultId) && resultSets.length > 0) {
+  if ((normalizedSets.length === 0 || !fromManifest || fromManifest !== activeResultId) && allResultSets.length > 0) {
     try {
       await patchProjectManifestMetadata(project.cacheDir, {
         activeResultId,
-        resultSets,
+        resultSets: allResultSets,
       });
     } catch (metaErr) {
       console.warn(
@@ -985,6 +1412,7 @@ async function resolveActiveResultContext(
     fallbackReason,
     sourceSignature: activeSet?.sourceSignature ?? null,
     resultSets,
+    allResultSets,
     modelId: activeSet?.modelId ?? null,
     runtimeProfileId: activeSet?.runtimeProfileId ?? null,
   };
@@ -1004,7 +1432,7 @@ async function resolveOrchestrationDebugSnapshot(
   }>,
   activeResultContext: ActiveResultContext,
 ): Promise<Record<string, unknown>> {
-  const orchResultSets = activeResultContext.resultSets
+  const orchResultSets = activeResultContext.allResultSets
     .filter((entry) => entry.id.startsWith(ORCH_RESULT_SET_PREFIX))
     .sort((a, b) => b.createdAt - a.createdAt);
   if (orchResultSets.length === 0) {
@@ -1027,6 +1455,7 @@ async function resolveOrchestrationDebugSnapshot(
       passReports: [],
       stemSelections: [],
       reportPath: null,
+      specialistRunSnapshot: null,
     };
   }
 
@@ -1055,6 +1484,9 @@ async function resolveOrchestrationDebugSnapshot(
   const orchestrationReports = manifestOrchestration && isObjectLike(manifestOrchestration.reports)
     ? manifestOrchestration.reports as Record<string, unknown>
     : null;
+  const orchestrationRunSnapshots = manifestOrchestration && isObjectLike(manifestOrchestration.runConfigSnapshots)
+    ? manifestOrchestration.runConfigSnapshots as Record<string, unknown>
+    : null;
   const reportFromManifest = orchestrationReports
     && isObjectLike(orchestrationReports[inspectedResultSetId])
     ? orchestrationReports[inspectedResultSetId] as Record<string, unknown>
@@ -1062,6 +1494,57 @@ async function resolveOrchestrationDebugSnapshot(
   const reportPathFromManifest = reportFromManifest && typeof reportFromManifest.path === 'string'
     ? reportFromManifest.path.trim()
     : '';
+  const runSnapshotFromManifest = orchestrationRunSnapshots && isObjectLike(orchestrationRunSnapshots[inspectedResultSetId])
+    ? orchestrationRunSnapshots[inspectedResultSetId] as Record<string, unknown>
+    : null;
+  const specialistRunSnapshot = runSnapshotFromManifest
+    ? {
+      guitarEnabled: !!runSnapshotFromManifest.guitarEnabled,
+      guitarModelId: typeof runSnapshotFromManifest.guitarModelId === 'string' ? runSnapshotFromManifest.guitarModelId : null,
+      guitarRuntimeProfileId: typeof runSnapshotFromManifest.guitarRuntimeProfileId === 'string'
+        ? runSnapshotFromManifest.guitarRuntimeProfileId
+        : null,
+      guitarSelectionStatus: typeof runSnapshotFromManifest.guitarSelectionStatus === 'string'
+        ? runSnapshotFromManifest.guitarSelectionStatus
+        : 'not_configured',
+      guitarCheckpoint: typeof runSnapshotFromManifest.guitarCheckpoint === 'string'
+        ? runSnapshotFromManifest.guitarCheckpoint
+        : null,
+      guitarConfigSource: runSnapshotFromManifest.guitarConfigSource === 'env'
+        || runSnapshotFromManifest.guitarConfigSource === 'persisted'
+        || runSnapshotFromManifest.guitarConfigSource === 'default'
+        ? runSnapshotFromManifest.guitarConfigSource
+        : 'default',
+      guitarMissingFields: Array.isArray(runSnapshotFromManifest.guitarMissingFields)
+        ? runSnapshotFromManifest.guitarMissingFields.filter((entry): entry is string => typeof entry === 'string')
+        : [],
+      guitarBlocker: typeof runSnapshotFromManifest.guitarBlocker === 'string'
+        ? runSnapshotFromManifest.guitarBlocker
+        : null,
+      pianoEnabled: !!runSnapshotFromManifest.pianoEnabled,
+      pianoModelId: typeof runSnapshotFromManifest.pianoModelId === 'string' ? runSnapshotFromManifest.pianoModelId : null,
+      pianoRuntimeProfileId: typeof runSnapshotFromManifest.pianoRuntimeProfileId === 'string'
+        ? runSnapshotFromManifest.pianoRuntimeProfileId
+        : null,
+      pianoSelectionStatus: typeof runSnapshotFromManifest.pianoSelectionStatus === 'string'
+        ? runSnapshotFromManifest.pianoSelectionStatus
+        : 'not_configured',
+      pianoCheckpoint: typeof runSnapshotFromManifest.pianoCheckpoint === 'string'
+        ? runSnapshotFromManifest.pianoCheckpoint
+        : null,
+      pianoConfigSource: runSnapshotFromManifest.pianoConfigSource === 'env'
+        || runSnapshotFromManifest.pianoConfigSource === 'persisted'
+        || runSnapshotFromManifest.pianoConfigSource === 'default'
+        ? runSnapshotFromManifest.pianoConfigSource
+        : 'default',
+      pianoMissingFields: Array.isArray(runSnapshotFromManifest.pianoMissingFields)
+        ? runSnapshotFromManifest.pianoMissingFields.filter((entry): entry is string => typeof entry === 'string')
+        : [],
+      pianoBlocker: typeof runSnapshotFromManifest.pianoBlocker === 'string'
+        ? runSnapshotFromManifest.pianoBlocker
+        : null,
+    }
+    : null;
   const reportPath = reportPathFromManifest.length > 0
     ? reportPathFromManifest
     : (inspectedResultSetRole === 'final_orchestrated'
@@ -1169,6 +1652,7 @@ async function resolveOrchestrationDebugSnapshot(
     passReports: reportPasses,
     stemSelections: reportStemSelections,
     reportPath,
+    specialistRunSnapshot,
   };
 }
 
@@ -2609,12 +3093,12 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       workerInfra.projectRepo,
       workerInfra.stemFileRepo,
     );
-    const specialists = resolveOrchestrationSpecialists();
+    const resolvedSpecialists = resolveOrchestrationSpecialists();
     const executionPlan: SpecialistExecutionPlan = {
       orchestratedResultSetId: orchestrationResultSetId,
       baselineModelId: PILOT_MODEL_ID,
       baselineRuntimeProfileId: PILOT_RUNTIME_PROFILE_ID,
-      specialists,
+      specialists: resolvedSpecialists.specialists,
       selectionPolicy: resolveOrchestrationSelectionPolicy(),
     };
     const orchestrationResult = await orchestrationService.start({
@@ -2647,6 +3131,10 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       resultSetEntry,
       manifestEntries,
       orchestrationResult.debugReportRelativePath,
+      buildOrchestrationRunConfigSnapshot(
+        resolvedSpecialists.configSnapshot,
+        orchestrationResult.specialistReports,
+      ),
     );
     await workerInfra.projectRepo.updateStatus(projectId, ProjectStatus.Ready);
     console.log(

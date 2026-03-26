@@ -22,6 +22,8 @@ const SUPPORTED_WORKER_MODEL_OVERRIDES = new Set([
   'htdemucs_6s',
   GUITAR_SPECIALIST_MODEL_ID,
   'mel_roformer_guitar',
+  'mel_roformer_piano',
+  'bs_roformer_sw_piano',
 ]);
 
 const ORCH_STEM_FILENAME: Record<string, string> = {

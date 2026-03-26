@@ -196,12 +196,18 @@ export const ResultPage: React.FC<ResultPageProps> = ({
       pianoSpecialistStatus?: string;
       specialistReports?: Array<{
         specialistId?: string;
+        modelId?: string;
+        runtimeProfileId?: string;
         status?: string;
         healthStatus?: string;
         reason?: string | null;
+        errorCode?: string | null;
+        errorMessage?: string | null;
         passStatusBeforeFallback?: string | null;
         fallbackUsed?: boolean;
         selected?: boolean;
+        selectionReason?: string | null;
+        sourceResultSetId?: string | null;
       }>;
       passReports?: Array<{
         passId?: string;
@@ -220,6 +226,24 @@ export const ResultPage: React.FC<ResultPageProps> = ({
       }>;
       reportPath?: string | null;
       availableOrchResultSetIds?: string[];
+      specialistRunSnapshot?: {
+        guitarEnabled?: boolean;
+        guitarModelId?: string | null;
+        guitarRuntimeProfileId?: string | null;
+        guitarSelectionStatus?: string;
+        guitarCheckpoint?: string | null;
+        guitarConfigSource?: 'env' | 'persisted' | 'default';
+        guitarMissingFields?: string[];
+        guitarBlocker?: string | null;
+        pianoEnabled?: boolean;
+        pianoModelId?: string | null;
+        pianoRuntimeProfileId?: string | null;
+        pianoSelectionStatus?: string;
+        pianoCheckpoint?: string | null;
+        pianoConfigSource?: 'env' | 'persisted' | 'default';
+        pianoMissingFields?: string[];
+        pianoBlocker?: string | null;
+      } | null;
     };
   }) | null;
   const activeResultId = projectResultWithMeta?.activeResultId?.trim() || 'main';
@@ -257,6 +281,30 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const orchestrationStemSelections = Array.isArray(orchestrationDebug?.stemSelections)
     ? orchestrationDebug.stemSelections
     : [];
+  const orchestrationCurrentResultSetId = orchestrationDebug?.currentResultSetId ?? activeResultId;
+  const orchestrationCurrentResultSetKind = orchestrationDebug?.currentResultSetKind ?? activeResultKind;
+  const specialistRunSnapshot = orchestrationDebug?.specialistRunSnapshot ?? null;
+  const pianoSpecialistReport = Array.isArray(orchestrationDebug?.specialistReports)
+    ? orchestrationDebug.specialistReports.find((entry) => entry?.specialistId === 'piano_specialist')
+    : undefined;
+  const keyboardStemSelection = orchestrationStemSelections.find((entry) => {
+    const stemType = (entry.stemType ?? '').trim().toLowerCase();
+    return stemType === 'keyboard' || stemType === 'piano' || stemType === 'keys';
+  });
+  const pianoStatusLegend = 'not_configured | runtime_unavailable | health_failed | skipped_by_policy | selected | failed | fallback_to_baseline';
+  const pianoBlockingReason = [
+    pianoSpecialistReport?.reason ?? null,
+    pianoSpecialistReport?.errorCode ?? null,
+    pianoSpecialistReport?.errorMessage ?? null,
+  ].find((item) => typeof item === 'string' && item.trim().length > 0) ?? 'none';
+  const guitarMissingFieldsLabel = Array.isArray(specialistRunSnapshot?.guitarMissingFields)
+    && specialistRunSnapshot.guitarMissingFields.length > 0
+    ? specialistRunSnapshot.guitarMissingFields.join(', ')
+    : 'none';
+  const pianoMissingFieldsLabel = Array.isArray(specialistRunSnapshot?.pianoMissingFields)
+    && specialistRunSnapshot.pianoMissingFields.length > 0
+    ? specialistRunSnapshot.pianoMissingFields.join(', ')
+    : 'none';
   const orchestrationInspectingResultSetId =
     orchestrationDebug?.inspectedResultSetId
     ?? orchestrationDebug?.orchResultSetId
@@ -871,7 +919,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           </div>
           <div style={styles.chordSummaryRow}>
             <span style={styles.chordSummaryLabel}>当前读取 ResultSet</span>
-            <span style={styles.chordSummaryValue}>{activeResultId} ({activeResultKind})</span>
+            <span style={styles.chordSummaryValue}>{orchestrationCurrentResultSetId} ({orchestrationCurrentResultSetKind})</span>
           </div>
           <div style={styles.chordSummaryRow}>
             <span style={styles.chordSummaryLabel}>Orch ResultSetId</span>
@@ -888,6 +936,10 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           <div style={styles.chordSummaryRow}>
             <span style={styles.chordSummaryLabel}>最近 Final Orch ResultSetId</span>
             <span style={styles.chordSummaryValue}>{orchestrationDebug?.latestFinalOrchResultSetId ?? 'none'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>中间结果集暴露策略</span>
+            <span style={styles.chordSummaryValue}>baseline/specialist pass 仅内部使用（fallback/provenance/debug），不在普通结果集列表展示</span>
           </div>
           <div style={styles.chordSummaryRow}>
             <span style={styles.chordSummaryLabel}>当前调试快照来源</span>
@@ -914,6 +966,62 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           <div style={styles.chordSummaryRow}>
             <span style={styles.chordSummaryLabel}>Piano Specialist</span>
             <span style={styles.chordSummaryValue}>{orchestrationDebug?.pianoSpecialistStatus ?? 'not_configured'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Guitar Enabled(Model/Runtime)</span>
+            <span style={styles.chordSummaryValue}>
+              {`${Boolean(specialistRunSnapshot?.guitarEnabled)} | ${specialistRunSnapshot?.guitarModelId ?? 'none'} | ${specialistRunSnapshot?.guitarRuntimeProfileId ?? 'none'}`}
+            </span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Guitar Selection/Checkpoint</span>
+            <span style={styles.chordSummaryValue}>
+              {`${specialistRunSnapshot?.guitarSelectionStatus ?? 'not_configured'} | ${specialistRunSnapshot?.guitarCheckpoint ?? 'none'}`}
+            </span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Guitar ConfigSource/Missing/Blocker</span>
+            <span style={styles.chordSummaryValue}>
+              {`${specialistRunSnapshot?.guitarConfigSource ?? 'default'} | ${guitarMissingFieldsLabel} | ${specialistRunSnapshot?.guitarBlocker ?? 'none'}`}
+            </span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Piano Enabled(Model/Runtime)</span>
+            <span style={styles.chordSummaryValue}>
+              {`${Boolean(specialistRunSnapshot?.pianoEnabled)} | ${specialistRunSnapshot?.pianoModelId ?? 'none'} | ${specialistRunSnapshot?.pianoRuntimeProfileId ?? 'none'}`}
+            </span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Piano Selection/Checkpoint</span>
+            <span style={styles.chordSummaryValue}>
+              {`${specialistRunSnapshot?.pianoSelectionStatus ?? 'not_configured'} | ${specialistRunSnapshot?.pianoCheckpoint ?? 'none'}`}
+            </span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Piano ConfigSource/Missing/Blocker</span>
+            <span style={styles.chordSummaryValue}>
+              {`${specialistRunSnapshot?.pianoConfigSource ?? 'default'} | ${pianoMissingFieldsLabel} | ${specialistRunSnapshot?.pianoBlocker ?? 'none'}`}
+            </span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Piano 状态枚举</span>
+            <span style={styles.chordSummaryValue}>{pianoStatusLegend}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Piano Health</span>
+            <span style={styles.chordSummaryValue}>{pianoSpecialistReport?.healthStatus ?? 'unknown'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Piano Blocker</span>
+            <span style={styles.chordSummaryValue}>{pianoBlockingReason}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>Keyboard Stem 来源</span>
+            <span style={styles.chordSummaryValue}>
+              {keyboardStemSelection
+                ? `${keyboardStemSelection.modelId ?? 'unknown'} | runtime=${keyboardStemSelection.runtimeProfileId ?? 'unknown'} | reason=${keyboardStemSelection.selectionReason ?? 'unknown'} | fallback=${Boolean(keyboardStemSelection.fallbackUsed)} | source=${keyboardStemSelection.sourceResultSetId ?? 'none'}`
+                : 'none'}
+            </span>
           </div>
           {typeof orchestrationDebug?.reportPath === 'string' && orchestrationDebug.reportPath.trim().length > 0 && (
             <div style={styles.chordSummaryRow}>

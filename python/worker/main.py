@@ -47,6 +47,7 @@ MODEL_SUPPORTED_STEM_TYPES = {
 DEFAULT_SEPARATION_ENGINE = "demucs"
 ALLOWED_SEPARATION_ENGINES = {"demucs", "bs_roformer_sw"}
 GUITAR_SPECIALIST_MODEL_IDS = {"mel_roformer_guitar", "bs_roformer_sw_guitar"}
+PIANO_SPECIALIST_MODEL_IDS = {"mel_roformer_piano", "bs_roformer_sw_piano"}
 ENV_WORKER_PYTHON_EXE = "WORKER_PYTHON_EXE"
 ENV_DEMUCS_PYTHON_EXE = "DEMUCS_PYTHON_EXE"
 ENV_DEMUCS_6S_PILOT_PYTHON_EXE = "DEMUCS_6S_PILOT_PYTHON_EXE"
@@ -59,6 +60,8 @@ ENV_TEMPO_ANALYZER = "TEMPO_ANALYZER"
 ENV_ANALYZER_STRICT_MODE = "ANALYZER_STRICT_MODE"
 ENV_ORCH_GUITAR_SPECIALIST_CMD = "ORCH_GUITAR_SPECIALIST_CMD"
 ENV_ORCH_GUITAR_SPECIALIST_CHECKPOINT = "ORCH_GUITAR_SPECIALIST_CHECKPOINT"
+ENV_ORCH_PIANO_SPECIALIST_CMD = "ORCH_PIANO_SPECIALIST_CMD"
+ENV_ORCH_PIANO_SPECIALIST_CHECKPOINT = "ORCH_PIANO_SPECIALIST_CHECKPOINT"
 
 LEGACY_CHORD_ANALYZER_ID = "chord_rule_chroma_v1"
 PILOT_CHORD_ANALYZER_ID = "chord_rule_chroma_v2_pilot"
@@ -2043,7 +2046,7 @@ def handle_execute_chord_analysis(request_id: str, payload: dict) -> None:
 
 def _resolve_separation_engine(request_id: str, model_override: Optional[str] = None) -> str:
     normalized_model = (model_override or "").strip().lower()
-    if normalized_model in GUITAR_SPECIALIST_MODEL_IDS:
+    if normalized_model in GUITAR_SPECIALIST_MODEL_IDS or normalized_model in PIANO_SPECIALIST_MODEL_IDS:
         log(
             "INFO",
             f"[REAL_CHAIN] start_separation specialist_engine_override request_id={request_id} "
@@ -2234,18 +2237,34 @@ def _run_bs_roformer_engine(
     """
     specialist_model = (specialist_model_id or "").strip().lower()
     bs_cmd_template = os.environ.get("BS_ROFORMER_CMD", "").strip()
-    specialist_cmd_template = os.environ.get(ENV_ORCH_GUITAR_SPECIALIST_CMD, "").strip()
-    specialist_checkpoint = os.environ.get(ENV_ORCH_GUITAR_SPECIALIST_CHECKPOINT, "").strip()
+    specialist_cmd_template = ""
+    specialist_checkpoint = ""
+    specialist_target_label = ""
+    specialist_cmd_env = ""
+    specialist_checkpoint_env = ""
+
+    if specialist_model in GUITAR_SPECIALIST_MODEL_IDS:
+        specialist_cmd_template = os.environ.get(ENV_ORCH_GUITAR_SPECIALIST_CMD, "").strip()
+        specialist_checkpoint = os.environ.get(ENV_ORCH_GUITAR_SPECIALIST_CHECKPOINT, "").strip()
+        specialist_target_label = "Guitar"
+        specialist_cmd_env = ENV_ORCH_GUITAR_SPECIALIST_CMD
+        specialist_checkpoint_env = ENV_ORCH_GUITAR_SPECIALIST_CHECKPOINT
+    elif specialist_model in PIANO_SPECIALIST_MODEL_IDS:
+        specialist_cmd_template = os.environ.get(ENV_ORCH_PIANO_SPECIALIST_CMD, "").strip()
+        specialist_checkpoint = os.environ.get(ENV_ORCH_PIANO_SPECIALIST_CHECKPOINT, "").strip()
+        specialist_target_label = "Piano"
+        specialist_cmd_env = ENV_ORCH_PIANO_SPECIALIST_CMD
+        specialist_checkpoint_env = ENV_ORCH_PIANO_SPECIALIST_CHECKPOINT
 
     candidates: List[Tuple[List[str], bool]] = []
-    if specialist_model in GUITAR_SPECIALIST_MODEL_IDS:
+    if specialist_model in GUITAR_SPECIALIST_MODEL_IDS or specialist_model in PIANO_SPECIALIST_MODEL_IDS:
         if not specialist_cmd_template:
             raise RuntimeError(
-                "Guitar specialist command missing: set ORCH_GUITAR_SPECIALIST_CMD"
+                f"{specialist_target_label} specialist command missing: set {specialist_cmd_env}"
             )
         if "{checkpoint}" in specialist_cmd_template and not specialist_checkpoint:
             raise RuntimeError(
-                "Guitar specialist checkpoint missing: set ORCH_GUITAR_SPECIALIST_CHECKPOINT"
+                f"{specialist_target_label} specialist checkpoint missing: set {specialist_checkpoint_env}"
             )
         rendered = (
             specialist_cmd_template
