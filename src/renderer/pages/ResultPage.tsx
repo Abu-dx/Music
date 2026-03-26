@@ -78,6 +78,24 @@ const SOURCE_TYPE_LABELS: Record<string, string> = {
   cache_hit: '缓存命中',
 };
 
+function resolveOrchResultSetRole(resultSetId: string): 'baseline-pass' | 'specialist-pass' | 'final-orchestrated' {
+  const normalized = resultSetId.trim().toLowerCase();
+  if (normalized.includes('__base_6s') || normalized.includes('base6s')) return 'baseline-pass';
+  if (normalized.includes('__guitar_specialist') || normalized.includes('__piano_specialist')) return 'specialist-pass';
+  return 'final-orchestrated';
+}
+
+function resolveResultSetScopeLabel(resultSetId: string): string {
+  if (resultSetId.startsWith('orch_')) {
+    const role = resolveOrchResultSetRole(resultSetId);
+    if (role === 'baseline-pass') return '编排基线pass';
+    if (role === 'specialist-pass') return '编排专模pass';
+    return '编排最终结果';
+  }
+  if (resultSetId.startsWith('pilot_')) return '实验';
+  return '主线';
+}
+
 /**
  * 杞ㄩ亾瀛樺湪鐘舵€佹樉绀烘枃妗? *
  * 缁熶竴璇箟锛堜笌 PlayerPage 涓€鑷达級锛? * - exists锛氬凡鐢熸垚 鈥?鏈夊彲鎾斁鏂囦欢
@@ -133,6 +151,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameBusy, setRenameBusy] = useState(false);
   const [pilotBusy, setPilotBusy] = useState(false);
+  const [orchBusy, setOrchBusy] = useState(false);
   const [rebindBusy, setRebindBusy] = useState(false);
   const [resultSetSwitchBusy, setResultSetSwitchBusy] = useState(false);
   const [pilotInfo, setPilotInfo] = useState<string | null>(null);
@@ -156,14 +175,22 @@ export const ResultPage: React.FC<ResultPageProps> = ({
 
   const { projectResult, stems, isLoading } = snapshot;
   const projectResultWithMeta = projectResult as (ProjectResultSummaryDTO & {
+    currentResultSetKind?: 'main' | 'pilot' | 'orch';
     resultSets?: Array<{ id?: string; modelId?: string; runtimeProfileId?: string }>;
     sourceFilePath?: string | null;
     activeResultModelId?: string | null;
     activeResultRuntimeProfileId?: string | null;
     orchestrationDebug?: {
       exists?: boolean;
+      currentResultSetId?: string | null;
+      currentResultSetKind?: 'main' | 'pilot' | 'orch';
       orchResultSetId?: string | null;
+      inspectedResultSetId?: string | null;
+      inspectedResultSetRole?: 'non_orch' | 'baseline_pass' | 'specialist_pass' | 'final_orchestrated';
       latestOrchResultSetId?: string | null;
+      latestFinalOrchResultSetId?: string | null;
+      reportExists?: boolean;
+      reportAvailabilityReason?: string;
       baselinePassStatus?: string;
       guitarSpecialistStatus?: string;
       pianoSpecialistStatus?: string;
@@ -213,8 +240,16 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     ?? projectResultWithMeta?.activeResultRuntimeProfileId
     ?? activeStem?.runtimeProfileId
     ?? 'unknown';
+  const isActiveOrchResult = activeResultId.startsWith('orch_6s_');
   const isActivePilotResult = activeResultId.startsWith('pilot_');
-  const activeResultKindLabel = isActivePilotResult ? '实验结果集' : '主线结果集';
+  const activeResultKind = projectResultWithMeta?.currentResultSetKind
+    ?? (isActiveOrchResult ? 'orch' : (isActivePilotResult ? 'pilot' : 'main'));
+  const activeOrchRole = isActiveOrchResult ? resolveOrchResultSetRole(activeResultId) : null;
+  const activeResultKindLabel = activeResultKind === 'orch'
+    ? (activeOrchRole === 'baseline-pass'
+      ? '编排基线pass'
+      : (activeOrchRole === 'specialist-pass' ? '编排专模pass' : '编排最终结果'))
+    : (activeResultKind === 'pilot' ? '实验结果集' : '主线结果集');
   const orchestrationDebug = projectResultWithMeta?.orchestrationDebug;
   const hasOrchestrationResultSet = (projectResultWithMeta?.resultSets ?? [])
     .some((entry) => typeof entry?.id === 'string' && entry.id.startsWith('orch_6s_'));
@@ -222,6 +257,11 @@ export const ResultPage: React.FC<ResultPageProps> = ({
   const orchestrationStemSelections = Array.isArray(orchestrationDebug?.stemSelections)
     ? orchestrationDebug.stemSelections
     : [];
+  const orchestrationInspectingResultSetId =
+    orchestrationDebug?.inspectedResultSetId
+    ?? orchestrationDebug?.orchResultSetId
+    ?? orchestrationDebug?.latestOrchResultSetId
+    ?? null;
   const tempoAnalyzerId = analysisSnap.chordResult?.analysisMethods?.tempoAnalyzer ?? 'unknown';
   const tempoMethod = analysisSnap.chordResult?.tempo?.method ?? null;
   const tempoConfidence = analysisSnap.chordResult?.tempo?.confidence;
@@ -485,6 +525,42 @@ export const ResultPage: React.FC<ResultPageProps> = ({
     }
   }, [projectResultWithMeta?.resultSets, projectResultWithMeta?.sourceFilePath, projectStore, projectId]);
 
+  const handleStartOrchestratedSeparation = useCallback(async () => {
+    const hasExistingOrchResultSet = (projectResultWithMeta?.resultSets ?? [])
+      .some((entry) => typeof entry.id === 'string' && entry.id.startsWith('orch_6s_'));
+    if (hasExistingOrchResultSet) {
+      const confirmed = window.confirm(
+        '继续分离将新增一个编排结果集（orch_6s_*），不会覆盖 main/pilot。是否继续？',
+      );
+      if (!confirmed) return;
+    }
+
+    try {
+      setOrchBusy(true);
+      setPilotError(null);
+      setPilotInfo(null);
+      const preferredSourceFilePath =
+        (typeof projectResultWithMeta?.sourceFilePath === 'string' && projectResultWithMeta.sourceFilePath.trim().length > 0)
+          ? projectResultWithMeta.sourceFilePath.trim()
+          : undefined;
+      const result = await projectStore.startOrchestratedSeparation(projectId, preferredSourceFilePath);
+      setPilotInfo(`Orchestration 任务已启动（jobId: ${result.jobId}）`);
+      await Promise.all([
+        projectStore.loadProjectResult(projectId),
+        projectStore.loadRecentProjects(20),
+      ]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('ORCH_SOURCE_PATH_REQUIRED')) {
+        setPilotError('缺少可用的原始音频路径。请先重绑原始音频，再启动 orchestration。');
+      } else {
+        setPilotError(message || 'orchestration 启动失败');
+      }
+    } finally {
+      setOrchBusy(false);
+    }
+  }, [projectResultWithMeta?.resultSets, projectResultWithMeta?.sourceFilePath, projectStore, projectId]);
+
   const handleRebindSourceFile = useCallback(async () => {
     const currentSource =
       (typeof projectResultWithMeta?.sourceFilePath === 'string' && projectResultWithMeta.sourceFilePath.trim().length > 0)
@@ -678,7 +754,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           </button>
         </div>
       </div>
-      <div style={styles.experimentalHint}>实验功能：新增 pilot 结果集，不覆盖 main 主线结果。</div>
+      <div style={styles.experimentalHint}>实验功能：新增 pilot / orch 结果集，不覆盖 main 主线结果。</div>
 
       {/* === mock 鏁版嵁鎻愮ず === */}
       {projectResult?.sourceTypeLabel?.includes('模拟') && (
@@ -711,7 +787,7 @@ export const ResultPage: React.FC<ResultPageProps> = ({
               {availableResultSets.map((entry) => (
                 <option key={entry.id} value={entry.id}>
                   {entry.id}
-                  {entry.id.startsWith('pilot_') ? '（实验）' : '（主线）'}
+                  {`（${resolveResultSetScopeLabel(entry.id)}）`}
                 </option>
               ))}
             </select>
@@ -746,6 +822,17 @@ export const ResultPage: React.FC<ResultPageProps> = ({
         <button
           style={{
             ...styles.actionButton,
+            ...(orchBusy ? styles.playerButtonDisabled : {}),
+          }}
+          onClick={handleStartOrchestratedSeparation}
+          disabled={orchBusy}
+          title="编排试点：新增 orch_6s_* 结果集，不覆盖 main/pilot"
+        >
+          {orchBusy ? 'Orch 启动中...' : 'Orch 编排分离'}
+        </button>
+        <button
+          style={{
+            ...styles.actionButton,
             ...(rebindBusy ? styles.playerButtonDisabled : {}),
           }}
           onClick={handleRebindSourceFile}
@@ -769,6 +856,11 @@ export const ResultPage: React.FC<ResultPageProps> = ({
           当前正在查看 pilot 实验结果；main 主线结果仍保留，默认主线仍为 main。
         </div>
       )}
+      {isActiveOrchResult && (
+        <div style={styles.resultScopeHint}>
+          当前正在查看 {activeResultKindLabel}；main 主线结果仍保留，默认主线仍为 main。
+        </div>
+      )}
 
       <div style={styles.section}>
         <h3 style={styles.sectionTitle}>Orchestration 调试（只读）</h3>
@@ -778,9 +870,39 @@ export const ResultPage: React.FC<ResultPageProps> = ({
             <span style={styles.chordSummaryValue}>{orchestrationExists ? 'yes' : 'no'}</span>
           </div>
           <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>当前读取 ResultSet</span>
+            <span style={styles.chordSummaryValue}>{activeResultId} ({activeResultKind})</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
             <span style={styles.chordSummaryLabel}>Orch ResultSetId</span>
             <span style={styles.chordSummaryValue}>{orchestrationDebug?.orchResultSetId ?? orchestrationDebug?.latestOrchResultSetId ?? 'none'}</span>
           </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>当前 Orch 角色</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.inspectedResultSetRole ?? 'non_orch'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>最近 Orch ResultSetId</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.latestOrchResultSetId ?? 'none'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>最近 Final Orch ResultSetId</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.latestFinalOrchResultSetId ?? 'none'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>当前调试快照来源</span>
+            <span style={styles.chordSummaryValue}>{orchestrationInspectingResultSetId ?? 'none'}</span>
+          </div>
+          <div style={styles.chordSummaryRow}>
+            <span style={styles.chordSummaryLabel}>orchestration-report.json</span>
+            <span style={styles.chordSummaryValue}>{orchestrationDebug?.reportExists ? 'exists' : 'missing'}</span>
+          </div>
+          {!orchestrationDebug?.reportExists && (
+            <div style={styles.chordSummaryRow}>
+              <span style={styles.chordSummaryLabel}>Report 说明</span>
+              <span style={styles.chordSummaryValue}>{orchestrationDebug?.reportAvailabilityReason ?? 'report_missing'}</span>
+            </div>
+          )}
           <div style={styles.chordSummaryRow}>
             <span style={styles.chordSummaryLabel}>Baseline Pass</span>
             <span style={styles.chordSummaryValue}>{orchestrationDebug?.baselinePassStatus ?? 'not_configured'}</span>
@@ -797,6 +919,16 @@ export const ResultPage: React.FC<ResultPageProps> = ({
             <div style={styles.chordSummaryRow}>
               <span style={styles.chordSummaryLabel}>Debug Report Path</span>
               <span style={styles.chordSummaryValue}>{orchestrationDebug.reportPath}</span>
+            </div>
+          )}
+          {orchestrationExists && !isActiveOrchResult && (
+            <div style={styles.resultScopeHint}>
+              已检测到 orch 结果集，但当前页面仍在读取 {activeResultId}。如需查看 orch，请在“结果集”下拉中切换到 `orch_6s_*`。
+            </div>
+          )}
+          {orchestrationDebug?.inspectedResultSetRole === 'baseline_pass' && (
+            <div style={styles.resultScopeHint}>
+              当前是 baseline-pass 中间结果集；此结果集用于基线 6stem pass，specialist/pass report 为空属于预期。请切换到 final orch 结果集查看完整编排报告。
             </div>
           )}
           <details style={styles.chordDebugPanel}>

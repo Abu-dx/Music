@@ -96,9 +96,19 @@ export const HomePage: React.FC<HomePageProps> = ({
 
     // Refresh single-project status before routing.
     // Failed/cancelled projects should not be routed into ProgressPage.
-    await store.loadProject(project.id).catch(() => undefined);
-    const latest = store.getSnapshot().currentProject;
+    await Promise.all([
+      store.loadProject(project.id).catch(() => undefined),
+      store.loadProjectResult(project.id).catch(() => undefined),
+    ]);
+    const latestSnapshot = store.getSnapshot();
+    const latest = latestSnapshot.currentProject;
     const latestStatus = latest?.id === project.id ? latest.status : project.status;
+    const hasReadableResult = latestSnapshot.projectResult?.id === project.id
+      && latestSnapshot.stems.some((stem) => stem.presence === 'exists');
+    if (hasReadableResult) {
+      onNavigateToProject(project.id);
+      return;
+    }
     if (latestStatus === 'processing') {
       onNavigateToProgress(project.id);
       return;

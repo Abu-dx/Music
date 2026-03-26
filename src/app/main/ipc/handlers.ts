@@ -174,9 +174,12 @@ const DEFAULT_CHORD_ANALYZER_ID = 'chord_rule_chroma_v2_pilot';
 const DEFAULT_TEMPO_ANALYZER_ID = 'tempo_rule_onset_v2_pilot';
 const PILOT_MODEL_ID = 'htdemucs_6s';
 const PILOT_RUNTIME_PROFILE_ID = 'demucs_6s_pilot';
-const ORCH_GUITAR_SPECIALIST_DEFAULT_MODEL_ID = 'mel_roformer_guitar';
+const ORCH_GUITAR_SPECIALIST_DEFAULT_MODEL_ID = 'bs_roformer_sw_guitar';
 const ORCH_GUITAR_SPECIALIST_DEFAULT_RUNTIME_PROFILE_ID = PILOT_RUNTIME_PROFILE_ID;
-const ORCH_GUITAR_SPECIALIST_SUPPORTED_MODEL_IDS = new Set(['mel_roformer_guitar']);
+const ORCH_GUITAR_SPECIALIST_SUPPORTED_MODEL_IDS = new Set([
+  'bs_roformer_sw_guitar',
+  'mel_roformer_guitar',
+]);
 const ORCH_GUITAR_SPECIALIST_COMMAND_ENV = 'ORCH_GUITAR_SPECIALIST_CMD';
 const ORCH_GUITAR_SPECIALIST_CHECKPOINT_ENV = 'ORCH_GUITAR_SPECIALIST_CHECKPOINT';
 const ORCH_RESULT_SET_PREFIX = 'orch_6s_';
@@ -193,9 +196,28 @@ type ActiveResultContext = {
   runtimeProfileId: string | null;
 };
 
+type ResultSetKind = 'main' | 'pilot' | 'orch';
+type OrchResultSetRole = 'non_orch' | 'baseline_pass' | 'specialist_pass' | 'final_orchestrated';
+
 function normalizeParentResultId(value: string | null | undefined): string {
   const normalized = typeof value === 'string' ? value.trim() : '';
   return normalized.length > 0 ? normalized : DEFAULT_ACTIVE_RESULT_ID;
+}
+
+function resolveResultSetKind(resultSetId: string | null | undefined): ResultSetKind {
+  const normalized = normalizeParentResultId(resultSetId);
+  if (normalized.startsWith(ORCH_RESULT_SET_PREFIX)) return 'orch';
+  if (normalized.startsWith('pilot_6s_')) return 'pilot';
+  return 'main';
+}
+
+function resolveOrchResultSetRole(resultSetId: string | null | undefined): OrchResultSetRole {
+  const normalized = normalizeParentResultId(resultSetId);
+  if (!normalized.startsWith(ORCH_RESULT_SET_PREFIX)) return 'non_orch';
+  const lower = normalized.toLowerCase();
+  if (lower.includes('__base_6s') || lower.includes('base6s')) return 'baseline_pass';
+  if (lower.includes('__guitar_specialist') || lower.includes('__piano_specialist')) return 'specialist_pass';
+  return 'final_orchestrated';
 }
 
 type PilotRuntimePreflightResult = {
@@ -988,9 +1010,16 @@ async function resolveOrchestrationDebugSnapshot(
   if (orchResultSets.length === 0) {
     return {
       exists: false,
+      currentResultSetId: activeResultContext.activeResultId,
+      currentResultSetKind: resolveResultSetKind(activeResultContext.activeResultId),
       activeIsOrch: activeResultContext.activeResultId.startsWith(ORCH_RESULT_SET_PREFIX),
       orchResultSetId: null,
+      inspectedResultSetId: null,
+      inspectedResultSetRole: 'non_orch',
       latestOrchResultSetId: null,
+      latestFinalOrchResultSetId: null,
+      reportExists: false,
+      reportAvailabilityReason: 'no_orchestration_result_set',
       baselinePassStatus: 'not_configured',
       guitarSpecialistStatus: 'not_configured',
       pianoSpecialistStatus: 'not_configured',
@@ -1002,9 +1031,13 @@ async function resolveOrchestrationDebugSnapshot(
   }
 
   const latestOrchResultSetId = orchResultSets[0].id;
+  const latestFinalOrchResultSetId =
+    orchResultSets.find((entry) => resolveOrchResultSetRole(entry.id) === 'final_orchestrated')?.id
+    ?? null;
   const inspectedResultSetId = activeResultContext.activeResultId.startsWith(ORCH_RESULT_SET_PREFIX)
     ? activeResultContext.activeResultId
-    : latestOrchResultSetId;
+    : (latestFinalOrchResultSetId ?? latestOrchResultSetId);
+  const inspectedResultSetRole = resolveOrchResultSetRole(inspectedResultSetId);
   const fallbackStemSelections = filterStemsForResultSet(stems, inspectedResultSetId).map((stem) => ({
     stemType: stem.stemType ?? 'unknown',
     modelId: stem.modelId ?? 'unknown',
@@ -1031,8 +1064,20 @@ async function resolveOrchestrationDebugSnapshot(
     : '';
   const reportPath = reportPathFromManifest.length > 0
     ? reportPathFromManifest
-    : path.posix.join('results', inspectedResultSetId, 'orchestration-report.json');
-  const reportRecord = await readProjectJsonRecord(project.cacheDir, reportPath);
+    : (inspectedResultSetRole === 'final_orchestrated'
+      ? path.posix.join('results', inspectedResultSetId, 'orchestration-report.json')
+      : null);
+  const reportRecord = reportPath
+    ? await readProjectJsonRecord(project.cacheDir, reportPath)
+    : null;
+  const reportExists = !!reportRecord;
+  const reportAvailabilityReason = reportExists
+    ? 'available'
+    : (inspectedResultSetRole === 'baseline_pass'
+      ? 'baseline_pass_intermediate_no_report'
+      : (inspectedResultSetRole === 'specialist_pass'
+        ? 'specialist_pass_intermediate_no_report'
+        : 'report_missing'));
   const reportPasses = Array.isArray(reportRecord?.passReports)
     ? reportRecord!.passReports.filter(isObjectLike).map((entry) => ({
       passId: typeof entry.passId === 'string' ? entry.passId : 'unknown',
@@ -1106,10 +1151,17 @@ async function resolveOrchestrationDebugSnapshot(
 
   return {
     exists: true,
+    currentResultSetId: activeResultContext.activeResultId,
+    currentResultSetKind: resolveResultSetKind(activeResultContext.activeResultId),
     activeIsOrch: activeResultContext.activeResultId.startsWith(ORCH_RESULT_SET_PREFIX),
     orchResultSetId: inspectedResultSetId,
+    inspectedResultSetId,
+    inspectedResultSetRole,
     latestOrchResultSetId,
+    latestFinalOrchResultSetId,
     availableOrchResultSetIds: orchResultSets.map((entry) => entry.id),
+    reportExists,
+    reportAvailabilityReason,
     baselinePassStatus,
     guitarSpecialistStatus: guitarSpecialistReport?.status ?? fallbackSpecialistStatus('guitar_specialist'),
     pianoSpecialistStatus: pianoSpecialistReport?.status ?? fallbackSpecialistStatus('piano_specialist'),
@@ -2488,6 +2540,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
   });
 
   ipcMain.handle('project:startOrchestratedSeparation', async (_event, projectId: string, sourceFilePath?: string) => {
+    console.log(`[REAL_CHAIN] handlers.project:startOrchestratedSeparation enter projectId="${projectId}"`);
     if (!workerInfra) {
       throw new Error('分离服务不可用，请重启应用后重试');
     }
@@ -2778,7 +2831,9 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
     console.log(
       `[REAL_CHAIN] handlers.project:getResult active_context projectId="${projectId}" resultSetCount=${activeResultContext.resultSets.length} ` +
       `activeFromManifest="${activeResultContext.manifestActiveResultId ?? 'none'}" ` +
-      `activeResolved="${activeResultContext.activeResultId}" fallbackReason="${activeResultContext.fallbackReason ?? 'none'}"`,
+      `activeResolved="${activeResultContext.activeResultId}" activeKind="${resolveResultSetKind(activeResultContext.activeResultId)}" ` +
+      `fallbackReason="${activeResultContext.fallbackReason ?? 'none'}" orchExists="${Boolean((orchestrationDebug as { exists?: unknown })?.exists)}" ` +
+      `orchLatest="${typeof (orchestrationDebug as { latestOrchResultSetId?: unknown })?.latestOrchResultSetId === 'string' ? (orchestrationDebug as { latestOrchResultSetId?: string }).latestOrchResultSetId : 'none'}"`,
     );
 
     const isRealSeparation = project.status === ProjectStatus.Ready && stems.length > 0;
@@ -2818,6 +2873,7 @@ export function registerIpcHandlers(infra?: WorkerInfra): void {
       cacheHitBannerText: null,
       sourceTypeLabel,
       activeResultId: activeResultContext.activeResultId,
+      currentResultSetKind: resolveResultSetKind(activeResultContext.activeResultId),
       resultSets: activeResultContext.resultSets,
       sourceFilePath: project.originalFilePath ?? null,
       activeResultModelId: activeResultContext.modelId,

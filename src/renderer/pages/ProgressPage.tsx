@@ -105,6 +105,7 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
   const { isRunning, isComplete, isFailed, cacheHit, progress, stageDisplayName,
     errorMessage, warnings, currentStageIndex, orderedStages, elapsedMs } = jobSnap;
   const isIdleWithoutJob = !isRunning && !isComplete && !isFailed;
+  const shouldRecoverToResult = isIdleWithoutJob && hasReadableResult;
   const shouldRecoverFromIdle = isIdleWithoutJob
     && projectStatus !== null
     && projectStatus !== 'processing'
@@ -112,10 +113,10 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
     && projectStatus !== 'importing';
 
   useEffect(() => {
-    if (shouldRecoverFromIdle && hasReadableResult) {
+    if (shouldRecoverToResult) {
       onNavigateToResult(projectId);
     }
-  }, [shouldRecoverFromIdle, hasReadableResult, onNavigateToResult, projectId]);
+  }, [shouldRecoverToResult, onNavigateToResult, projectId]);
 
   return (
     <div className="progress-page" style={styles.container}>
@@ -230,6 +231,23 @@ export const ProgressPage: React.FC<ProgressPageProps> = ({
           <div style={styles.errorTitle}>任务未在运行</div>
           <div style={styles.errorMessage}>
             当前项目状态：{projectStatus ?? 'unknown'}。该项目没有可读取结果，请返回首页或重新上传。
+          </div>
+          <div style={styles.recoverActions}>
+            <button style={styles.homeButton} onClick={onNavigateToHome}>
+              返回首页
+            </button>
+            <button style={styles.retryButton} onClick={onNavigateToUpload}>
+              重新上传
+            </button>
+          </div>
+        </div>
+      )}
+
+      {isIdleWithoutJob && projectStatus === 'processing' && !hasReadableResult && (
+        <div style={styles.errorBox}>
+          <div style={styles.errorTitle}>任务状态异常</div>
+          <div style={styles.errorMessage}>
+            当前显示为 processing，但未检测到运行中的 job，进度停留在 0%。请返回首页后重进，或重新上传。
           </div>
           <div style={styles.recoverActions}>
             <button style={styles.homeButton} onClick={onNavigateToHome}>

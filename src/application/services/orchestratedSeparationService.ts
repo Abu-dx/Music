@@ -16,8 +16,13 @@ import type {
 const ORCH_SOURCE_KIND = 'orchestrated';
 const ORCH_RESULT_MODEL_ID = 'orchestrated_6s';
 const ORCH_RESULT_RUNTIME_PROFILE_ID = 'orchestrator_main';
-const GUITAR_SPECIALIST_MODEL_ID = 'mel_roformer_guitar';
-const SUPPORTED_WORKER_MODEL_OVERRIDES = new Set(['htdemucs', 'htdemucs_6s', GUITAR_SPECIALIST_MODEL_ID]);
+const GUITAR_SPECIALIST_MODEL_ID = 'bs_roformer_sw_guitar';
+const SUPPORTED_WORKER_MODEL_OVERRIDES = new Set([
+  'htdemucs',
+  'htdemucs_6s',
+  GUITAR_SPECIALIST_MODEL_ID,
+  'mel_roformer_guitar',
+]);
 
 const ORCH_STEM_FILENAME: Record<string, string> = {
   [StemType.Vocal]: 'vocals',

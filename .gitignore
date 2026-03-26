@@ -50,5 +50,22 @@ python/venv/
 python/mdx_smoke_out/
 python/models/mdx_piano/
 
+# Local model assets (do not commit large checkpoints)
+python/models/**
+!python/models/
+!python/models/.gitkeep
+!python/models/README.md
+!python/models/guitar/
+!python/models/guitar/.gitkeep
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.bin
+*.safetensors
+.cache/**
+.huggingface/**
+**/debug-*.json
+
 # 第三方代码（如果用标准包管理）  
 python/third_party/uvr-mdx-infer/
